@@ -144,11 +144,13 @@ bool build(const Plan& p, Built* b) {
     b->ncls = 2;
     const int64_t E = p.E, top_k = p.top_k, M = p.M, T = M * top_k;
     if (E < 2 || top_k <= 0 || top_k > E || M <= 0 || (p.N[0] <= 0) || (p.N[1] <= 0) ||
-        p.N[0] % 256 || p.N[1] % 256 || p.K[0] % 128 || p.K[1] % 128 || p.parts <= 0 ||
+        p.K[0] <= 0 || p.K[1] <= 0 || p.N[0] % 256 || p.N[1] % 256 || p.K[0] % 128 ||
+        p.K[1] % 128 || p.parts <= 0 || p.parts > 255 ||
         p.N[0] % p.parts || p.N[1] % p.parts || (p.N[0] / p.parts) % 256 ||
         (p.N[1] / p.parts) % 256 || p.drop < 0 || p.drop > T)
         return false;
     if (p.zero_rows && p.top_k > E - 2) return false;
+    if (p.all_to_first && top_k != 1) return false;
 
     b->g.n_expert = E;
     b->g.top_k = top_k;
@@ -164,23 +166,22 @@ bool build(const Plan& p, Built* b) {
     b->g.a_group = 128;
     b->Kmax = std::max(p.K[0], p.K[1]);
 
-    /* The routing: top_k distinct experts a token, the last `drop` slots dropped. */
-    Rng rnd(p.seed);
+    /* The routing: top_k distinct experts a token, the last `drop` slots dropped. Round-robin over
+     * the experts the zero-row test leaves available; an interval of top_k <= available slots has
+     * distinct residues, so every token sees top_k different experts and both classes. */
+    std::vector<int64_t> avail;
+    for (int64_t e = 0; e < E; ++e)
+        if (!excluded(p, e)) avail.push_back(e);
+    if (avail.empty() || top_k > (int64_t)avail.size()) return false;
+    const int64_t turn = (int64_t)(p.seed % (uint64_t)avail.size());
     std::vector<std::vector<int32_t>> rows_of((size_t)E);
     for (int64_t t = 0; t < M; ++t) {
-        std::vector<int64_t> used;
         for (int64_t j = 0; j < top_k; ++j) {
             const int64_t flat = t * top_k + j;
             if (flat >= T - p.drop) continue;
-            int64_t e;
-            if (p.all_to_first) {
-                e = 0;
-            } else {
-                do {
-                    e = (int64_t)(rnd.u32() % (uint32_t)E);
-                } while (std::find(used.begin(), used.end(), e) != used.end() || excluded(p, e));
-            }
-            used.push_back(e);
+            const int64_t e = p.all_to_first
+                                  ? 0
+                                  : avail[(size_t)((flat + turn) % (int64_t)avail.size())];
             rows_of[(size_t)e].push_back((int32_t)flat);
         }
     }
@@ -196,6 +197,7 @@ bool build(const Plan& p, Built* b) {
     }
 
     /* The activation: one row a token (gate_up's a_order) or one a sorted slot (down's). */
+    Rng rnd(p.seed);
     const int64_t Arows = p.sorted_a ? T : M;
     b->a.assign((size_t)(Arows * b->Kmax), 0);
     b->as.assign((size_t)(Arows * (b->Kmax / 128)), 0.0f);
@@ -281,7 +283,7 @@ int bad_reference_cells(const Built& b, const std::vector<uint16_t>& y) {
     const Plan& p = b.plan;
     const int64_t Nmax = std::max(p.N[0], p.N[1]), fy = Nmax / p.parts;
     int bad = 0;
-    for (int64_t i = 0; i < b.g.T; i += 3) {
+    for (int64_t i = 0; i < b.g.T; ++i) {
         const int64_t e = expert_of(b.off, p.E, i);
         if (e < 0) continue;
         const int64_t q = e & 1, Nc = p.N[q], Kc = p.K[q], nkb = Kc / 128;
@@ -320,10 +322,10 @@ TEST(moe_iqr_reference_covers_runs_zero_rows_and_topk) {
         radtest::artifact_missing(__FILE__, __LINE__, "libr3d's moe_gemm_iqr layout hooks");
         return;
     }
-    CHECK(build(p, &b));
+    REQUIRE(build(p, &b));
     std::vector<uint8_t> live;
     const std::vector<uint16_t> y = reference(b, &live);
-    CHECK(!y.empty());
+    REQUIRE(!y.empty());
     CHECK_EQ((int64_t)b.off.size(), p.E + 1);
 
     /* The run map: offsets monotone, the prefix is a permutation of the live slots, the tail is
@@ -349,6 +351,10 @@ TEST(moe_iqr_reference_covers_runs_zero_rows_and_topk) {
     int dup = 0;
     for (int v : seen) dup += v > 1;
     CHECK_EQ(dup, 0);
+    int classes = 0;
+    for (int64_t e = 0; e < p.E; ++e)
+        if (b.off[(size_t)e] < b.off[(size_t)e + 1]) classes |= 1 << (int)(e & 1);
+    CHECK_EQ(classes, 3);
 
     /* A row an expert owns is computed where its class is wide; a narrower class's part is zero
      * past its width; a dropped tail row is zero everywhere. */
@@ -410,13 +416,16 @@ TEST(moe_iqr_reference_sorted_rows_and_parts) {
     Plan p{ "sorted rows, two parts", 4, 2, 2, 2, { 512, 512 }, { 256, 256 }, true, 0, false, false,
             0xBEEF1234u };
     Built b;
-    CHECK(build(p, &b));
+    REQUIRE(build(p, &b));
     std::vector<uint8_t> live;
     const std::vector<uint16_t> y = reference(b, &live);
-    CHECK(!y.empty());
+    REQUIRE(!y.empty());
     CHECK_EQ(bad_reference_cells(b, y), 0);
     const int64_t Nmax = 512, fy = Nmax / p.parts;
-    int bad_live = 0;
+    int bad_live = 0, classes = 0;
+    for (int64_t e = 0; e < p.E; ++e)
+        if (b.off[(size_t)e] < b.off[(size_t)e + 1]) classes |= 1 << (int)(e & 1);
+    CHECK_EQ(classes, 3);
     for (int64_t i = 0; i < b.g.T; ++i)
         for (int64_t part = 0; part < p.parts; ++part)
             for (int64_t j = 0; j < fy; ++j)
@@ -432,7 +441,7 @@ TEST(moe_iqr_layout_round_trips_both_classes) {
     Plan p{ "layout round trip", 4, 2, 1, 1, { 256, 512 }, { 256, 128 }, false, 0, false, false,
             0x1234ABCDu };
     Built b;
-    CHECK(build(p, &b));
+    REQUIRE(build(p, &b));
     const std::vector<RadParam> lp = {
         pint("N", p.N[0]), pint("K", p.K[0]), pint("N_odd", p.N[1]), pint("K_odd", p.K[1]),
         pint("group", 128), pstr("dtype", "i8a8h"), pint("parts", p.parts), pint("a_group", 128),
@@ -616,8 +625,10 @@ bool run_card(const Plan& p, int* worst_out, int64_t* diff_out) {
     args.world_size = 1;
     if (lib().scratch) {
         const int64_t need = lib().scratch(&args);
+        if (need < 0) return false;
         if (need > 0) {
             args.scratch = dev.alloc((size_t)need);
+            if (!args.scratch) return false;
             args.scratch_bytes = need;
         }
     }
@@ -704,6 +715,11 @@ TEST(moe_iqr_on_the_card_matches_the_host_reference) {
     };
     if (!lib().card_ok()) {
         SKIP("libr3d has no moe_gemm_iqr row yet (r3d_rad_moe_gemm_iqr absent)");
+        return;
+    }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev <= 0) {
+        SKIP("no HIP device for the moe_gemm_iqr card case");
         return;
     }
     int worst_all = 0;

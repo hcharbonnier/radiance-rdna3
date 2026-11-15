@@ -292,10 +292,18 @@ inline bool moe_gemm_reference(const std::vector<MoeExpert>& ex, const MoeGeom& 
     if (Nmax <= 0 || Kmax <= 0 || Kmax % g.a_group || Nmax % parts) return false;
     nsa = Kmax / g.a_group;
     if ((int64_t)a.size() < Arows * Kmax || (int64_t)as.size() < Arows * nsa) return false;
+    for (int64_t e = 0; e <= g.n_expert; ++e) {
+        if (off[(size_t)e] < 0 || off[(size_t)e] > g.T) return false;
+        if (e > 0 && off[(size_t)e - 1] > off[(size_t)e]) return false;
+    }
 
     for (int64_t e = 0; e < g.n_expert; ++e) {
         const MoeExpert& x = ex[(size_t)e];
-        if (!x.w || !x.sb || x.N <= 0 || x.K <= 0 || x.K % 128 || x.form.scale != kRowF32)
+        const int64_t cls = e % ncls;
+        if (!x.w || !x.sb || x.N <= 0 || x.K <= 0 || x.K % 128 ||
+            x.N != g.N[cls] || x.K != g.K[cls] || x.form.scale != kRowF32 ||
+            x.form.lrb != 0 || x.form.bits < 1 || x.form.bits > 7 ||
+            x.form.L < 1 || x.form.L > 31 || x.form.run <= 0 || x.N % x.form.run)
             return false;
     }
 
@@ -362,8 +370,14 @@ inline bool moe_gather_reference(const std::vector<uint16_t>& rows, const MoeGeo
                                  const std::vector<float>& gate, std::vector<float>* out) {
     int64_t Nmax = 0;
     for (int64_t q = 0; q < g.ncls; ++q) Nmax = std::max(Nmax, g.N[q]);
-    if (!out || Nmax <= 0 || (int64_t)rows.size() < g.T * Nmax || (int64_t)gate.size() < g.T)
+    if (!out || Nmax <= 0 || g.n_expert <= 0 || g.top_k <= 0 ||
+        (int64_t)rows.size() < g.T * Nmax || (int64_t)sorted.size() < g.T ||
+        (int64_t)off.size() < g.n_expert + 1 || (int64_t)gate.size() < g.T)
         return false;
+    for (int64_t e = 0; e <= g.n_expert; ++e) {
+        if (off[(size_t)e] < 0 || off[(size_t)e] > g.T) return false;
+        if (e > 0 && off[(size_t)e - 1] > off[(size_t)e]) return false;
+    }
     out->assign((size_t)(g.M * Nmax), 0.0f);
     std::vector<int64_t> row_of((size_t)g.T, -1);
     for (int64_t i = 0; i < g.T; ++i) {
