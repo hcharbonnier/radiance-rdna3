@@ -12,10 +12,10 @@
 | W3 — GEMM M ≤ 16 | en cours | 1,5 sem | GEMV 86 % ; m16 `v_dot4` à porter |
 | W4 — m64 et préfill | à faire | 2,5 sem | m64, tuile préfill, bout en bout 27B |
 | W5 — MoE IQR | à faire | 4 sem | run map, formes mixtes, experts bf16 |
-| W6 — attention h256/GQA/KV i8 | **à démarrer** | 3,5 sem | nécessaire à M1 (GQA 6) |
-| W7 — QSA | à faire | 2,5 sem | |
-| W8 — HC | à faire | 3,5 sem | |
-| W9 — PLE | à faire | 1,5 sem | |
+| W6 — attention h256/GQA/KV i8 | en cours (sous-agent) | 3,5 sem | branche `rdna3-w6-attn-h256` |
+| W7 — QSA | à faire | 2,5 sem | après W6 |
+| W8 — HC | en cours (sous-agent) | 3,5 sem | branche `rdna3-w8-w9-hc-ple` |
+| W9 — PLE | en cours (sous-agent) | 1,5 sem | même branche, avant HC |
 | W10 — vision | à faire | 3 sem | conteneur sans média autorisé (ADR-5) |
 | W11 — intégration | à faire | 1,5 sem | |
 | W12 — optimisation | à faire | 3–4 sem | |

@@ -124,6 +124,16 @@ plugin `qwen4exp_fp8@0.1.0`. Même monde que le handover.
 
 **Décision** : **M0 = GO** (`MEMO_M0_RDNA3.md`).
 
+**Parallélisation** (autorisée par l'utilisateur, plan §6.5)
+
+- Deux sessions Agent Manager ouvertes depuis `rdna3-iqr` (c9f7d51) :
+  `rdna3-w6-attn-h256` (W6 attention h256/GQA/KV i8) et
+  `rdna3-w8-w9-hc-ple` (W9 PLE puis W8 HC). Travail d'implémentation seulement :
+  aucun benchmark ni test GPU concurrent, build device autorisé. Revue et fusion
+  assurées par le coordinateur.
+- Les lots IQR (W1–W5) restent séquentiels : point de contention du décodeur
+  (plan §6.5). Les benchmarks restent séquentiels (une carte).
+
 **Prochaine étape** : W1/W2 (table, grid, `kE4m3`, `tcq_rb`, refus), W3 (m16), W4
 (m64/préfill), et W6 en parallèle (attention h256/GQA 6).
 
