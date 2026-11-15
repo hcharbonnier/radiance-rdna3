@@ -117,7 +117,10 @@ __global__ void __launch_bounds__(kThreads) R3D_WAVES(4) logits16_kernel(
     c.run_tiles = run_tiles;
     c.tab = nullptr;   /* the head's classes are the computed trellis */
 
-    __shared__ __align__(4) uint8_t sW[16 * 128];
+    /* 16 x 128 int8 as 32 dwords a row, plus one pad dword: 33 mod 32 is 1, so the 16 rows'
+     * same-column reads land in 16 different LDS banks instead of all in the one a 32-dword
+     * stride would give. The pad is never read; the row's dwords keep lane order. */
+    __shared__ uint32_t sW[16 * 33];
 
     const int row0 = (int)rt * 16;
     constexpr int NP = (MT * 16 + (int)kThreads - 1) / (int)kThreads;
@@ -131,7 +134,7 @@ __global__ void __launch_bounds__(kThreads) R3D_WAVES(4) logits16_kernel(
         Dec<F>::rows(r, c, 1.0f, w);
         Dec<F>::unzero(c, rt, kb, w);
 #pragma unroll
-        for (int q = 0; q < 16; ++q) *(uint32_t*)(sW + q * 128 + 4u * lane) = w[q];
+        for (int q = 0; q < 16; ++q) sW[q * 33 + (int)lane] = w[q];
         __syncthreads();
 
         if constexpr (MT == 1) {
@@ -145,7 +148,7 @@ __global__ void __launch_bounds__(kThreads) R3D_WAVES(4) logits16_kernel(
             const int tok = tok0;
             if (tok < M) {
                 const int8_t* ap = (hi ? xh : xl) + (long long)tok * K + (long long)kb * 128;
-                const uint32_t* wp = (const uint32_t*)(sW + q * 128);
+                const uint32_t* wp = sW + q * 33;
                 int s = 0;
 #pragma unroll
                 for (int c4 = 0; c4 < 32; ++c4)
@@ -167,7 +170,7 @@ __global__ void __launch_bounds__(kThreads) R3D_WAVES(4) logits16_kernel(
                 if (tok >= M) continue;
                 const int8_t* h = xh + (long long)tok * K + (long long)kb * 128;
                 const int8_t* l = xl + (long long)tok * K + (long long)kb * 128;
-                const uint32_t* wp = (const uint32_t*)(sW + q * 128);
+                const uint32_t* wp = sW + q * 33;
                 int sh = 0, sl = 0;
 #pragma unroll
                 for (int c4 = 0; c4 < 32; ++c4) {
