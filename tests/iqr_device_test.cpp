@@ -819,14 +819,16 @@ struct Cls {
     RadLayout L{}, LS{};
     std::vector<int32_t> ids;
     int64_t rows = 0;
+    uint32_t bits = 4;
 };
 
-bool make_class(Cls& c, int64_t rows, int64_t K, int32_t id0, uint64_t seed) {
+bool make_class(Cls& c, int64_t rows, int64_t K, int32_t id0, uint64_t seed, uint32_t bits = 4) {
     g_z = seed;
     c.rows = rows;
+    c.bits = bits;
     rad_enc_clear(&c.w.enc);
     rad_enc_copy_str(c.w.enc.scheme, "trellis");
-    rad_enc_add_plane(&c.w.enc, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&c.w.enc, "codes", kU[bits], 1, 1);
     rad_enc_add_plane(&c.w.enc, "scale", RAD_F32, 1, 0);
     rad_enc_add_plane(&c.w.enc, "scale.col", RAD_F32, 0, 128);
     const int t = rad_enc_add_table(&c.w.enc, "trellis", RAD_I8, 1ll << 16, 1);
@@ -881,7 +883,7 @@ bool make_class(Cls& c, int64_t rows, int64_t K, int32_t id0, uint64_t seed) {
 void reference16(const Cls& cl, const std::vector<float>& xr, int64_t M, int64_t K, int32_t voff,
                  int64_t n_vocab, float* want) {
     const int64_t rows = cl.rows, nkb = K / 128;
-    const std::vector<int8_t> dec = decode_class(cl.w, 4, 16, rows, K);
+    const std::vector<int8_t> dec = decode_class(cl.w, cl.bits, 16, rows, K);
     const float* rs = (const float*)cl.w.data[(size_t)cl.w.find("scale")].data();
     const float* cf = (const float*)cl.w.data[(size_t)cl.w.find("scale.col")].data();
     for (int64_t m = 0; m < M; ++m)
@@ -908,11 +910,12 @@ void reference16(const Cls& cl, const std::vector<float>& xr, int64_t M, int64_t
  * these magnitudes (ulp 0.125 at 22), which is the point of the sixteen-bit activation. */
 constexpr float kLogitAtol = 5e-3f, kLogitRtol = 2e-4f;
 
-bool run_vocab(int64_t M) {
+bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bits = nullptr) {
     const int64_t rows = 256, K = 512, n_vocab = 768, voff = 128;
     Cls cls[4];
     for (int i = 0; i < 4; ++i)
-        if (!make_class(cls[i], rows, K, (int32_t)(i * rows), 0x9E3779B97F4A7C15ull * (i + 3)))
+        if (!make_class(cls[i], rows, K, (int32_t)(i * rows), 0x9E3779B97F4A7C15ull * (i + 3),
+                        bits ? bits[i] : 4u))
             return false;
     const int64_t nkb = K / 128;
     std::vector<uint16_t> xb((size_t)(M * K));
@@ -967,6 +970,7 @@ bool run_vocab(int64_t M) {
         return false;
     }
     hipMemcpy(logits.data(), dl, logits.size() * 4, hipMemcpyDeviceToHost);
+    if (out) *out = logits;
 
     /* The f32 reference's rotated activation comes from the same bf16 values the kernel reads. */
     std::vector<float> xr((size_t)(M * K));
@@ -1139,7 +1143,47 @@ TEST(iqr_vocab_head_matches_its_reference) {
     int nd = 0;
     if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) return;
     CHECK(run_vocab(1));
+    CHECK(run_vocab(2));
     CHECK(run_vocab(7));
+    /* Four classes of different code widths, one launch: the width dispatch, not just the
+     * per-class pointers. */
+    const uint32_t mixed[4] = { 2, 3, 5, 7 };
+    CHECK(run_vocab(2, nullptr, mixed));
+}
+
+/* The head's two tilings: M = 1 selects MT = 1 (the hi/lo wave split), M = 2 selects MT = 2. The
+ * exact integer sums and the f32 fold are the same code and the same order, so the common token's
+ * logits must be bit-identical, and both runs must stay within the reference's tolerance. The
+ * fixture's four classes are the multi-class case; the second pair gives them different widths. */
+TEST(iqr_vocab_head_is_bit_exact_across_mt) {
+    if (!lib().ok() || !lib().logits || !lib().logits_scratch) return;
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) return;
+    const uint32_t fixed[4] = { 4, 4, 4, 4 };
+    const uint32_t mixed[4] = { 2, 3, 5, 7 };
+    std::vector<float> one, two, one_mixed, two_mixed;
+    CHECK(run_vocab(1, &one, fixed));
+    CHECK(run_vocab(2, &two, fixed));
+    CHECK(run_vocab(1, &one_mixed, mixed));
+    CHECK(run_vocab(2, &two_mixed, mixed));
+
+    auto same = [](const std::vector<float>& a, const std::vector<float>& b, const char* what) {
+        const bool shape = a.size() == b.size() / 2;   /* M = 2's first row */
+        const bool exact = shape && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+        if (!exact) {
+            size_t first = a.size();
+            for (size_t i = 0; shape && i < a.size(); ++i)
+                if (std::memcmp(&a[i], &b[i], sizeof(float))) { first = i; break; }
+            std::fprintf(stderr,
+                         "vocab %s: M=1 vs M=2 not bit-exact (%zu vs %zu floats), first %zu: "
+                         "%.9g vs %.9g\n",
+                         what, a.size(), b.size(), first, first < a.size() ? a[first] : 0.0f,
+                         first < b.size() ? b[first] : 0.0f);
+        }
+        return exact;
+    };
+    CHECK(same(one, two, "four classes of 4 bits"));
+    CHECK(same(one_mixed, two_mixed, "classes of 2/3/5/7 bits"));
 }
 
 TEST(iqr_gemm_bench_on_the_27b_shapes_when_asked) {    if (!std::getenv("RAD_IQR_BENCH") || !lib().ok()) return;
