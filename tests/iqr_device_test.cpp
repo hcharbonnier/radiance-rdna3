@@ -368,8 +368,19 @@ bool run_case(const Case& c) {
     } else {
         const char* role = c.kind == kTable ? "table" : "grid";
         int8_t* tab = (int8_t*)w.data[(size_t)w.find(role)].data();
-        for (size_t i = 0; i < w.data[(size_t)w.find(role)].size(); ++i)
-            tab[i] = (int8_t)((int)(rnd() % 255) - 127);
+        const size_t ntab = w.data[(size_t)w.find(role)].size();
+        for (size_t i = 0; i < ntab; ++i) tab[i] = (int8_t)((int)(rnd() % 255) - 127);
+        if (c.pattern == 1)   /* the zero-code case decodes a zero weight */
+            for (size_t i = 0; i < (c.kind == kGrid ? 4u : 1u); ++i) tab[i] = 0;
+        if (c.pattern == 2) {   /* the max code reaches the int8 negative boundary */
+            int8_t* last = tab + (ntab - (c.kind == kGrid ? 4u : 1u));
+            last[0] = -127;
+            if (c.kind == kGrid) {
+                last[1] = 127;
+                last[2] = -127;
+                last[3] = 127;
+            }
+        }
     }
     if (c.sc == kRowF32) {
         float* rs = (float*)w.data[(size_t)w.find("scale")].data();
