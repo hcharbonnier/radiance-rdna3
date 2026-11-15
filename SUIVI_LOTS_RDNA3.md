@@ -18,9 +18,9 @@
 | W9 — PLE | **terminé (revu, device vert)** | 1,5 sem | 4 rows ; `opd_shape` en W11 |
 | W10 — vision | **terminé (revu, 142 rows vertes)** | 3 sem | coût attn_dense à optimiser en W12 |
 | W11 — intégration | **terminé (2026-11-15)** | 1,5 sem | tête vocabulaire validée et servie par défaut |
-| W12 — optimisation | à faire | 3–4 sem | |
+| W12 — optimisation | **terminé (2026-11-15)** | 3–4 sem | préfill 27B ×3,8 ; gated fusionné ; tête 16 bits ; h256/vision ; W13 = WMMA/IU8, split-K `down`, mesures isolées |
 | M0 — Go/No-Go | **GO (2026-11-15)** | fin S3 | `MEMO_M0_RDNA3.md` |
-| M1 — dense IQR | **atteint : 27B texte, decode 21–28 tok/s, préfill jusqu'à 819 tokens** | fin S8 | optimisation en W12 |
+| M1 — dense IQR | **atteint et dépassé : 27B texte, décodage 27,2 tok/s (16 tok) / 20,8 (819), préfill 303 tok/s à 819** | fin S8 | W13 : préfill WMMA, split-K |
 
 ## Risques ouverts
 
@@ -39,3 +39,12 @@
 - **R7** — *résolu* : le préfill > 16 tokens segfaultait parce que
   `rad_gemm_run` lisait l'en-tête `rad.planes` sur un poids bf16 en VRAM ; le
   peek ne s'applique plus qu'aux poids privés. 33/83/819 tokens verts.
+- **R8** — Les gains de `attn_paged` h256 et `attn_dense` hd72 ne sont pas isolés :
+  les chiffres 27B les incluent sans les distinguer. Les noyaux restent dans
+  l'arbre, marqués à mesurer puis optimiser en W13 (voir
+  `TABLEAU_REEL_IDEAL_RDNA3.md`, « Optimisations différées »).
+- **R9** — La vérification des formes E4M3/rotated sur un modèle non-IQR reste
+  impossible : aucun 2B/4B sur l'hôte, seulement le 27B et le Flash-Next.
+- **R10** — `gemm_iqr_gated_i8a8h` fusionné n'utilise que 1,4 bloc par CU
+  (136 groupes, 96 CU) ; son gain est réel (~1,5 % en décodage) mais son
+  occupation est à revoir en W13 (deux groupes par bloc ou 256 threads).

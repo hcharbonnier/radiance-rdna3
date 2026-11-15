@@ -405,5 +405,56 @@ is ») traverse les bandes tiled M ≤ 64/127/512.
 
 **Selftest après correctif** : RC=0, 144 rows, 0 échec, 14 skips ; norme 7/7.
 
+## 2026-11-15 — W12 : préfill résident, gated fusionné, tête 16 bits, h256/vision
+
+Cinq chants menés en parallèle dans des worktrees Agent Manager, revus par leurs
+auteurs puis fusionnés sur `rdna3-iqr` (10 commits, `d4de0ca`→`d8418c1`).
+
+- **`gemm_iqr_tiled` résident** : une tuile de 16×128 est décodée une fois par
+  (tuile, bloc K) et réutilisée pour toutes les tranches de 16 tokens ; l'ordre
+  numérique par (token, ligne) ne change pas, donc **bit-identique** au tiled
+  précédent (cas M=33/160/512 ajoutés au test device). Préfill 819 tokens :
+  **79,9 → 303,2 tok/s**, TTFT **10,25 → 2,70 s**.
+- **Gated IQR fusionné** : decode gate/up, gate, arrondi bf16, Hadamard et codes
+  en **un seul launch** (16 waves par groupe de 128 colonnes), sans scratch
+  `[M, 2n]`. Test dédié : **codes, échelles et `out_bf16` identiques octet pour
+  octet** à la paire m16 + `gated_had_quant_i8g` pour M=1/5/16, silu/sigmoid,
+  avec et sans `out_bf16`. Gain mesuré ~1,5 % en décodage.
+- **Tête IQR 16 bits** : activation `q = 128·hi + lo`, deux passes int8 exactes,
+  repli f32 unique, **plus aucun intermédiaire bf16** ; la row garde son contrat
+  (`vocab_offset`, classes 0..3, ids hors rang ignorés). Premier jet 3 % plus
+  lent au décodage : les 16 lignes de la tuile LDS étaient lues au même banc à
+  chaque `c4` (stride 32 dwords). Pitch de **33 dwords** + split hi/lo sur les
+  32 lanes : décodage à parité (27,2 contre 27,3 tok/s à 16 tokens ; 20,8
+  contre 20,4 à 819).
+- **`attn_paged` h256** : page i8 staged en blocs de 16 octets, `nu` limite les
+  slots visibles, passe max sans V. 15/15 identiques à libref.
+- **`attn_dense` hd72** : tuilage LDS de K/V, chargements bf16 16 octets,
+  élargissement exact et même ordre de dots (sortie identique ou dans la
+  tolérance libref), garde `grid.y` et index de ligne 64 bits. 142 rows vision
+  vertes.
+
+**Validation** : `iqr_device_test` 4 cas/11 checks verts ; `r3d_selftest`
+**144 rows, 0 échec, 14 skips**. 27B : mêmes sorties greedy que la base
+(« the Cook Islands is Avarua… »).
+
+**Attribution A/B** (décodage 16 tok, préfill 819) : base 27,3/79,9 ; sans gated
+25,9/303 ; sans tête 27,0/300 ; final 27,2/303. Le préfill vient du résident,
+le gated est un gain, la tête est neutre après le pitch.
+
+**Pièges** : (1) un stride de 32 dwords en LDS met 16 lignes sur le même banc —
+pitch impair obligatoire ; (2) un `build` neuf ne contient pas les plugins
+`architectures/`, il faut construire la cible par défaut ou le serveur refuse
+« no architecture plugin claims 'qwen35' » ; (3) chaque agent doit avoir son
+propre répertoire distant et tout test GPU passe par
+`flock /tmp/radiance-gpu.lock` ; (4) un lancement de benchmark par arbre, même
+requêtes, mêmes lots.
+
+**Reste à optimiser (W13+)** : cœur WMMA/IU8 du préfill, split-K `down`,
+occupation du gated (1,4 bloc/CU), classes parallèles de la tête, mesure isolée
+h256/vision, HC/PLE. Détail dans `HANDOVER_RDNA3_PHASE5.md` et
+`TABLEAU_REEL_IDEAL_RDNA3.md`.
+
+
 
 
