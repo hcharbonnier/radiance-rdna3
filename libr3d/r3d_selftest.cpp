@@ -419,6 +419,8 @@ static void check_shapes() {
                               PI("seqs", 2), PS("dtype", "bf16") } },
         { "qsa_block_key", { PI("M", 8), PI("n", 128), PI("ratio", 4), PI("rotary_dim", 64),
                              PF("eps", 1e-6), PF("theta", 1e7), PS("dtype", "bf16") } },
+        { "qsa_score", { PI("M", 8), PI("n", 128), PI("heads", 4), PI("blocks", 256),
+                         PI("seqs", 2), PS("dtype", "bf16") } },
         { "gated_had_quant_i8", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
         { "had_quant_act_fp8", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
         { "gated_had_quant_fp8", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },

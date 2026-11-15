@@ -472,6 +472,27 @@ int r3d_shape_qsa_block_key(const RadParam* p, int n_p, int operand, RadOpdDesc*
     R3D_PICK(list);
 }
 
+/* The QSA block score: q [M, heads*n], bk [pages, n] (a page holds exactly n contiguous values;
+ * a KV cache's rank is a container detail), `bt` [seqs, blocks] page ids, `cu` [seqs+1], `nc`
+ * [seqs], and score [M, blocks] f32. The table's entries index the key store, and cu is the join
+ * from a query row to its sequence. */
+int r3d_shape_qsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t h = gi(p, n_p, "heads", 0), nb = gi(p, n_p, "blocks", 0);
+    const int64_t s = gi(p, n_p, "seqs", 1);
+    if (n <= 0 || h <= 0 || nb <= 0 || s <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd(D, M, h * n),                                /* q */
+        opd(D, nb, n),                                   /* bk, one page a row */
+        opd_idx(s, 0, -1, 0, nb),                        /* bt: page ids below nb */
+        opd_idx(s + 1, M + 1, -1, RAD_OPD_F_IDX_CU, 1),  /* cu: cumulative query rows */
+        opd_idx(s, nb + 1, -1, 0, 1),                    /* nc: complete blocks, 0 .. nb */
+        opd((uint32_t)RAD_F32, M, nb)                    /* score */
+    };
+    R3D_PICK(list);
+}
+
 /* The gated Hadamard int8: a [M, n], b [M, n] (optional, fused gate_up when absent), q [M, n] i8,
  * scale [M]. */
 int r3d_shape_gated_had_quant_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

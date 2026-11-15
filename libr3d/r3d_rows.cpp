@@ -249,6 +249,11 @@ static const RadOperandSpec oQsaBlockKey[] = { { "k", RAD_OPD_IN, 0 },
                                                { "page", RAD_OPD_IN, 1 },
                                                { "pos", RAD_OPD_IN, 1 },
                                                { "out", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pQsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"),
+                                          P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oQsaScore[] = { { "q", RAD_OPD_IN, 0 }, { "bk", RAD_OPD_IN, 0 },
+                                            { "bt", RAD_OPD_IN, 0 }, { "cu", RAD_OPD_IN, 0 },
+                                            { "nc", RAD_OPD_IN, 0 }, { "score", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pGatedHadQuantI8[] = { P_INT("M"), P_INT("n"), P_INT("group"),
                                                  P_STR("dtype"), P_STRO("act"), P_INTO("mode") };
 static const RadOperandSpec oGatedHadQuantI8[] = { { "a", RAD_OPD_IN, 0 },
@@ -859,6 +864,11 @@ static const RadOpSchema kSchemas[] = {
            "(wadd + w); the key is rotated at the block's first-token position (`pos[b]` under "
            "mode/sections, or `pos0 + b*ratio`) with YaRN when given. `page[b]` is the output row; "
            "a negative entry writes nothing."),
+    SCHEMA("qsa_score", pQsaScore, oQsaScore,
+           "The QSA indexer's block score: score[m][b] = (sum over heads of relu(q[m][h] . "
+           "bk[bt[seq(m)][b]])) / sqrt(n), for b below min(nc[seq], the table's and the score "
+           "plane's widths). The relu is per (block, head) and the sum is over the heads, in "
+           "that order. `bt` holds page ids; a negative entry scores -inf, never zero."),
     SCHEMA("gated_had_quant_i8", pGatedHadQuantI8, oGatedHadQuantI8,
            "A gated product (mode 0 silu(a)*b, mode 1 sigmoid(a)*b), a block Hadamard along n, "
            "then per-row symmetric int8: the rotation shrinks the row maximum, so int8 beats e4m3."),
@@ -1576,6 +1586,11 @@ static const RadConstraint cKvLenTrim[] = { C_GE("max_seqs", 1), C_LE("max_seqs"
 static const RadConstraint cQsaTailStore[] = { C_IN("dtype", "bf16"), C_GE("seqs", 1) };
 /* The block key's LDS is one f32 row, so n is bounded by it; the board's index head is 128. */
 static const RadConstraint cQsaBlockKey[] = { C_IN("dtype", "bf16"), C_LE("n", 4096) };
+/* The score row takes the indexer's activation dtype for q; `bk` may be the block-key group's
+ * own bf16 whichever row runs. */
+static const RadConstraint cQsaScoreBf16[] = { C_IN("dtype", "bf16") };
+static const RadConstraint cQsaScoreF16[]  = { C_IN("dtype", "f16") };
+static const RadConstraint cQsaScoreF32[]  = { C_IN("dtype", "f32") };
 /* group is the block width: the kernel instantiates 128, 256 and 512 (the shim declines the
  * DIV-legal 384, which no wave form serves). */
 static const RadConstraint cGatedHadQuantI8[] = { C_IN("dtype", "bf16"), C_DIV("group", 128),
@@ -2306,6 +2321,39 @@ static const RadKernelInfo kKernels[] = {
   ROW(cQsaBlockKey), NOTUNE,
   nullptr, nullptr, r3d_rad_qsa_block_key, nullptr, nullptr, nullptr,
   r3d_shape_qsa_block_key },
+
+/* The indexer's score. A thread owns one (query, block) pair and walks its heads and lanes in the
+ * reference's ascending f32 order, so the scores are bit-identical to libref's; the workgroup's
+ * lanes cover the block axis and share the row's sequence lookup. `nc` bounds the block loop, and
+ * a negative page id writes -inf, which qsa_select reads as absent. */
+{ "qsa_score_bf16", "qsa_score", "kv",
+  "the QSA indexer's block score: relu per (block, head), summed over heads, over 1/sqrt(n)",
+  "any n, head count and block count; a thread a (query, block); the dot is an ascending f32 "
+  "chain, the relus summed in head order; bt's page ids bound the store",
+  "bf16 q and bk (bk may be the group's bf16 in another dtype), i32 bt/cu/nc, f32 scores; a "
+  "negative page scores -inf and a page past the store is left unwritten",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cQsaScoreBf16), NOTUNE,
+  nullptr, nullptr, r3d_rad_qsa_score, nullptr, nullptr, nullptr,
+  r3d_shape_qsa_score },
+
+{ "qsa_score_f16", "qsa_score", "kv",
+  "the QSA indexer's block score: relu per (block, head), summed over heads, over 1/sqrt(n)",
+  "any n, head count and block count; a thread a (query, block); f16 queries widened exactly",
+  "f16 q, bf16/f16/f32 bk, i32 bt/cu/nc, f32 scores; a negative page scores -inf",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cQsaScoreF16), NOTUNE,
+  nullptr, nullptr, r3d_rad_qsa_score, nullptr, nullptr, nullptr,
+  r3d_shape_qsa_score },
+
+{ "qsa_score_f32", "qsa_score", "kv",
+  "the QSA indexer's block score: relu per (block, head), summed over heads, over 1/sqrt(n)",
+  "any n, head count and block count; a thread a (query, block); the reference's f32 chain",
+  "f32 q and bk, i32 bt/cu/nc, f32 scores; a negative page scores -inf",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cQsaScoreF32), NOTUNE,
+  nullptr, nullptr, r3d_rad_qsa_score, nullptr, nullptr, nullptr,
+  r3d_shape_qsa_score },
 
 { "gated_had_quant_i8_bf16", "gated_had_quant_i8", "quant",
   "a gated product (silu(a)*b or sigmoid(a)*b), a block Hadamard along n, then per-row int8",

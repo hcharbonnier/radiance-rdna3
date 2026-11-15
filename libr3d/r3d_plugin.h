@@ -260,6 +260,9 @@ int r3d_rad_qsa_tail_store(const RadArgs* a, RadStream s);
 /* --- r3d_qsa_block_key.hip: the QSA indexer's compressed key, pooled, normed and rotated. */
 int r3d_rad_qsa_block_key(const RadArgs* a, RadStream s);
 
+/* --- r3d_qsa_score.hip: the QSA indexer's block scores, per query. */
+int r3d_rad_qsa_score(const RadArgs* a, RadStream s);
+
 /* --- r3d_gated_had_quant_i8.hip: a gated product, block Hadamard, then per-row int8. */
 int r3d_rad_gated_had_quant_i8(const RadArgs* a, RadStream s);
 
@@ -312,6 +315,7 @@ int r3d_shape_gelu_mul_quant_i8(const RadParam* p, int n_p, int operand, RadOpdD
 int r3d_shape_kv_len_trim(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_qsa_block_key(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_qsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gated_had_quant_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_had_quant_act_fp8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gated_had_quant_fp8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
