@@ -165,8 +165,10 @@ R3D_IQR_HD constexpr int64_t tile_major(int64_t r, int64_t kb, int64_t nkb) {
 }
 
 /* The forms libr3d's kernels are built for, as (kind, B, log2 V, L, log2 rb, scale): one list, so
- * the layout hook refuses at declare a form no kernel reads. W0 reads the computed trellis; the
- * table and grid forms follow with the MoE lot. */
+ * the layout hook refuses at declare a form no kernel reads. The dense GEMM rows read the computed
+ * trellis (either scale) and, since W14, IQR-V1's scalar table (u2..u5) and vector grid
+ * (u8/u9/u10/u12, V = 4) under a bf16 scale a (row, 128); the remaining trellis and E4M3 forms stay
+ * declared here for the rows that consume them but are refused by the dense shims. */
 #define R3D_IQR_FORMS(X)                                                                          \
     /* IQR-V1: scalar tables, vector grids, 6-bit codes under a zero */                           \
     X(kTable, 2, 0, 0, 0, kBf16) X(kTable, 3, 0, 0, 0, kBf16) X(kTable, 4, 0, 0, 0, kBf16)        \

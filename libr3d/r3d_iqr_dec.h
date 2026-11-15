@@ -343,6 +343,7 @@ struct Dec {
                 w[15u - q] = pack4(pack2(v[0], v[1]), pack2(v[2], v[3]));
             }
         } else if constexpr (GRID) {
+            (void)ratio;
             constexpr uint32_t V = 1u << F::LV, PER = 4u / V;
 #pragma unroll
             for (uint32_t q = 0; q < 16; ++q) {

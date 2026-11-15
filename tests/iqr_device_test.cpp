@@ -109,6 +109,13 @@ RadParam pstr(const char* k, const char* v) {
 
 const uint32_t kU[] = { 0, RAD_U1, RAD_U2, RAD_U3, RAD_U4, RAD_U5, RAD_U6, RAD_U7 };
 
+/* The unsigned code dtype of a width up to 12 bits, for the grid forms. */
+uint32_t udt(uint32_t b) {
+    static const uint32_t t[] = { 0,      RAD_U1,  RAD_U2,  RAD_U3,  RAD_U4,  RAD_U5,  RAD_U6,
+                                  RAD_U7, RAD_U8,  RAD_U9,  RAD_U10, RAD_U11, RAD_U12 };
+    return b < (uint32_t)(sizeof t / sizeof t[0]) ? t[b] : 0;
+}
+
 /* One form's canonical planes, as a container hands them over. */
 struct W {
     RadEncoding enc{};
@@ -208,6 +215,9 @@ struct Case {
     int64_t N, K;
     int M;
     bool split = false;   /* ask the row for its split-K scratch (the GEMV's narrow band) */
+    Kind kind = kTrellisMad;
+    int pattern = 0;      /* 0: random codes, 1: all zero, 2: all one bits */
+    uint32_t LV = 0;      /* Grid: log2 V */
 };
 
 /* Split-K sums S slab partials instead of the reference's one ascending chain: the same group
@@ -215,16 +225,36 @@ struct Case {
  * 5120; two covers a second boundary flip and is still orders below any decode or scale error. */
 constexpr int kSplitMaxUlps = 2;
 
-/* The decoded weight, row-major [N, K]. The values are canonical_state's, one (n, k) at a time,
- * but the state advances by one code as n rises inside a 256-row run instead of restarting from
- * the run's seed: N * K steps rather than N * K * run. The down shape (5120 x 17408) is otherwise
- * too slow for the device test. */
-std::vector<int8_t> decode_rows(const W& w, uint32_t B, uint32_t L, uint32_t RB, Scale sc,
-                                int64_t N, int64_t K, const uint8_t* sb, int64_t nkb) {
+/* The decoded weight, row-major [N, K]. A trellis's values are canonical_state's, one (n, k) at a
+ * time, but the state advances by one code as n rises inside a 256-row run instead of restarting
+ * from the run's seed: N * K steps rather than N * K * run. The down shape (5120 x 17408) is
+ * otherwise too slow for the device test. A table code is its entry; a grid code is a V-vector of
+ * entries (V = 4 for the built forms). */
+std::vector<int8_t> decode_rows(const W& w, Kind kind, uint32_t B, uint32_t LV, uint32_t L,
+                                uint32_t RB, Scale sc, int64_t N, int64_t K, const uint8_t* sb,
+                                int64_t nkb) {
+    std::vector<int8_t> dec((size_t)(N * K));
+    if (kind == kTable) {
+        const int8_t* tab = (const int8_t*)w.data[(size_t)w.find("table")].data();
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t k = 0; k < K; ++k)
+                dec[(size_t)(n * K + k)] = tab[code_at(w, n, k, B)];
+        return dec;
+    }
+    if (kind == kGrid) {
+        const int8_t* grid = (const int8_t*)w.data[(size_t)w.find("grid")].data();
+        const int64_t V = (int64_t)1 << LV, nc = K / V;
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t c = 0; c < nc; ++c) {
+                const uint32_t code = code_at(w, n, c, B);
+                for (int64_t j = 0; j < V; ++j)
+                    dec[(size_t)(n * K + c * V + j)] = grid[code * V + j];
+            }
+        return dec;
+    }
     const Form f{ kTrellisMad, B, 0, L, RB, sc, 0, 0 };
     const uint32_t A = ((const uint32_t*)(w.data[(size_t)w.find("trellis.mad")].data()))[0];
     const uint32_t Bc = ((const uint32_t*)(w.data[(size_t)w.find("trellis.mad")].data()))[1];
-    std::vector<int8_t> dec((size_t)(N * K));
     const int64_t run = 256;
     const uint32_t mask = (1u << L) - 1u;
     const int64_t nspan = (L + B - 1) / B;
@@ -258,8 +288,9 @@ std::vector<uint16_t> reference(const W& w, const Case& c, const std::vector<int
                                 const std::vector<float>& as, const uint8_t* sb, int64_t sbytes) {
     const int64_t nkb = c.K / 128;
     (void)sbytes;
-    const Form f{ kTrellisMad, c.B, 0, c.L, c.RB, c.sc, 0, 0 };
-    const std::vector<int8_t> dec = decode_rows(w, c.B, c.L, c.RB, c.sc, c.N, c.K, sb, nkb);
+    const Form f{ c.kind, c.B, c.LV, c.L, c.RB, c.sc, 0, 0 };
+    const std::vector<int8_t> dec =
+        decode_rows(w, c.kind, c.B, c.LV, c.L, c.RB, c.sc, c.N, c.K, sb, nkb);
     /* The scales the GEMM folds. */
     std::vector<uint16_t> y((size_t)(c.M * c.N));
     for (int m = 0; m < c.M; ++m)
@@ -291,29 +322,55 @@ std::vector<uint16_t> reference(const W& w, const Case& c, const std::vector<int
 bool run_case(const Case& c) {
     W w;
     rad_enc_clear(&w.enc);
-    rad_enc_copy_str(w.enc.scheme, "trellis");
-    rad_enc_add_plane(&w.enc, "codes", kU[c.B], 1, 1);
-    if (c.sc == kRowF32) {
-        rad_enc_add_plane(&w.enc, "scale", RAD_F32, 1, 0);
-        rad_enc_add_plane(&w.enc, "scale.col", RAD_F32, 0, 128);
+    if (c.kind == kTrellisMad) {
+        rad_enc_copy_str(w.enc.scheme, "trellis");
+        rad_enc_add_plane(&w.enc, "codes", kU[c.B], 1, 1);
+        if (c.sc == kRowF32) {
+            rad_enc_add_plane(&w.enc, "scale", RAD_F32, 1, 0);
+            rad_enc_add_plane(&w.enc, "scale.col", RAD_F32, 0, 128);
+        } else {
+            rad_enc_add_plane(&w.enc, "scale", RAD_BF16, 1, 128);
+        }
+        const int t = rad_enc_add_table(&w.enc, "trellis", RAD_I8, (int64_t)1 << c.L, 1);
+        w.enc.plane[t].block[0] = 256;
+        w.enc.plane[t].block[1] = c.RB ? 32 : 0;
+        rad_enc_add_table(&w.enc, "trellis.mad", RAD_U32, 2, 1);
     } else {
-        rad_enc_add_plane(&w.enc, "scale", RAD_BF16, 1, 128);
+        rad_enc_copy_str(w.enc.scheme, "affine");
+        rad_enc_add_plane(&w.enc, "codes", udt(c.B), 1, c.kind == kGrid ? 4 : 1);
+        if (c.sc == kRowF32) {
+            rad_enc_add_plane(&w.enc, "scale", RAD_F32, 1, 0);
+            rad_enc_add_plane(&w.enc, "scale.col", RAD_F32, 0, 128);
+        } else {
+            rad_enc_add_plane(&w.enc, "scale", RAD_BF16, 1, 128);
+        }
+        if (c.kind == kTable)
+            rad_enc_add_table(&w.enc, "table", RAD_I8, 1, (int64_t)1 << c.B);
+        else
+            rad_enc_add_table(&w.enc, "grid", RAD_I8, (int64_t)1 << c.B, 4);
     }
-    const int t = rad_enc_add_table(&w.enc, "trellis", RAD_I8, (int64_t)1 << c.L, 1);
-    w.enc.plane[t].block[0] = 256;
-    w.enc.plane[t].block[1] = c.RB ? 32 : 0;
-    rad_enc_add_table(&w.enc, "trellis.mad", RAD_U32, 2, 1);
     rad_enc_copy_str(w.enc.transform, "fwht128");
     w.size(c.N, c.K);
 
     const int ic = w.find("codes");
-    for (auto& b : w.data[(size_t)ic]) b = (uint8_t)rnd();
-    const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
-    uint32_t* ab = (uint32_t*)w.data[(size_t)w.find("trellis.mad")].data();
-    ab[0] = A;
-    ab[1] = Bc;
-    int8_t* tab = (int8_t*)w.data[(size_t)w.find("trellis")].data();
-    for (uint32_t st = 0; st < (1u << c.L); ++st) tab[st] = (int8_t)mad_value(st, A, Bc);
+    if (c.pattern == 1) std::fill(w.data[(size_t)ic].begin(), w.data[(size_t)ic].end(), (uint8_t)0);
+    else if (c.pattern == 2)
+        std::fill(w.data[(size_t)ic].begin(), w.data[(size_t)ic].end(), (uint8_t)0xFF);
+    else
+        for (auto& b : w.data[(size_t)ic]) b = (uint8_t)rnd();
+    if (c.kind == kTrellisMad) {
+        const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
+        uint32_t* ab = (uint32_t*)w.data[(size_t)w.find("trellis.mad")].data();
+        ab[0] = A;
+        ab[1] = Bc;
+        int8_t* tab = (int8_t*)w.data[(size_t)w.find("trellis")].data();
+        for (uint32_t st = 0; st < (1u << c.L); ++st) tab[st] = (int8_t)mad_value(st, A, Bc);
+    } else {
+        const char* role = c.kind == kTable ? "table" : "grid";
+        int8_t* tab = (int8_t*)w.data[(size_t)w.find(role)].data();
+        for (size_t i = 0; i < w.data[(size_t)w.find(role)].size(); ++i)
+            tab[i] = (int8_t)((int)(rnd() % 255) - 127);
+    }
     if (c.sc == kRowF32) {
         float* rs = (float*)w.data[(size_t)w.find("scale")].data();
         for (int64_t n = 0; n < c.N; ++n) rs[n] = 0.001f + 0.0005f * (float)(n % 7);
@@ -784,6 +841,34 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
         { "mad u4 L16 bf16, 512 tokens (resident)", 4, 16, 0, kBf16, 256, 384, 512 },
         { "mad u4 L16 one-f32-row, 512 tokens (resident)", 4, 16, 0, kRowF32, 512, 384, 512 },
         { "mad u4 L16 bf16, 4096 tokens (resident)", 4, 16, 0, kBf16, 256, 384, 4096 },
+        /* IQR-V1's scalar codebook (kTable): the entry a u2..u5 code names, under a bf16 scale a
+         * (row, 128). Every width is covered; u4 also at M = 1 / 16 / 512, and the zero and
+         * all-one-bits code planes hold the two ends of the table. */
+        { "table u4 bf16, GEMV", 4, 0, 0, kBf16, 256, 384, 1, false, kTable },
+        { "table u4 bf16, 16 tokens", 4, 0, 0, kBf16, 256, 384, 16, false, kTable },
+        { "table u4 bf16, 512 tokens (resident)", 4, 0, 0, kBf16, 256, 384, 512, false, kTable },
+        { "table u2 bf16, 16 tokens", 2, 0, 0, kBf16, 256, 384, 16, false, kTable },
+        { "table u3 bf16, 16 tokens", 3, 0, 0, kBf16, 256, 384, 16, false, kTable },
+        { "table u5 bf16, 16 tokens", 5, 0, 0, kBf16, 256, 384, 16, false, kTable },
+        { "table u4 bf16 zero codes, 16 tokens", 4, 0, 0, kBf16, 256, 384, 16, false, kTable, 1 },
+        { "table u4 bf16 zero codes, GEMV", 4, 0, 0, kBf16, 256, 384, 1, false, kTable, 1 },
+        { "table u4 bf16 max codes, 16 tokens", 4, 0, 0, kBf16, 256, 384, 16, false, kTable, 2 },
+        { "table u5 bf16 max codes, GEMV", 5, 0, 0, kBf16, 256, 384, 1, false, kTable, 2 },
+        /* IQR-V1's vector codebook (kGrid, V = 4): the codeword a u8/u9/u10/u12 code names, under a
+         * bf16 scale a (row, 128). u9 at M = 1 / 16 / 512, every built width, and the zero and
+         * all-one-bits code planes. */
+        { "grid u9 V4 bf16, GEMV", 9, 0, 0, kBf16, 256, 384, 1, false, kGrid, 0, 2 },
+        { "grid u9 V4 bf16, 16 tokens", 9, 0, 0, kBf16, 256, 384, 16, false, kGrid, 0, 2 },
+        { "grid u9 V4 bf16, 512 tokens (resident)", 9, 0, 0, kBf16, 256, 384, 512, false, kGrid, 0,
+          2 },
+        { "grid u8 V4 bf16, 16 tokens", 8, 0, 0, kBf16, 256, 384, 16, false, kGrid, 0, 2 },
+        { "grid u10 V4 bf16, 16 tokens", 10, 0, 0, kBf16, 256, 384, 16, false, kGrid, 0, 2 },
+        { "grid u12 V4 bf16, 16 tokens", 12, 0, 0, kBf16, 256, 384, 16, false, kGrid, 0, 2 },
+        { "grid u9 V4 bf16 zero codes, 16 tokens", 9, 0, 0, kBf16, 256, 384, 16, false, kGrid, 1,
+          2 },
+        { "grid u9 V4 bf16 zero codes, GEMV", 9, 0, 0, kBf16, 256, 384, 1, false, kGrid, 1, 2 },
+        { "grid u9 V4 bf16 max codes, 16 tokens", 9, 0, 0, kBf16, 256, 384, 16, false, kGrid, 2, 2 },
+        { "grid u12 V4 bf16 max codes, GEMV", 12, 0, 0, kBf16, 256, 384, 1, false, kGrid, 2, 2 },
         /* The 27B's down vector (N = 5120, K = 17408, u4, one f32 scale a row, M = 1): the shape
          * the W0 table measures at 51.5 %. It takes the split band, so the comparison is in bf16
          * ulps (2). Every other case above stays bit-identical: it either passes no scratch (the

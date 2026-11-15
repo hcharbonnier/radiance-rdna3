@@ -1,8 +1,10 @@
 /* r3d_gemm_iqr_m16.hip -- gemm_nt_q over an IQR weight (r3d_iqr.h) at M <= 16, on gfx11.
  *
  * W0/W3 slice: the computed trellis (`tcq_code=mad`) with one f32 scale a row and a factor a 128-K
- * block, or a bf16 scale a (row, 128). The table and grid forms follow with the MoE lot; the shim
- * refuses them explicitly.
+ * block, or a bf16 scale a (row, 128); W14 adds IQR-V1's scalar codebook (`kTable`, u2..u5) and
+ * vector codebook (`kGrid`, u8/u9/u10/u12, V = 4), both under a bf16 scale a (row, 128). The other
+ * forms the container can declare (E4M3 scales, tcq_rb grids, the read trellis, signed/zero codes)
+ * stay refused: no kernel and no measured container weight exercises them yet.
  *
  * ---- the arithmetic ------------------------------------------------------------------------------
  *
@@ -81,12 +83,18 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
     c.N = (uint32_t)N;
     c.nkb = nkb;
     c.run_tiles = run_tiles;
-    c.tab = nullptr;   /* the W0 forms compute their values; the table forms stage LDS with W5 */
+    c.tab = nullptr;
 
-    /* One 16x128 int8 tile, and the GEMV's row partials (a stride of 33 words avoids a 16-way bank
-     * conflict when the 16 row owners read one lane column). */
+    /* One 16x128 int8 tile, the GEMV's row partials (a stride of 33 words avoids a 16-way bank
+     * conflict when the 16 row owners read one lane column), and the form's table when it has one. */
     __shared__ uint8_t sW[16 * 128];
     __shared__ int sP[16 * 33];
+    __shared__ __align__(16) int8_t sTab[Dec<F>::kTab];
+    if constexpr (Dec<F>::kTab > 4) {   /* a table form; the computed trellis reads none */
+        Dec<F>::stage(sTab, c, threadIdx.x, blockDim.x);
+        __syncthreads();
+        c.tab = sTab;
+    }
 
     const int row0 = (int)rt * 16;
 
@@ -206,8 +214,14 @@ gemm_iqr_resident_kernel(const int8_t* __restrict__ a, const float* __restrict__
     c.run_tiles = run_tiles;
     c.tab = nullptr;
 
-    /* The decoded 16x128 int8 tile, shared by the workgroup's W slices. */
+    /* The decoded 16x128 int8 tile, shared by the workgroup's W slices, and the form's table. */
     __shared__ uint32_t sW[16 * kIqrSWPitch];
+    __shared__ __align__(16) int8_t sTab[Dec<F>::kTab];
+    if constexpr (Dec<F>::kTab > 4) {   /* a table form; the computed trellis reads none */
+        Dec<F>::stage(sTab, c, threadIdx.x, blockDim.x);
+        __syncthreads();
+        c.tab = sTab;
+    }
     const int row0 = (int)rt * 16;
 
     constexpr int NP = 8;   /* (token, row) pairs a lane: 16 tokens x 16 rows over one wave */
@@ -307,9 +321,16 @@ gemm_iqr_wmma_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
     c.run_tiles = run_tiles;
     c.tab = nullptr;
 
-    /* The decoded 16x128 weight unit (the B fragment), and each wave's 16x128 activation tile. */
+    /* The decoded 16x128 weight unit (the B fragment), each wave's 16x128 activation tile, and the
+     * form's table. */
     __shared__ uint32_t sW[16 * kIqrSWPitch];
     __shared__ uint32_t sA[W][16 * kIqrSWPitch];
+    __shared__ __align__(16) int8_t sTab[Dec<F>::kTab];
+    if constexpr (Dec<F>::kTab > 4) {   /* a table form; the computed trellis reads none */
+        Dec<F>::stage(sTab, c, threadIdx.x, blockDim.x);
+        __syncthreads();
+        c.tab = sTab;
+    }
     const int row0 = (int)rt * 16;
 
     /* The A fragment's row is lane & 15; the D fragment's rows are 2e + (lane >> 4). */
@@ -380,9 +401,21 @@ int mt_for(int M) {
 /* ------------------------------------------------------------------ the shim */
 
 int form_supported(const Form& f) {
-    /* W0: the computed trellis, L = 16, one scale a row or a bf16 scale a (row, 128). */
-    return f.kind == kTrellisMad && f.L == 16 && f.lrb == 0 &&
-           (f.scale == kRowF32 || f.scale == kBf16) && f.bits >= 2 && f.bits <= 7;
+    /* W0: the computed trellis, L = 16, one scale a row or a bf16 scale a (row, 128). W14 adds the
+     * two IQR-V1 forms the decoded-lane kernels already read: a scalar codebook (kTable, u2..u5) and
+     * a vector codebook (kGrid, V = 4, u8/u9/u10/u12), both under a bf16 scale a (row, 128). The
+     * built() list is the authority for the added forms, so a width or scale the layout cannot
+     * produce stays refused with the same code. */
+    if (is_trellis(f.kind))
+        return f.kind == kTrellisMad && f.L == 16 && f.lrb == 0 &&
+               (f.scale == kRowF32 || f.scale == kBf16) && f.bits >= 2 && f.bits <= 7;
+    if (f.kind != kTable && f.kind != kGrid) return 0;
+    if (!built(kernel_word(word(f)))) return 0;
+    if (f.kind == kTable)
+        return f.scale == kBf16 && f.bits >= 2 && f.bits <= 5 && f.lv == 0 && f.L == 0 &&
+               f.lrb == 0;
+    return f.scale == kBf16 && f.lv == 2 && f.L == 0 && f.lrb == 0 && f.bits != 11 &&
+           f.bits >= 8 && f.bits <= 12;
 }
 
 }  // namespace
@@ -400,17 +433,20 @@ static int launch_mt(const uint8_t* b, const uint8_t* bs, long a, long as, long 
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-#define R3D_IQR_MT_CASE(B, SC)                                                                    \
-    do {                                                                                          \
-        using F = FormT<kTrellisMad, B, 0, 16, 0, SC>;                                             \
-        switch (mt) {                                                                             \
-            case 1:  return launch_mt<F, 1>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run, stream);   \
-            case 2:  return launch_mt<F, 2>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run, stream);   \
-            case 4:  return launch_mt<F, 4>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run, stream);   \
-            case 8:  return launch_mt<F, 8>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run, stream);   \
-            default: return launch_mt<F, 16>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run, stream);  \
-        }                                                                                         \
-    } while (0)
+/* The decode band's dispatch: one launch a form, MT chosen from M. */
+template <uint32_t KIND, uint32_t B, uint32_t LV, uint32_t L, uint32_t LRB, uint32_t SC>
+static int launch_mt_form(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
+                          int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream,
+                          int mt) {
+    using F = FormT<KIND, B, LV, L, LRB, SC>;
+    switch (mt) {
+        case 1:  return launch_mt<F, 1>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+        case 2:  return launch_mt<F, 2>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+        case 4:  return launch_mt<F, 4>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+        case 8:  return launch_mt<F, 8>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+        default: return launch_mt<F, 16>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+    }
+}
 
 /* The resident tile's launch: one workgroup a (weight tile, 64-token block). */
 template <class F>
@@ -445,6 +481,16 @@ static int launch_wmma(const uint8_t* b, const uint8_t* bs, long a, long as, lon
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+/* The tiled row's dispatch: the same residency and wave-matrix switch for every form. */
+template <uint32_t KIND, uint32_t B, uint32_t LV, uint32_t L, uint32_t LRB, uint32_t SC>
+static int launch_tiled_form(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
+                             int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream) {
+    using F = FormT<KIND, B, LV, L, LRB, SC>;
+    if (M >= kIqrWmmaMinM) return launch_wmma<F>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles,
+                                                 stream);
+    return launch_resident<F>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+}
+
 /* The split-K slice rule and launcher (r3d_gemm_iqr_splitk.hip). */
 extern "C" int r3d_iqr_split_slices(long long N, long long K);
 extern "C" int r3d_gemm_iqr_splitk(long a, long as, long b, long bs, long y, int N, int K,
@@ -455,9 +501,12 @@ extern "C" int r3d_gemm_iqr_splitk(long a, long as, long b, long bs, long y, int
  * only: the split is chosen by the geometry, not by the launch's M. N and K are the logical
  * extents. Attaching scratch makes the row non-concurrent (rad_kernel_concurrent is
  * `scratch == nullptr`), the price of the partials; the narrow band pays it at every height because
- * the hook cannot see a launch's M. */
+ * the hook cannot see a launch's M. Only the computed trellis has a split kernel, so the other
+ * forms answer 0 and keep the row concurrent. */
 extern "C" int64_t r3d_rad_gemm_nt_q_iqr_m16_scratch(const RadArgs* a) {
     if (!a) return 0;
+    const RadTensor* B = r3d_opt(a, 2);
+    if (!B || !is_weight_dtype(B->dtype) || form(B->dtype).kind != kTrellisMad) return 0;
     long long N = 0, K = 0;
     if (!rad_args_geti(a, "N", &N) || !rad_args_geti(a, "K", &K)) return 0;
     const int splits = r3d_iqr_split_slices(N, K);
@@ -475,8 +524,8 @@ extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M,
     if (M < 1 || M > kMTMax || N < 1 || K < 128) return -2;
     if (N % 16 || K % 128) return -2;
     const unsigned lrun = (unsigned)((word >> 22) & 15u);
-    if (lrun < 4 || (N % (int)(1u << lrun))) return -2;
-    const uint32_t run = (1u << lrun) / 16u;
+    if (is_trellis(f.kind) && (lrun < 4 || (N % (int)(1u << lrun)))) return -2;
+    const uint32_t run = is_trellis(f.kind) ? (1u << lrun) / 16u : 0u;
     const int mt = mt_for(M);
     if (!a_ld) a_ld = K;
     if (!y_ld) y_ld = N;
@@ -490,31 +539,58 @@ extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M,
 
     /* The split band: the GEMV (M = 1) at a narrow N, when the caller's scratch holds the
      * partials the row's hook asked for. Without it the unsplit path below runs, unchanged, so a
-     * direct caller that allocates no scratch still gets the old kernel and bytes. */
-    if (mt == 1) {
+     * direct caller that allocates no scratch still gets the old kernel and bytes. Only the
+     * computed trellis has a split kernel; the other forms keep the unsplit GEMV. */
+    if (mt == 1 && f.kind == kTrellisMad) {
         const int splits = r3d_iqr_split_slices(N, K);
         if (splits > 1 && scratch && !((uintptr_t)scratch & 3u) &&
             scratch_bytes >= (long long)splits * N * (long long)sizeof(float))
             return r3d_gemm_iqr_splitk(a, as, b, bs, y, N, K, word, splits, scratch, stream);
     }
 
-#define R3D_IQR_SC_CASE(B)                                                                        \
+#define R3D_IQR_M16_FORM(KIND, B, LV, L, LRB, SC)                                                 \
+    return launch_mt_form<KIND, B, LV, L, LRB, SC>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run,    \
+                                                    stream, mt)
+#define R3D_IQR_M16_SC(KIND, B, LV, L, LRB)                                                       \
     do {                                                                                          \
-        if (f.scale == kRowF32) { R3D_IQR_MT_CASE(B, kRowF32); }                                  \
-        R3D_IQR_MT_CASE(B, kBf16);                                                                \
+        if (f.scale == kRowF32) { R3D_IQR_M16_FORM(KIND, B, LV, L, LRB, kRowF32); }               \
+        R3D_IQR_M16_FORM(KIND, B, LV, L, LRB, kBf16);                                             \
     } while (0)
+#define R3D_IQR_M16_BF16(KIND, B, LV, L, LRB)                                                     \
+    R3D_IQR_M16_FORM(KIND, B, LV, L, LRB, kBf16)
 
-    switch (f.bits) {
-        case 2: R3D_IQR_SC_CASE(2);
-        case 3: R3D_IQR_SC_CASE(3);
-        case 4: R3D_IQR_SC_CASE(4);
-        case 5: R3D_IQR_SC_CASE(5);
-        case 6: R3D_IQR_SC_CASE(6);
-        case 7: R3D_IQR_SC_CASE(7);
+    switch (f.kind) {
+        case kTrellisMad:
+            switch (f.bits) {
+                case 2: R3D_IQR_M16_SC(kTrellisMad, 2, 0, 16, 0);
+                case 3: R3D_IQR_M16_SC(kTrellisMad, 3, 0, 16, 0);
+                case 4: R3D_IQR_M16_SC(kTrellisMad, 4, 0, 16, 0);
+                case 5: R3D_IQR_M16_SC(kTrellisMad, 5, 0, 16, 0);
+                case 6: R3D_IQR_M16_SC(kTrellisMad, 6, 0, 16, 0);
+                case 7: R3D_IQR_M16_SC(kTrellisMad, 7, 0, 16, 0);
+                default: return -6;
+            }
+        case kTable:
+            switch (f.bits) {
+                case 2: R3D_IQR_M16_BF16(kTable, 2, 0, 0, 0);
+                case 3: R3D_IQR_M16_BF16(kTable, 3, 0, 0, 0);
+                case 4: R3D_IQR_M16_BF16(kTable, 4, 0, 0, 0);
+                case 5: R3D_IQR_M16_BF16(kTable, 5, 0, 0, 0);
+                default: return -6;
+            }
+        case kGrid:
+            switch (f.bits) {
+                case 8: R3D_IQR_M16_BF16(kGrid, 8, 2, 0, 0);
+                case 9: R3D_IQR_M16_BF16(kGrid, 9, 2, 0, 0);
+                case 10: R3D_IQR_M16_BF16(kGrid, 10, 2, 0, 0);
+                case 12: R3D_IQR_M16_BF16(kGrid, 12, 2, 0, 0);
+                default: return -6;
+            }
         default: return -6;
     }
-#undef R3D_IQR_SC_CASE
-#undef R3D_IQR_MT_CASE
+#undef R3D_IQR_M16_BF16
+#undef R3D_IQR_M16_SC
+#undef R3D_IQR_M16_FORM
 }
 
 /* The tiled row's launch: above kIqrWmmaMinM rows the int8 wave matrix
@@ -530,7 +606,7 @@ extern "C" int r3d_gemm_iqr_tiled(long a, long as, long b, long bs, long y, int 
     if (M < 1 || N < 1 || K < 128) return -2;
     if (N % 16 || K % 128) return -2;
     const unsigned lrun = (unsigned)((word >> 22) & 15u);
-    if (lrun < 4 || (N % (int)(1u << lrun))) return -2;
+    if (is_trellis(f.kind) && (lrun < 4 || (N % (int)(1u << lrun)))) return -2;
     if (!a_ld) a_ld = K;
     if (!y_ld) y_ld = N;
     if (a_ld < K || a_ld % 4 || y_ld < N) return -3;
@@ -539,32 +615,51 @@ extern "C" int r3d_gemm_iqr_tiled(long a, long as, long b, long bs, long y, int 
         return -5;
     const uint8_t* B_ = (const uint8_t*)b;
     const uint8_t* S_ = (const uint8_t*)bs;
+    const uint32_t run = is_trellis(f.kind) ? (1u << lrun) / 16u : 0u;
 
-#define R3D_IQR_RES_CASE(B, SC)                                                                   \
+#define R3D_IQR_TILED_FORM(KIND, B, LV, L, LRB, SC)                                               \
+    return launch_tiled_form<KIND, B, LV, L, LRB, SC>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run, \
+                                                       stream)
+#define R3D_IQR_TILED_SC(KIND, B, LV, L, LRB)                                                     \
     do {                                                                                          \
-        using F = FormT<kTrellisMad, B, 0, 16, 0, SC>;                                             \
-        if (M >= kIqrWmmaMinM)                                                                    \
-            return launch_wmma<F>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run, stream);             \
-        return launch_resident<F>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run, stream);             \
+        if (f.scale == kRowF32) { R3D_IQR_TILED_FORM(KIND, B, LV, L, LRB, kRowF32); }             \
+        R3D_IQR_TILED_FORM(KIND, B, LV, L, LRB, kBf16);                                           \
     } while (0)
-#define R3D_IQR_RES_SC(B)                                                                         \
-    do {                                                                                          \
-        if (f.scale == kRowF32) { R3D_IQR_RES_CASE(B, kRowF32); }                                  \
-        R3D_IQR_RES_CASE(B, kBf16);                                                                \
-    } while (0)
+#define R3D_IQR_TILED_BF16(KIND, B, LV, L, LRB)                                                   \
+    R3D_IQR_TILED_FORM(KIND, B, LV, L, LRB, kBf16)
 
-    const uint32_t run = (1u << lrun) / 16u;
-    switch (f.bits) {
-        case 2: R3D_IQR_RES_SC(2);
-        case 3: R3D_IQR_RES_SC(3);
-        case 4: R3D_IQR_RES_SC(4);
-        case 5: R3D_IQR_RES_SC(5);
-        case 6: R3D_IQR_RES_SC(6);
-        case 7: R3D_IQR_RES_SC(7);
+    switch (f.kind) {
+        case kTrellisMad:
+            switch (f.bits) {
+                case 2: R3D_IQR_TILED_SC(kTrellisMad, 2, 0, 16, 0);
+                case 3: R3D_IQR_TILED_SC(kTrellisMad, 3, 0, 16, 0);
+                case 4: R3D_IQR_TILED_SC(kTrellisMad, 4, 0, 16, 0);
+                case 5: R3D_IQR_TILED_SC(kTrellisMad, 5, 0, 16, 0);
+                case 6: R3D_IQR_TILED_SC(kTrellisMad, 6, 0, 16, 0);
+                case 7: R3D_IQR_TILED_SC(kTrellisMad, 7, 0, 16, 0);
+                default: return -6;
+            }
+        case kTable:
+            switch (f.bits) {
+                case 2: R3D_IQR_TILED_BF16(kTable, 2, 0, 0, 0);
+                case 3: R3D_IQR_TILED_BF16(kTable, 3, 0, 0, 0);
+                case 4: R3D_IQR_TILED_BF16(kTable, 4, 0, 0, 0);
+                case 5: R3D_IQR_TILED_BF16(kTable, 5, 0, 0, 0);
+                default: return -6;
+            }
+        case kGrid:
+            switch (f.bits) {
+                case 8: R3D_IQR_TILED_BF16(kGrid, 8, 2, 0, 0);
+                case 9: R3D_IQR_TILED_BF16(kGrid, 9, 2, 0, 0);
+                case 10: R3D_IQR_TILED_BF16(kGrid, 10, 2, 0, 0);
+                case 12: R3D_IQR_TILED_BF16(kGrid, 12, 2, 0, 0);
+                default: return -6;
+            }
         default: return -6;
     }
-#undef R3D_IQR_RES_SC
-#undef R3D_IQR_RES_CASE
+#undef R3D_IQR_TILED_BF16
+#undef R3D_IQR_TILED_SC
+#undef R3D_IQR_TILED_FORM
 }
 
 extern "C" int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* arg, RadStream s) {
@@ -597,7 +692,8 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* arg, RadStream s) {
     if (K % 128 || N % 16) return R3D_NO(RAD_E_SHAPE);
     if (r3d_geti_or(arg, "group", 128) != 128) return R3D_NO(RAD_E_SHAPE);
     const unsigned lrun = (unsigned)((B->dtype >> 22) & 15u);
-    if (lrun < 4 || (N % (long long)(1u << lrun))) return R3D_NO(RAD_E_SHAPE);
+    if (is_trellis(fw.kind) && (lrun < 4 || (N % (long long)(1u << lrun))))
+        return R3D_NO(RAD_E_SHAPE);
 
     const long long ynel = r3d_numel(Y);
     if (ynel % N) return R3D_NO(RAD_E_SHAPE);
@@ -658,7 +754,8 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_tiled(const RadArgs* arg, RadStream s) {
     if (N < 1 || K < 1 || K % 128 || N % 16) return R3D_NO(RAD_E_SHAPE);
     if (r3d_geti_or(arg, "group", 128) != 128) return R3D_NO(RAD_E_SHAPE);
     const unsigned lrun = (unsigned)((B->dtype >> 22) & 15u);
-    if (lrun < 4 || (N % (long long)(1u << lrun))) return R3D_NO(RAD_E_SHAPE);
+    if (is_trellis(fw.kind) && (lrun < 4 || (N % (long long)(1u << lrun))))
+        return R3D_NO(RAD_E_SHAPE);
 
     const long long ynel = r3d_numel(Y);
     if (ynel % N) return R3D_NO(RAD_E_SHAPE);
