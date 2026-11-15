@@ -132,6 +132,7 @@ struct Args {
     int             q_rs, o_rs;          /* row pitch in elements */
     int             bt_rs, bt_cs;
     int             sb, sh, so;          /* cache strides in bytes: block, kv head, slot */
+    int             kv16;                /* the cache and both page strides are 16-aligned */
     int             n_seq, q_len, rows;
     int             n_head, kv_heads;
     int             block;               /* cache slots a page: 4 or 16 */
@@ -183,35 +184,76 @@ typedef __attribute__((address_space(3))) int8_t   r3d_lds_i8;
 typedef __attribute__((address_space(3))) uint32_t r3d_lds_u32;
 typedef __attribute__((address_space(3))) float    r3d_lds_f32;
 
-/* Stage one int8 cache block (K codes, V codes) and its per-slot scales into LDS. Every lane of
- * the workgroup runs this; the caller barriers before and after. A slot row is 516 bytes, so the
- * copy moves 4-byte words (the rows are 4-aligned but not 16-aligned). */
-template <int BLOCK, int NTH>
-__device__ __forceinline__ void stage_i8(const Args& A, int blk, int kh, int tid,
+/* One 4-byte word of a staged page, routed by its flat word index: a slot is 129 words (64 K
+ * codes, 64 V codes, then the two f16 scales packed in one dword). `STAGE_V` is false in the max
+ * pass, which reads only K and K's scale, so the V stores are skipped there. */
+template <bool STAGE_V>
+__device__ __forceinline__ void put_slot_word(int slot, int r, uint32_t v,
+                                              r3d_lds_i8* __restrict__ sK,
+                                              r3d_lds_i8* __restrict__ sV,
+                                              r3d_lds_f32* __restrict__ sks,
+                                              r3d_lds_f32* __restrict__ svs)
+{
+    if (r < kHeadDim / 4) {
+        *((r3d_lds_u32*)(sK + slot * kHeadDim) + r) = v;
+    } else if (r < kHeadDim / 2) {
+        if (STAGE_V) *((r3d_lds_u32*)(sV + slot * kHeadDim) + (r - kHeadDim / 4)) = v;
+    } else {
+        sks[slot] = f16_to_f32((uint16_t)(v & 0xffffu));
+        svs[slot] = f16_to_f32((uint16_t)(v >> 16));
+    }
+}
+
+/* Stage the `nu` visible int8 slots of one cache block (K codes, V codes) and their scales into
+ * LDS. Every lane of the workgroup runs this; the caller barriers before and after.
+ *
+ * A slot row is 516 bytes, so a row is 4-aligned but not 16-aligned. The page as a whole is
+ * 16-aligned whenever the cache is (A.sb and A.sh are multiples of 16 for both geometries), so the
+ * staged slots are then read as one flat run of 16-byte chunks and each of the four words is
+ * routed to its K, V or scale home: every global load is a 16-byte vector load inside the page.
+ * The 4-byte loop is the general path, because the shim only promises 4-byte alignment. Both paths
+ * move the same bytes to the same LDS words, so no arithmetic changes. */
+template <int NTH, bool STAGE_V>
+__device__ __forceinline__ void stage_i8(const Args& A, int blk, int kh, int nu, int tid,
                                          r3d_lds_i8* __restrict__ sK, r3d_lds_i8* __restrict__ sV,
                                          r3d_lds_f32* __restrict__ sks,
                                          r3d_lds_f32* __restrict__ svs)
 {
     const long long base = (long long)blk * A.sb + (long long)kh * A.sh;
     const uint8_t* src = A.kv + base;
+    constexpr int kWordsSlot = kHeadDim / 2 + 1;       /* 129 */
+    const int nw = nu * kWordsSlot;
+    if (A.kv16 && nu > 0) {
+        const int nc = nw >> 2;
 #pragma unroll 1
-    for (int i = tid; i < 2 * BLOCK * (kHeadDim / 4); i += NTH) {
-        const int half = i >= BLOCK * (kHeadDim / 4);
-        const int j = i - half * BLOCK * (kHeadDim / 4);
-        const int slot = j / (kHeadDim / 4);
-        const int word = j - slot * (kHeadDim / 4);
-        const uint32_t v = *(const uint32_t*)(src + (long long)slot * A.so + half * kHeadDim
-                                              + word * 4);
-        r3d_lds_u32* dst = (r3d_lds_u32*)((half ? sV : sK) + slot * kHeadDim) + word;
-        *dst = v;
-    }
-    if (tid < 2 * BLOCK) {
-        const int half = tid >= BLOCK;
-        const int slot = tid - half * BLOCK;
-        uint16_t h;
-        __builtin_memcpy(&h, src + (long long)slot * A.so + 2 * kHeadDim + 2 * half, 2);
-        const float sc = f16_to_f32(h);
-        if (half) svs[slot] = sc; else sks[slot] = sc;
+        for (int c = tid; c < nc; c += NTH) {
+            const r3d_u32x4 v = *(const __attribute__((address_space(1))) r3d_u32x4*)
+                                    (const void*)(src + (long long)c * 16);
+            int slot = (c << 2) / kWordsSlot;
+            int r = (c << 2) - slot * kWordsSlot;
+            put_slot_word<STAGE_V>(slot, r, v[0], sK, sV, sks, svs);
+            if (++r == kWordsSlot) { r = 0; ++slot; }
+            put_slot_word<STAGE_V>(slot, r, v[1], sK, sV, sks, svs);
+            if (++r == kWordsSlot) { r = 0; ++slot; }
+            put_slot_word<STAGE_V>(slot, r, v[2], sK, sV, sks, svs);
+            if (++r == kWordsSlot) { r = 0; ++slot; }
+            put_slot_word<STAGE_V>(slot, r, v[3], sK, sV, sks, svs);
+        }
+#pragma unroll 1
+        for (int idx = (nc << 2) + tid; idx < nw; idx += NTH) {
+            const int slot = idx / kWordsSlot;
+            const int r = idx - slot * kWordsSlot;
+            put_slot_word<STAGE_V>(slot, r, ldg_u32((const uint32_t*)(src + (long long)idx * 4)),
+                                   sK, sV, sks, svs);
+        }
+    } else {
+#pragma unroll 1
+        for (int idx = tid; idx < nw; idx += NTH) {
+            const int slot = idx / kWordsSlot;
+            const int r = idx - slot * kWordsSlot;
+            put_slot_word<STAGE_V>(slot, r, ldg_u32((const uint32_t*)(src + (long long)idx * 4)),
+                                   sK, sV, sks, svs);
+        }
     }
 }
 
@@ -341,15 +383,16 @@ void attn_kernel(const Args A)
 
     float mx = -INFINITY;
     /* Pass one: the maximum over visible scores. Ascending key order, same arithmetic as pass two,
-     * so the score a key gets here is the score it gets there. */
+     * so the score a key gets here is the score it gets there. This pass reads K and K's scale
+     * only, so it stages no V (pass two stages the block's V rows anyway). */
     for (int b = b0; b < b1; ++b) {
         const int blk = ld_ix(A.bt, (size_t)M.s * A.bt_rs + (size_t)b * A.bt_cs);
-        group_barrier();
-        if (blk >= 0) stage_i8<BLOCK, NTH>(A, blk, kh, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
-        group_barrier();
-        if (blk < 0) continue;
         const int j0 = b * BLOCK;
         const int nu = jend_all - j0 < BLOCK ? jend_all - j0 : BLOCK;
+        group_barrier();
+        if (blk >= 0) stage_i8<NTH, false>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+        group_barrier();
+        if (blk < 0) continue;
         for (int u = 0; u < nu; ++u) {
             const float dot = dot_group(qf, (const r3d_lds_i8*)(sK + u * kHeadDim + d0), ((const r3d_lds_f32*)sks)[u], gbase);
             const int j = j0 + u;
@@ -374,12 +417,12 @@ void attn_kernel(const Args A)
     /* Pass two: exponentiate and accumulate in ascending key order. */
     for (int b = b0; b < b1; ++b) {
         const int blk = ld_ix(A.bt, (size_t)M.s * A.bt_rs + (size_t)b * A.bt_cs);
-        group_barrier();
-        if (blk >= 0) stage_i8<BLOCK, NTH>(A, blk, kh, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
-        group_barrier();
-        if (blk < 0) continue;
         const int j0 = b * BLOCK;
         const int nu = jend_all - j0 < BLOCK ? jend_all - j0 : BLOCK;
+        group_barrier();
+        if (blk >= 0) stage_i8<NTH, true>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+        group_barrier();
+        if (blk < 0) continue;
         for (int u = 0; u < nu; ++u) {
             const float dot = dot_group(qf, (const r3d_lds_i8*)(sK + u * kHeadDim + d0), ((const r3d_lds_f32*)sks)[u], gbase);
             const int j = j0 + u;
@@ -516,6 +559,11 @@ int fill(Args& A, long q, long kv, long bt, long seqused, long cu, long out, lon
     A.so = 2 * kHeadDim + 4;
     A.sh = block_size * A.so;
     A.sb = kv_heads * A.sh;
+    /* A page's slots are 516 bytes, so a row is 4-aligned at best; the page base however is
+     * 16-aligned whenever the cache is, because `sh` (4 * 516 or 16 * 516) and `sb` are multiples
+     * of 16. The staging copy reads a page as a flat run of 16-byte chunks only under that
+     * condition; otherwise it stays on 4-byte words. */
+    A.kv16 = (((uintptr_t)A.kv | (uintptr_t)A.sb | (uintptr_t)A.sh) & 15) == 0;
     if ((long long)A.sb * cache_blocks > 2147483000LL) return -2;
     if (q_ld > 2147483000LL || out_ld > 2147483000LL) return -2;
     A.q_rs = (int)q_ld;
