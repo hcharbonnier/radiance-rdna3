@@ -134,6 +134,14 @@ static const RadParamSpec pRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_he
 static const RadOperandSpec oRope[] = { { "qkv", RAD_OPD_INOUT, 0 },
                                         { "positions", RAD_OPD_IN, 0 } };
 
+static const RadParamSpec pRopeTable[] = { P_INT("M"), P_INT("rot"), P_F64("theta"),
+                                           P_F64("scale"), P_STR("dtype"),
+                                           P_F64O("yarn_factor"), P_F64O("yarn_low"),
+                                           P_F64O("yarn_high"), P_F64O("yarn_magnitude"),
+                                           P_INTO("head_dim"), P_STRO("ladder") };
+static const RadOperandSpec oRopeTable[] = { { "positions", RAD_OPD_IN, 0 },
+                                             { "cos_sin", RAD_OPD_OUT, 0 } };
+
 static const RadParamSpec pKvStore[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head_kv"),
                                          P_INT("block_size"), P_STR("kv_dtype"),
                                          P_F64O("k_scale"), P_F64O("v_scale") };
@@ -784,6 +792,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("kv_store", pKvStore, oKvStore,
            "K and V into a paged cache at slot_mapping's slots, converting to the cache's dtype. A "
            "negative slot is skipped; the cache is [blocks, kv_heads, block_size, 2*head_dim]."),
+    SCHEMA("rope_table", pRopeTable, oRopeTable,
+           "The cos/sin plane a fused prologue reads: cos in the first rot/2 values of a table "
+           "row, sin in the second, at each position's own row. Only rows named by positions are "
+           "written; a negative or past-the-table position writes nothing."),
     SCHEMA("embed_lookup", pEmbed, oEmbed,
            "x[r] = wte[tokens[r] - vocab_offset] * wscale * mult, the id global and the table "
            "sharded by `vocab_offset`. An id outside the shard's range yields a zero row."),
@@ -1471,6 +1483,17 @@ static const RadConstraint cMlaAttnPaged[] = {
     C_GE("heads", 1),   C_LE("heads", 64),    C_GE("block_size", 1),   C_LE("block_size", 256),
     C_IN("dtype", "bf16")
 };
+
+/* The 27B bands: an int8 slot cache at head_dim 256 and 16-token pages, the cos/sin table the
+ * fused prologue reads (rot 64, theta 1e7, 64 rows), and imrope with Qwen3-VL's 11 11 10
+ * sections at 24 query heads over 4 KV heads. */
+static const RadConstraint cKvI8[] = { C_IN("kv_dtype", "i8"), C_EQ("head_dim", 256),
+                                       C_EQ("block_size", 16) };
+static const RadConstraint cRopeTableF32[] = { C_IN("dtype", "f32"), C_EQ("rot", 64),
+                                               C_EQ("M", 64) };
+static const RadConstraint cRopeImrope[] = { C_IN("mode", "imrope"), C_EQ("head_dim", 256),
+                                             C_EQ("n_head", 24), C_EQ("n_head_kv", 4),
+                                             C_EQ("rotary_dim", 64) };
 
 static const RadConstraint cEmbed[] = { C_IN("dtype", "bf16"), C_DIV("n_embd", 2) };
 /* An IQR table: the gather decodes the rows it is asked for, so n_embd is whole 128-blocks. */
@@ -3586,6 +3609,44 @@ static const RadKernelInfo kKernels[] = {
   ROW(cAttnH256Gqa6Prefill), NOTUNE,
   nullptr, nullptr, r3d_rad_attn_prefill_h256, nullptr, nullptr, nullptr,
   r3d_shape_attn_paged_i8 },
+
+
+/* ------------------------------------------------------------------ the 27B's int8 store and rope
+ *
+ * kv_store_i8: one wave a (token, KV head), the head's absmax reduced across the wave and rounded
+ * to an f16 scale, then round(x/scale) codes. rope_table builds the cos/sin plane the fused
+ * prologue reads; rope_imrope is Qwen3-VL's interleaved three-component rotary (sections 11 11
+ * 10) over NeoX pairs, q heads then k heads, v untouched.
+ */
+{ "kv_store_i8", "kv_store", "attn",
+  "K and V into an int8 paged cache: each head stores 256 K codes, 256 V codes and the two f16 "
+  "scales, the scale the head's absmax / 127 rounded to f16 and the codes round(x/scale)",
+  "head_dim 256; block_size 16; a wave a (token, KV head); a negative slot skipped; a zero head "
+  "stores scale 0 and codes 0",
+  "bf16 k and v, i32 slot_mapping, i8 cache with per-slot f16 K/V scales",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cKvI8), NOTUNE,
+  nullptr, nullptr, r3d_rad_kv_store, nullptr, nullptr, nullptr, r3d_shape_kv_store_i8 },
+
+{ "rope_table_f32", "rope_table", "attn",
+  "the cos/sin plane a fused prologue reads, cos in the first rot/2 values of a row and sin in "
+  "the second, written at each position's own row",
+  "rot 64; M 64; one block a position; only named rows are written and a negative or "
+  "past-the-table position writes nothing; ref's double cos/sin and pow, narrowed once",
+  "i32 positions, f32 cos/sin table",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cRopeTableF32), NOTUNE,
+  nullptr, nullptr, r3d_rad_rope_table, nullptr, nullptr, nullptr, r3d_shape_rope_table },
+
+{ "rope_imrope_h256", "rope", "attn",
+  "Qwen3-VL's interleaved three-component rotary over NeoX pairs, sections 11 11 10, in place on "
+  "a fused qkv row: q heads then k heads, v untouched",
+  "head_dim 256; rotary_dim 64; n_head 24; n_head_kv 4; mode imrope; positions [3, M] "
+  "component-major; one block a token",
+  "bf16 qkv in place, i32 positions, fp32 angles",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cRopeImrope), NOTUNE,
+  nullptr, nullptr, r3d_rad_rope, nullptr, nullptr, nullptr, r3d_shape_rope },
 
 
 };

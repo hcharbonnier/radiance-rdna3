@@ -100,9 +100,9 @@ static inline int r3d_dt_size(int code) {
 /* The activation an `act` parameter names, as the kernels' template argument. */
 enum { R3D_ACT_SILU = 0, R3D_ACT_SIGMOID = 1, R3D_ACT_GELU = 2 };
 
-/* rope's `mode`, numbered as libref's kModes. Only neox and gptj are implemented, and the rows'
- * constraints say so, so a model that needs mrope is not routed here. */
-enum { R3D_ROPE_NEOX = 0, R3D_ROPE_GPTJ = 1 };
+/* rope's `mode`, numbered as libref's kModes. neox, gptj and imrope are implemented; the rows'
+ * constraints say so, so a model that needs mrope or axial is not routed here. */
+enum { R3D_ROPE_NEOX = 0, R3D_ROPE_GPTJ = 1, R3D_ROPE_IMROPE = 3 };
 
 /* ================================================================== the row table's entry points
  *
@@ -126,7 +126,8 @@ int r3d_rad_act_mul       (const RadArgs* a, RadStream s);
 int r3d_rad_softmax       (const RadArgs* a, RadStream s);
 int r3d_rad_scale         (const RadArgs* a, RadStream s);
 int r3d_rad_fill          (const RadArgs* a, RadStream s);
-int r3d_rad_rope          (const RadArgs* a, RadStream s);
+int r3d_rad_rope            (const RadArgs* a, RadStream s);
+int r3d_rad_rope_table      (const RadArgs* a, RadStream s);
 int r3d_rad_kv_store      (const RadArgs* a, RadStream s);
 int r3d_rad_embed_lookup  (const RadArgs* a, RadStream s);
 int r3d_rad_gather_rows   (const RadArgs* a, RadStream s);
@@ -319,6 +320,8 @@ int r3d_shape_gemm_nt_q_mxfp4a8(const RadParam* p, int n_p, int operand, RadOpdD
 extern "C" int r3d_shape_silu_mul          (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_attn_paged        (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_attn_paged_i8     (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_kv_store_i8       (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_rope_table        (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_gemm_nt_q_gated (const RadParam*, int, int, RadOpdDesc*);
 /* r3d_gemm_nt_q_w2a8.hip: the w2a8 vocab projection's layout hook, one of the library's three
  * (with the fp8 weight's and the logits head's, below). It repacks nothing: it presents the

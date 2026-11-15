@@ -275,6 +275,31 @@ int r3d_shape_kv_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     R3D_PICK(list);
 }
 
+/* The int8 slot: 256 K codes, 256 V codes and the two f16 scales, so the last dim is
+ * 2*head_dim+4 rather than 2*head_dim. */
+int r3d_shape_kv_store_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M   = gi(p, n_p, "M", 0);
+    const int64_t hd  = gi(p, n_p, "head_dim", 0);
+    const int64_t kvh = gi(p, n_p, "n_head_kv", 0);
+    const int64_t bs  = gi(p, n_p, "block_size", 0);
+    if (M <= 0 || hd <= 0 || kvh <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t nb = (M + bs - 1) / bs + 2;
+    const RadOpdDesc list[] = {
+        opd((uint32_t)RAD_BF16, M, kvh, hd),                        /* k */
+        opd((uint32_t)RAD_BF16, M, kvh, hd),                        /* v */
+        opd_idx(M, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),              /* slot_mapping */
+        opd((uint32_t)RAD_I8, nb, kvh, bs, 2 * hd + 4)              /* kv_cache, INOUT */
+    };
+    R3D_PICK(list);
+}
+
+/* The rope table's rows are written at a position's own row and the table holds f32, so a random
+ * cos/sin draw would not be a rotation; the device test in r3d_selftest builds it. */
+extern "C" int r3d_shape_rope_table(const RadParam*, int, int, RadOpdDesc*)
+{
+    return RAD_E_UNSUPPORTED;
+}
+
 /* x[r] = wte[ids[r] - vocab_offset]. Ids are global, so the draw's bound is `vocab_offset + n_vocab`:
  * under a shard the draw crosses the slice boundary and exercises the zero-row path. */
 /* The KDA recurrence (r3d_kda_update.hip). The state cache's slot axis is the step's candidate

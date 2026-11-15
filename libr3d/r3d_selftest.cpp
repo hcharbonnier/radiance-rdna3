@@ -3014,7 +3014,7 @@ const RadKernelInfo* row_by_name(const char* name) {
 }
 
 /* libref's table, beside this plugin. Its attn_paged row is the reference launch. */
-const RadKernelInfo* libref_attn_row() {
+const RadKernelInfo* libref_row(const char* op) {
     static int (*count)(void) = nullptr;
     static const RadKernelInfo* (*at)(int) = nullptr;
     static bool tried = false;
@@ -3033,7 +3033,7 @@ const RadKernelInfo* libref_attn_row() {
     if (!at) return nullptr;
     for (int i = 0; i < count(); ++i) {
         const RadKernelInfo* k = at(i);
-        if (k && k->op && !std::strcmp(k->op, "attn_paged")) return k;
+        if (k && k->op && !std::strcmp(k->op, op)) return k;
     }
     return nullptr;
 }
@@ -3275,7 +3275,7 @@ void h256_case(const char* what, const RadKernelInfo* ours, const RadKernelInfo*
 void check_attn_h256() {
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("h256 attn: no device visible"); return; }
-    const RadKernelInfo* ref = libref_attn_row();
+    const RadKernelInfo* ref = libref_row("attn_paged");
     if (!ref || !ref->launch) { skip("h256 attn: libref.so with attn_paged is not beside the plugin"); return; }
 
     /* (gqa 12, block 4): Flash-Next's 24/2 geometry. Decode and prefill, causal, a ragged batch,
@@ -3314,9 +3314,232 @@ void check_attn_h256() {
     g_split_scratch = false;
 }
 
+/* ------------------------------------------------------------------ the 27B's bands
+ *
+ * kv_store_i8: the int8 slot layout and the reference's per-head absmax quantisation, compared
+ * byte for byte (mapped slots rewritten, every other byte untouched). rope_table: the cos/sin
+ * plane at each position's row; ref computes cos/sin in double, this kernel does the same, and a
+ * 2e-6 f32 bound absorbs the device/host libm difference. rope_imrope: the interleaved three-
+ * component rotary, q heads then k heads, at one bf16 code.
+ */
+bool bf16_one_code(const std::vector<uint16_t>& got, const std::vector<uint16_t>& want,
+                   double floor_abs, const char* what) {
+    long long worst = 0;
+    double max_abs = 0.0;
+    size_t at = 0;
+    bool okall = true;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const uint16_t g = got[i], w = want[i];
+        const bool gn = (g >> 15) != 0, wn = (w >> 15) != 0;
+        long long d;
+        if (gn == wn) d = (long long)(g & 0x7fffu) - (long long)(w & 0x7fffu);
+        else d = (g & 0x7fffu) == 0 || (w & 0x7fffu) == 0 ? 1 : 1000000;
+        if (d < 0) d = -d;
+        const double ad = std::fabs((double)bf16_to_f32(g) - (double)bf16_to_f32(w));
+        if (d > worst) { worst = d; at = i; }
+        if (ad > max_abs) max_abs = ad;
+        if (!(d <= 1 || ad <= floor_abs)) okall = false;
+    }
+    if (okall) { ok("%s: %zu values, %lld bf16 code(s) / max |diff| %.3g", what, got.size(), worst,
+                    max_abs); return true; }
+    fail("%s: %lld bf16 codes at value %zu: libr3d %g, libref %g", what, worst, at,
+         (double)bf16_to_f32(got[at]), (double)bf16_to_f32(want[at]));
+    return false;
+}
+
+void check_kv_store_i8() {
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("kv_store i8: no device"); return; }
+    const RadKernelInfo* ref = libref_row("kv_store");
+    const RadKernelInfo* ours = row_by_name("kv_store_i8");
+    if (!ref || !ours) { skip("kv_store i8: a row is absent"); return; }
+
+    const int hd = 256, kvh = 4, bs = 16, M = 17, nb = 4, sb = 2 * hd + 4;
+    const int slots_n = nb * bs;
+    std::vector<uint16_t> k((size_t)M * kvh * hd), v(k.size());
+    for (int t = 0; t < M; ++t)
+        for (int j = 0; j < kvh * hd; ++j) {
+            const float a = std::sin(0.037f * (float)(t * 97 + j * 13));
+            const float b = ((t + j) % 11 == 0) ? 0.0f : std::cos(0.021f * (float)(t * 57 + j * 7));
+            k[(size_t)t * kvh * hd + j] = f32_to_bf16(a);
+            v[(size_t)t * kvh * hd + j] = f32_to_bf16(b);
+        }
+    std::vector<int> sm((size_t)M);
+    for (int t = 0; t < M; ++t) sm[(size_t)t] = (t * 7 + 3) % slots_n;
+    sm[5] = -1;                    /* padding: no write */
+    sm[9] = slots_n - 1;           /* the last slot of the last block */
+    std::vector<uint8_t> want((size_t)nb * kvh * bs * sb, 0x5a), got = want;
+
+    int64_t qd[3] = { M, kvh, hd }, kvd[4] = { nb, kvh, bs, sb }, smd[1] = { M };
+    RadTensor th[4] = {
+        h256_tensor(k.data(), RAD_BF16, 3, qd), h256_tensor(v.data(), RAD_BF16, 3, qd),
+        h256_tensor(sm.data(), RAD_I32, 1, smd), h256_tensor(want.data(), RAD_I8, 4, kvd)
+    };
+    const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                            { "head_dim", RAD_P_INT, hd, 0, nullptr, 0.0 },
+                            { "n_head_kv", RAD_P_INT, kvh, 0, nullptr, 0.0 },
+                            { "block_size", RAD_P_INT, bs, 0, nullptr, 0.0 },
+                            { "kv_dtype", RAD_P_STR, 0, 0, "i8", 0.0 } };
+    RadArgs ra{ th, 4, pp, 5, nullptr, 0, nullptr, 0, 1 };
+    if (ref->launch(&ra, nullptr) != RAD_OK) { fail("kv_store i8: libref refused"); return; }
+
+    RadTensor td[4];
+    std::copy(th, th + 4, td);
+    void* dev[4] = {};
+    size_t bytes[4] = { k.size() * 2, v.size() * 2, sm.size() * 4, got.size() };
+    bool ok_alloc = true;
+    for (int i = 0; i < 4; ++i) {
+        if (hipMalloc(&dev[i], bytes[i]) != hipSuccess) { ok_alloc = false; break; }
+        const void* src = i == 0 ? (const void*)k.data() : i == 1 ? (const void*)v.data()
+                        : i == 2 ? (const void*)sm.data() : (const void*)got.data();
+        if (hipMemcpy(dev[i], src, bytes[i], hipMemcpyHostToDevice) != hipSuccess) { ok_alloc = false; break; }
+        td[i].data = dev[i];
+    }
+    if (!ok_alloc) {
+        for (void* p : dev) if (p) (void)hipFree(p);
+        skip("kv_store i8: no device buffers"); return;
+    }
+    RadArgs da{ td, 4, pp, 5, nullptr, 0, nullptr, 0, 1 };
+    const int rc = ours->launch(&da, nullptr);
+    if (rc != RAD_OK || hipDeviceSynchronize() != hipSuccess ||
+        hipMemcpy(got.data(), dev[3], got.size(), hipMemcpyDeviceToHost) != hipSuccess) {
+        fail("kv_store i8: the row failed (%d)", rc);
+    } else {
+        size_t first = got.size();
+        for (size_t i = 0; i < got.size(); ++i) if (got[i] != want[i]) { first = i; break; }
+        if (first == got.size()) ok("kv_store i8: %zu bytes identical to libref", got.size());
+        else {
+            const int row = (int)(first / sb), slot = row % bs, head = (row / bs) % kvh;
+            fail("kv_store i8: first difference byte %zu (block %d, head %d, slot %d, +%d): "
+                 "libr3d %d, libref %d", first, row / (kvh * bs), head, slot, (int)(first % sb),
+                 (int)got[first], (int)want[first]);
+        }
+    }
+    for (void* p : dev) if (p) (void)hipFree(p);
+}
+
+void check_rope_table() {
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("rope_table: no device"); return; }
+    const RadKernelInfo* ref = libref_row("rope_table");
+    const RadKernelInfo* ours = row_by_name("rope_table_f32");
+    if (!ref || !ours) { skip("rope_table: a row is absent"); return; }
+
+    const int M = 8, rot = 64, rows = 6;
+    const int posv[8] = { 0, 5, -1, 2, 7, 3, 1, 4 };     /* -1 and 7 (past rows) write nothing */
+    std::vector<int> pos(posv, posv + M);
+    std::vector<float> want((size_t)rows * rot, 12345.0f), got = want;
+    int64_t pd[1] = { M }, cd[2] = { rows, rot };
+    RadTensor th[2] = { h256_tensor(pos.data(), RAD_I32, 1, pd),
+                        h256_tensor(want.data(), RAD_F32, 2, cd) };
+    const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                            { "rot", RAD_P_INT, rot, 0, nullptr, 0.0 },
+                            { "theta", RAD_P_F64, 0, 0, nullptr, 1e7 },
+                            { "scale", RAD_P_F64, 0, 0, nullptr, 1.0 },
+                            { "dtype", RAD_P_STR, 0, 0, "f32", 0.0 } };
+    RadArgs ra{ th, 2, pp, 5, nullptr, 0, nullptr, 0, 1 };
+    if (ref->launch(&ra, nullptr) != RAD_OK) { fail("rope_table: libref refused"); return; }
+
+    RadTensor td[2];
+    std::copy(th, th + 2, td);
+    void* dev[2] = {};
+    const size_t bytes[2] = { pos.size() * 4, got.size() * 4 };
+    bool ok_alloc = true;
+    for (int i = 0; i < 2; ++i) {
+        if (hipMalloc(&dev[i], bytes[i]) != hipSuccess) { ok_alloc = false; break; }
+        const void* src = i == 0 ? (const void*)pos.data() : (const void*)got.data();
+        if (hipMemcpy(dev[i], src, bytes[i], hipMemcpyHostToDevice) != hipSuccess) { ok_alloc = false; break; }
+        td[i].data = dev[i];
+    }
+    if (!ok_alloc) {
+        for (void* p : dev) if (p) (void)hipFree(p);
+        skip("rope_table: no device buffers"); return;
+    }
+    RadArgs da{ td, 2, pp, 5, nullptr, 0, nullptr, 0, 1 };
+    const int rc = ours->launch(&da, nullptr);
+    if (rc != RAD_OK || hipDeviceSynchronize() != hipSuccess ||
+        hipMemcpy(got.data(), dev[1], bytes[1], hipMemcpyDeviceToHost) != hipSuccess) {
+        fail("rope_table: the row failed (%d)", rc);
+    } else {
+        double worst = 0.0;
+        size_t at = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const double d = std::fabs((double)got[i] - (double)want[i]);
+            if (d > worst) { worst = d; at = i; }
+        }
+        if (worst <= 2e-6) ok("rope_table: %zu f32 values, max |diff| %.3g", got.size(), worst);
+        else fail("rope_table: max |diff| %.3g at value %zu (row %zu, i %zu): libr3d %g, libref %g",
+                  worst, at, at / rot, at % rot, (double)got[at], (double)want[at]);
+    }
+    for (void* p : dev) if (p) (void)hipFree(p);
+}
+
+void check_rope_imrope() {
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("rope imrope: no device"); return; }
+    const RadKernelInfo* ref = libref_row("rope");
+    const RadKernelInfo* ours = row_by_name("rope_imrope_h256");
+    if (!ref || !ours) { skip("rope imrope: a row is absent"); return; }
+
+    const int M = 4, hd = 256, nq = 24, nkv = 4, rot = 64;
+    const int width = (nq + 2 * nkv) * hd;
+    std::vector<uint16_t> q((size_t)M * width), want, got;
+    for (int m = 0; m < M; ++m)
+        for (int j = 0; j < width; ++j) {
+            const float x = 0.25f * (float)(((m * 31 + j * 7) % 13) - 6);
+            q[(size_t)m * width + j] = f32_to_bf16(x);
+        }
+    want = q;
+    int posv[3 * M];
+    for (int c = 0; c < 3; ++c)
+        for (int m = 0; m < M; ++m) posv[c * M + m] = c * 9 + m;
+    int64_t qd[2] = { M, width }, pd[2] = { 3, M };
+    RadTensor th[2] = { h256_tensor(want.data(), RAD_BF16, 2, qd),
+                        h256_tensor(posv, RAD_I32, 2, pd) };
+    const RadParam pp[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                            { "head_dim", RAD_P_INT, hd, 0, nullptr, 0.0 },
+                            { "n_head", RAD_P_INT, nq, 0, nullptr, 0.0 },
+                            { "n_head_kv", RAD_P_INT, nkv, 0, nullptr, 0.0 },
+                            { "theta", RAD_P_F64, 0, 0, nullptr, 1e7 },
+                            { "scale", RAD_P_F64, 0, 0, nullptr, 1.0 },
+                            { "mode", RAD_P_STR, 0, 0, "imrope", 0.0 },
+                            { "rotary_dim", RAD_P_INT, rot, 0, nullptr, 0.0 },
+                            { "sections", RAD_P_STR, 0, 0, "11 11 10", 0.0 } };
+    RadArgs ra{ th, 2, pp, 9, nullptr, 0, nullptr, 0, 1 };
+    if (ref->launch(&ra, nullptr) != RAD_OK) { fail("rope imrope: libref refused"); return; }
+
+    got = q;
+    RadTensor td[2];
+    std::copy(th, th + 2, td);
+    void* dev[2] = {};
+    const size_t bytes[2] = { got.size() * 2, (size_t)(3 * M) * 4 };
+    bool ok_alloc = true;
+    for (int i = 0; i < 2; ++i) {
+        if (hipMalloc(&dev[i], bytes[i]) != hipSuccess) { ok_alloc = false; break; }
+        const void* src = i == 0 ? (const void*)got.data() : (const void*)posv;
+        if (hipMemcpy(dev[i], src, bytes[i], hipMemcpyHostToDevice) != hipSuccess) { ok_alloc = false; break; }
+        td[i].data = dev[i];
+    }
+    if (!ok_alloc) {
+        for (void* p : dev) if (p) (void)hipFree(p);
+        skip("rope imrope: no device buffers"); return;
+    }
+    RadArgs da{ td, 2, pp, 9, nullptr, 0, nullptr, 0, 1 };
+    const int rc = ours->launch(&da, nullptr);
+    if (rc != RAD_OK || hipDeviceSynchronize() != hipSuccess ||
+        hipMemcpy(got.data(), dev[0], bytes[0], hipMemcpyDeviceToHost) != hipSuccess)
+        fail("rope imrope: the row failed (%d)", rc);
+    else
+        (void)bf16_one_code(got, want, 1e-5, "rope imrope");
+    for (void* p : dev) if (p) (void)hipFree(p);
+}
+
 }  // namespace
 #else
 static void check_attn_h256() { skip("h256 attn: built without the HIP runtime"); }
+static void check_kv_store_i8() { skip("kv_store i8: built without the HIP runtime"); }
+static void check_rope_table() { skip("rope_table: built without the HIP runtime"); }
+static void check_rope_imrope() { skip("rope imrope: built without the HIP runtime"); }
 #endif
 
 int main(int argc, char** argv) {
@@ -3326,13 +3549,15 @@ int main(int argc, char** argv) {
     const char* path = nullptr;
     bool static_only = false;
     bool h256_only = false;
+    bool bands_only = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--case") && i + 1 < argc) g_case = argv[++i];
         else if (!std::strcmp(argv[i], "--static")) static_only = true;
         else if (!std::strcmp(argv[i], "--h256-only")) h256_only = true;
+        else if (!std::strcmp(argv[i], "--bands-only")) bands_only = true;
         else if (!std::strcmp(argv[i], "--help")) {
             std::printf("usage: r3d_selftest <path>/libr3d.so [--case <row>] [--static] "
-                        "[--h256-only]\n");
+                        "[--h256-only] [--bands-only]\n");
             return 0;
         } else if (!path) path = argv[i];
     }
@@ -3365,6 +3590,14 @@ int main(int argc, char** argv) {
         return g_fail ? 1 : 0;
     }
 
+    if (bands_only && !g_case) {
+        check_kv_store_i8();
+        check_rope_table();
+        check_rope_imrope();
+        dlclose(h);
+        return g_fail ? 1 : 0;
+    }
+
     if (h256_only && !g_case) {
         check_attn_h256();
         dlclose(h);
@@ -3380,6 +3613,9 @@ int main(int argc, char** argv) {
         check_shapes();
         check_moe_numerics();
         check_attn_h256();
+        check_kv_store_i8();
+        check_rope_table();
+        check_rope_imrope();
 
         const int n = rows();
         int passed = 0, failed = 0;

@@ -656,32 +656,67 @@ __global__ __launch_bounds__(THR) void fill_kernel(void* __restrict__ y, uint32_
  * off the critical path, with no scratch. nfreq == rot/2 always, so no pair lies past the ladder
  * (ref zeroes inv[] past nfreq only for the proportional ladder, which libr3d refuses).
  */
-template <int THR, int GPTJ>
+template <int THR, int MODE>
 __global__ __launch_bounds__(THR) void rope_kernel(
     uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos, uint32_t head_dim,
-    uint32_t n_rope_heads, uint32_t rot, float theta, float scale, uint32_t row_pitch) {
+    uint32_t n_rope_heads, uint32_t rot, float theta, float scale, uint32_t row_pitch,
+    uint32_t pos_cs, uint32_t pos_rs, uint32_t s1, uint32_t s2) {
     const uint32_t m = blockIdx.x;
     const float div = scale != 0.0f ? scale : 1.0f;
-    const float p = (float)ldg_i32(pos + m) / div;
     const uint32_t half = rot / 2;
     const uint32_t total = n_rope_heads * half;
     uint16_t* __restrict__ row = qkv + (size_t)m * row_pitch;
 
     for (uint32_t j = threadIdx.x; j < total; j += THR) {
         const uint32_t h = j / half, i = j - h * half;
+        /* imrope (Qwen3-VL): component 1 where i % 3 == 1 and i < 3*s1, component 2 where
+         * i % 3 == 2 and i < 3*s2, component 0 elsewhere; one ladder. A rank-1 position plane has
+         * pos_cs = 0, so every component reads the same value. */
+        uint32_t c = 0;
+        if (MODE == 2) {
+            if (i % 3u == 1u && i < 3u * s1) c = 1;
+            else if (i % 3u == 2u && i < 3u * s2) c = 2;
+        }
+        const float p = (float)ldg_i32(pos + (size_t)c * pos_cs + (size_t)m * pos_rs) / div;
         /* ref's ladder: `1.0f / ref_pow(theta, (float)(2i) / den)`, with ref_pow the double pow
          * narrowed once. powf would put the reciprocal a ULP off, and at position 262144 a ULP of a
          * frequency is about 0.01 rad of rotation, so the ladder is computed in double. The angle
          * stays f32, as in ref. */
         const float inv = 1.0f / (float)std::pow((double)theta, (double)((float)(2 * i) / (float)rot));
-        float s, c;
-        sincosf(p * inv, &s, &c);
-        const uint32_t i0 = h * head_dim + (GPTJ ? 2u * i : i);
-        const uint32_t i1 = h * head_dim + (GPTJ ? 2u * i + 1u : i + half);
+        float s, c_;
+        sincosf(p * inv, &s, &c_);
+        const uint32_t i0 = h * head_dim + (MODE == 1 ? 2u * i : i);
+        const uint32_t i1 = h * head_dim + (MODE == 1 ? 2u * i + 1u : i + half);
         const float x0 = bf16_to_f32(ldg_u16_at(row, i0));
         const float x1 = bf16_to_f32(ldg_u16_at(row, i1));
-        ((uint16_t*)row)[i0] = f32_to_bf16(x0 * c - x1 * s);
-        ((uint16_t*)row)[i1] = f32_to_bf16(x0 * s + x1 * c);
+        ((uint16_t*)row)[i0] = f32_to_bf16(x0 * c_ - x1 * s);
+        ((uint16_t*)row)[i1] = f32_to_bf16(x0 * s + x1 * c_);
+    }
+}
+
+/* ================================================================== rope_table
+ * The cos/sin plane `rope`'s angles build, written at each position's own row of a
+ * [rows, rot] f32 table: cos in the first rot/2 values of the row, sin in the second. Only rows
+ * named by `positions` are written; a negative or past-the-table position writes nothing. The
+ * angles use ref's double cos/sin and double pow, narrowed once, so a fused prologue reading the
+ * table gets the same rotation as `rope`.
+ */
+__global__ __launch_bounds__(64) void rope_table_kernel(
+    const int32_t* __restrict__ pos, float* __restrict__ cs, uint32_t M, uint32_t rot,
+    uint32_t rows, float theta, float scale) {
+    const uint32_t m = blockIdx.x;
+    const int32_t pp = ldg_i32(pos + m);
+    if (pp < 0 || (uint32_t)pp >= rows) return;
+    const float div = scale != 0.0f ? scale : 1.0f;
+    const float p = (float)pp / div;
+    const uint32_t half = rot / 2;
+    const uint32_t tb = (uint32_t)pp * rot;
+    for (uint32_t i = threadIdx.x; i < half; i += 64u) {
+        const float inv =
+            1.0f / (float)std::pow((double)theta, (double)((float)(2 * i) / (float)rot));
+        const float ang = p * inv;
+        cs[tb + i] = (float)std::cos((double)ang);
+        cs[tb + half + i] = (float)std::sin((double)ang);
     }
 }
 
@@ -728,6 +763,60 @@ __global__ __launch_bounds__(THR) void kv_store_kernel(
         st_elem(kv_dt, plane + cb, (size_t)d * sd, bf16_to_f32(ldg_u16_at(kr, j)) * k_inv);
         st_elem(kv_dt, plane + cb, (size_t)(head_dim + d) * sd,
                 bf16_to_f32(ldg_u16_at(vr, j)) * v_inv);
+    }
+}
+
+/* ================================================================== kv_store, int8 slot
+ * The paged int8 cache stores each token head as head_dim K codes, head_dim V codes and two f16
+ * scales (K's then V's). One wave handles one (token, kv head): the scale is the head's absmax /
+ * 127 rounded to f16 (clamped at 515), the codes round(x / scale) to nearest-even against the
+ * rounded scale and clamp to +-127; an all-zero head stores scale 0 and codes 0. The reduction is
+ * a 64-lane max, then every lane rereads its dimensions to encode them, so the scale is settled
+ * before any code is written.
+ */
+__device__ __forceinline__ float kv_absmax_wave(float am) {
+#pragma unroll
+    for (int off = 1; off < 64; off <<= 1) am = fmaxf(am, __shfl_xor(am, off, 64));
+    return am;
+}
+
+__global__ __launch_bounds__(64) void kv_store_i8_kernel(
+    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v, const int32_t* __restrict__ sm,
+    uint8_t* __restrict__ kv, uint32_t head_dim, uint32_t block_size, uint32_t k_ld,
+    uint32_t v_ld, int64_t sb, int64_t sh, int64_t so, int64_t slot_max) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y;
+    const int32_t s = ldg_i32(sm + t);
+    if (s < 0 || (int64_t)s >= slot_max) return;
+    const int64_t blk = (int64_t)s / (int64_t)block_size;
+    const int64_t off = (int64_t)s % (int64_t)block_size;
+    uint8_t* __restrict__ row = kv + blk * sb + (int64_t)h * sh + off * so;
+    const uint16_t* __restrict__ kr = k + (size_t)t * k_ld + (size_t)h * head_dim;
+    const uint16_t* __restrict__ vr = v + (size_t)t * v_ld + (size_t)h * head_dim;
+    const uint32_t lane = threadIdx.x;
+
+    float amk = 0.0f, amv = 0.0f;
+    for (uint32_t d = lane; d < head_dim; d += 64u) {
+        amk = fmaxf(amk, fabsf(bf16_to_f32(ldg_u16_at(kr, d))));
+        amv = fmaxf(amv, fabsf(bf16_to_f32(ldg_u16_at(vr, d))));
+    }
+    amk = kv_absmax_wave(amk);
+    amv = kv_absmax_wave(amv);
+    const uint16_t hk = f32_to_f16(fminf(amk / 127.0f, 515.0f));
+    const uint16_t hv = f32_to_f16(fminf(amv / 127.0f, 515.0f));
+    const float sk = f16_to_f32(hk), sv = f16_to_f32(hv);
+    int8_t* __restrict__ ck = (int8_t*)row;
+    int8_t* __restrict__ cv = (int8_t*)row + head_dim;
+    for (uint32_t d = lane; d < head_dim; d += 64u) {
+        const float xk = bf16_to_f32(ldg_u16_at(kr, d));
+        const float xv = bf16_to_f32(ldg_u16_at(vr, d));
+        const float rk = sk > 0.0f ? rintf(xk / sk) : 0.0f;
+        const float rv = sv > 0.0f ? rintf(xv / sv) : 0.0f;
+        ck[d] = (int8_t)fminf(fmaxf(rk, -127.0f), 127.0f);
+        cv[d] = (int8_t)fminf(fmaxf(rv, -127.0f), 127.0f);
+    }
+    if (lane == 0) {
+        __builtin_memcpy(row + 2 * head_dim, &hk, sizeof hk);
+        __builtin_memcpy(row + 2 * head_dim + 2, &hv, sizeof hv);
     }
 }
 
@@ -850,11 +939,13 @@ static inline int row_pair(long base, int n, int ld1, int ld2) {
 #define R3D_ROPE2(thr, grid, stream, ...)                                                       \
     do {                                                                                        \
         if ((thr) == (int)kNarrow) {                                                            \
-            if (gptj) R3D_ROPE_K(kNarrow, 1, grid, stream, __VA_ARGS__);                        \
-            else      R3D_ROPE_K(kNarrow, 0, grid, stream, __VA_ARGS__);                        \
+            if (mode == 3)      R3D_ROPE_K(kNarrow, 2, grid, stream, __VA_ARGS__);              \
+            else if (mode == 1) R3D_ROPE_K(kNarrow, 1, grid, stream, __VA_ARGS__);              \
+            else                R3D_ROPE_K(kNarrow, 0, grid, stream, __VA_ARGS__);              \
         } else {                                                                                \
-            if (gptj) R3D_ROPE_K(kThreads, 1, grid, stream, __VA_ARGS__);                       \
-            else      R3D_ROPE_K(kThreads, 0, grid, stream, __VA_ARGS__);                       \
+            if (mode == 3)      R3D_ROPE_K(kThreads, 2, grid, stream, __VA_ARGS__);             \
+            else if (mode == 1) R3D_ROPE_K(kThreads, 1, grid, stream, __VA_ARGS__);             \
+            else                R3D_ROPE_K(kThreads, 0, grid, stream, __VA_ARGS__);             \
         }                                                                                       \
     } while (0)
 
@@ -1248,23 +1339,54 @@ extern "C" int r3d_fill(long y, int M, int n, int y_ld, int dt, float v, long st
 
 extern "C" int r3d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_head, int n_head_kv,
                              float theta, float scale, int mode, int rot, int qkv_ld,
-                             long stream) {
+                             int pos_cs, int pos_rs, int s1, int s2, long stream) {
     if (!qkv || !pos) return -1;
     if (M <= 0 || head_dim <= 0 || n_head <= 0 || n_head_kv < 0) return -2;
     if (rot <= 0) rot = head_dim;
     if (rot > head_dim || (rot & 1)) return -3;
-    if (mode != R3D_ROPE_NEOX && mode != R3D_ROPE_GPTJ) return -3;
+    if (mode != R3D_ROPE_NEOX && mode != R3D_ROPE_GPTJ && mode != R3D_ROPE_IMROPE) return -3;
     if (head_dim & 1) return -3;                       // the two halves of a head, evenly split
     if (!(theta > 0.0f) || !std::isfinite(theta)) return -2;
+    if (pos_cs < 0 || pos_rs < 0 || s1 < 0 || s2 < 0) return -2;
     if (!qkv_ld) qkv_ld = (n_head + 2 * n_head_kv) * head_dim;
     if (qkv_ld < (n_head + 2 * n_head_kv) * head_dim) return -3;
     /* One wave covers a token's rope pairs when there are at most 256 of them; 256 threads take
      * more. */
-    const int gptj = mode == R3D_ROPE_GPTJ;
     const int thr = (n_head + n_head_kv) * (rot / 2) <= 256u ? (int)kNarrow : (int)kThreads;
     R3D_ROPE2(thr, M, stream, (uint16_t*)(uintptr_t)qkv, (const int32_t*)(uintptr_t)pos,
               (uint32_t)head_dim, (uint32_t)(n_head + n_head_kv), (uint32_t)rot, theta, scale,
-              (uint32_t)qkv_ld);
+              (uint32_t)qkv_ld, (uint32_t)pos_cs, (uint32_t)pos_rs, (uint32_t)s1, (uint32_t)s2);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r3d_rope_table_f32(long pos, long cs, int M, int rot, int rows, float theta,
+                                  float scale, long stream) {
+    if (!pos || !cs) return -1;
+    if (M <= 0 || rot < 2 || (rot & 1) || rows <= 0) return -2;
+    if (!(theta > 0.0f) || !std::isfinite(theta)) return -2;
+    R3D_KLAUNCH(R3D_KNAME(rope_table_kernel), dim3((uint32_t)M), dim3(64),
+                (hipStream_t)(uintptr_t)stream, (const int32_t*)(uintptr_t)pos,
+                (float*)(uintptr_t)cs, (uint32_t)M, (uint32_t)rot, (uint32_t)rows, theta, scale);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r3d_kv_store_i8(long k, long v, long sm, long kv, int M, int head_dim,
+                               int n_head_kv, int block_size, int k_ld, int v_ld,
+                               long long slot_max, long sb, long sh, long so, long stream) {
+    if (!k || !v || !sm || !kv) return -1;
+    if (M <= 0 || head_dim <= 0 || n_head_kv <= 0 || block_size <= 0) return -2;
+    if (!k_ld) k_ld = n_head_kv * head_dim;
+    if (!v_ld) v_ld = n_head_kv * head_dim;
+    if (k_ld < n_head_kv * head_dim || v_ld < n_head_kv * head_dim) return -3;
+    if (sb < 0 || sh < 0 || so < 0) return -3;
+    if (slot_max <= 0)
+        slot_max = (long long)((M + block_size - 1) / block_size + 2) * block_size;
+    R3D_KLAUNCH(R3D_KNAME(kv_store_i8_kernel), dim3((uint32_t)M, (uint32_t)n_head_kv), dim3(64),
+                (hipStream_t)(uintptr_t)stream, (const uint16_t*)(uintptr_t)k,
+                (const uint16_t*)(uintptr_t)v, (const int32_t*)(uintptr_t)sm,
+                (uint8_t*)(uintptr_t)kv, (uint32_t)head_dim, (uint32_t)block_size,
+                (uint32_t)k_ld, (uint32_t)v_ld, (int64_t)sb, (int64_t)sh, (int64_t)so,
+                (int64_t)slot_max);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1815,7 +1937,6 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     R3D_NEED(dt_bf16(qkv));
     R3D_NEED(dt_i32(pos));
     if (!r3d_contig(pos)) return R3D_NO(RAD_E_STRIDE);
-    if (pos->rank >= 2) return R3D_NO(RAD_E_UNSUPPORTED);   // multi-component positions
 
     const long long head_dim = r3d_geti_or(a, "head_dim", 0);
     const long long n_head = r3d_geti_or(a, "n_head", 0);
@@ -1832,14 +1953,36 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
         for (int i = 0; i < 5; ++i)
             if (!std::strcmp(nm, kModes[i])) { mode = i; break; }
     }
-    if (mode < 0) return R3D_NO(RAD_E_UNSUPPORTED);   // absent, or one of the three multi modes
-    if (mode > R3D_ROPE_GPTJ) return R3D_NO(RAD_E_UNSUPPORTED);
-    if (r3d_gets(a, "sections")) return R3D_NO(RAD_E_UNSUPPORTED);
+    if (mode < 0) return R3D_NO(RAD_E_UNSUPPORTED);   // absent, or mrope/axial
+    if (mode != R3D_ROPE_NEOX && mode != R3D_ROPE_GPTJ && mode != R3D_ROPE_IMROPE)
+        return R3D_NO(RAD_E_UNSUPPORTED);
     if (r3d_getf(a, "yarn_factor", 0.0) != 0.0) return R3D_NO(RAD_E_UNSUPPORTED);
     if (r3d_getf(a, "llama3_factor", 0.0) != 0.0) return R3D_NO(RAD_E_UNSUPPORTED);
     if (const char* lad = r3d_gets(a, "ladder")) {
         /* Absent and "rotary" are the ladder the kernel has: the base frequency divides by rot. */
         if (std::strcmp(lad, "rotary")) return R3D_NO(RAD_E_UNSUPPORTED);
+    }
+
+    /* imrope reads three component planes and the "11 11 10" sections; neox/gptj read one
+     * position per row and refuse a sections string. */
+    long long s1 = 0, s2 = 0;
+    if (mode == R3D_ROPE_IMROPE) {
+        const char* sec = r3d_gets(a, "sections");
+        if (!sec) return R3D_NO(RAD_E_SHAPE);
+        long long v[3] = {};
+        int n = 0;
+        for (const char* p = sec; *p && n < 3; ) {
+            char* end = nullptr;
+            const long long x = std::strtoll(p, &end, 10);
+            if (end == p || x <= 0) return R3D_NO(RAD_E_SHAPE);
+            v[n++] = x;
+            p = end;
+        }
+        if (n != 3) return R3D_NO(RAD_E_SHAPE);
+        s1 = v[1];
+        s2 = v[2];
+    } else if (r3d_gets(a, "sections")) {
+        return R3D_NO(RAD_E_UNSUPPORTED);
     }
 
     const float theta = (float)r3d_getf(a, "theta", 10000.0);
@@ -1849,13 +1992,47 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
     long long Mq = 0;
     const long long qkv_ld = r3d_rows_pitch(qkv, width, &Mq);
     if (qkv_ld < 0) return R3D_NO(RAD_E_STRIDE);
-    const long long Mp = r3d_numel(pos);
+    const bool multi = pos->rank >= 2;
+    if (multi && mode != R3D_ROPE_IMROPE) return R3D_NO(RAD_E_UNSUPPORTED);
+    if (multi && (r3d_dim(pos, 0) < 3 || r3d_dim(pos, 1) <= 0)) return R3D_NO(RAD_E_SHAPE);
+    const long long Mp = multi ? r3d_dim(pos, 1) : r3d_numel(pos);
     if (Mp <= 0 || Mq < Mp) return R3D_NO(RAD_E_SHAPE);
     const long long M = Mp;   // the positions drive the launch; a row past them is left alone
+    const int pos_cs = multi ? (int)r3d_stride(pos, 0) : 0;
+    const int pos_rs = multi ? (int)r3d_stride(pos, 1) : 1;
 
     return r3d_launch_ok(r3d_rope_bf16(r3d_addr(qkv), r3d_addr(pos), (int)M, (int)head_dim,
                                         (int)n_head, (int)n_head_kv, theta, scale, mode, (int)rot,
-                                        (int)qkv_ld, (long)(uintptr_t)s));
+                                        (int)qkv_ld, pos_cs, pos_rs, (int)s1, (int)s2,
+                                        (long)(uintptr_t)s));
+}
+
+/* ------------------------------------------------------------------ rope_table */
+extern "C" int r3d_rad_rope_table(const RadArgs* a, RadStream s) {
+    const RadTensor* pos = r3d_opt(a, 0);
+    const RadTensor* cs = r3d_opt(a, 1);
+    if (!pos || !cs) return R3D_NO(RAD_E_INVAL);
+    R3D_NEED(dt_i32(pos));
+    R3D_NEED(dt_f32(cs));
+    if (!r3d_contig(pos) || !r3d_contig(cs)) return R3D_NO(RAD_E_STRIDE);
+    const char* dtype = r3d_gets(a, "dtype");
+    if (!dtype || std::strcmp(dtype, "f32")) return R3D_NO(RAD_E_DTYPE);
+    const long long rot = r3d_geti_or(a, "rot", 0);
+    if (rot < 2 || (rot & 1)) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_getf(a, "yarn_factor", 0.0) != 0.0) return R3D_NO(RAD_E_UNSUPPORTED);
+    if (const char* lad = r3d_gets(a, "ladder")) {
+        if (std::strcmp(lad, "rotary")) return R3D_NO(RAD_E_UNSUPPORTED);
+    }
+    const long long M = r3d_numel(pos);
+    if (M <= 0 || M > 0x7fffffffLL) return R3D_NO(RAD_E_SHAPE);
+    const long long total = r3d_numel(cs);
+    if (total <= 0 || total % rot) return R3D_NO(RAD_E_SHAPE);
+    const long long rows = total / rot;
+    if (rows <= 0 || rows > 0x7fffffffLL) return R3D_NO(RAD_E_SHAPE);
+    const float theta = (float)r3d_getf(a, "theta", 10000.0);
+    const float scale = (float)r3d_getf(a, "scale", 1.0);
+    return r3d_launch_ok(r3d_rope_table_f32(r3d_addr(pos), r3d_addr(cs), (int)M, (int)rot,
+                                            (int)rows, theta, scale, (long)(uintptr_t)s));
 }
 
 /* ------------------------------------------------------------------ kv_store
@@ -1877,8 +2054,9 @@ extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s) {
     R3D_NEED(dt_bf16(v));
     R3D_NEED(dt_i32(sm));
     const int kv_dt = r3d_dt_code(kv->dtype);
-    if (kv_dt != R3D_DT_BF16 && kv_dt != R3D_DT_F16 && kv_dt != R3D_DT_U8)
+    if (kv_dt != R3D_DT_BF16 && kv_dt != R3D_DT_F16 && kv_dt != R3D_DT_U8 && kv_dt != R3D_DT_I8)
         return R3D_NO(RAD_E_DTYPE);
+    const bool i8 = kv_dt == R3D_DT_I8;
 
     const long long head_dim = r3d_geti_or(a, "head_dim", 0);
     const long long n_head_kv = r3d_geti_or(a, "n_head_kv", 0);
@@ -1889,6 +2067,10 @@ extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s) {
     if (kv_dt == R3D_DT_U8 && !(k_scale > 0.0f && v_scale > 0.0f)) return R3D_NO(RAD_E_INVAL);
 
     long long sb = 0, sh = 0, so = 0, sd = 1;
+    if (i8) {
+        if (kv->rank != 4 || r3d_dim(kv, 3) != 2 * head_dim + 4 || r3d_stride(kv, 3) != 1)
+            return R3D_NO(RAD_E_SHAPE);
+    }
     if (kv->rank == 4) {
         sb = r3d_stride(kv, 0);
         sh = r3d_stride(kv, 1);
@@ -1944,6 +2126,11 @@ extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s) {
         }
     }
 
+    if (i8)
+        return r3d_launch_ok(r3d_kv_store_i8(r3d_addr(k), r3d_addr(v), r3d_addr(sm),
+                                             r3d_addr(kv), (int)T, (int)head_dim, (int)n_head_kv,
+                                             (int)block_size, (int)k_ld, (int)v_ld, slot_max, sb,
+                                             sh, so, (long)(uintptr_t)s));
     return r3d_launch_ok(r3d_kv_store(r3d_addr(k), r3d_addr(v), r3d_addr(sm), r3d_addr(kv), (int)T,
                                       (int)head_dim, (int)n_head_kv, (int)block_size, kv_dt,
                                       k_scale, v_scale, (int)k_ld, (int)v_ld, slot_max, sb, sh, so,

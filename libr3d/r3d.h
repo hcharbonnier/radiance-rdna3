@@ -97,12 +97,14 @@ int r3d_scale_bf16(long x, long s, long y, int M, int n, int s_dt, int x_ld, int
 int r3d_scale_f32(long x, long s, long y, int M, int n, int s_dt, int x_ld, int y_ld, long stream);
 int r3d_fill(long y, int M, int n, int y_ld, int dt, float v, long stream);
 
-/* In-place rotary on a fused qkv row: q, then k; v is untouched. `mode` is R3D_ROPE_NEOX or
- * R3D_ROPE_GPTJ; `rot` the rotary width (<= head_dim, even). `scale` divides the position: the
- * angle of pair i is (pos / scale) * theta^-i, as in ref_rope. YaRN's magnitude (`yarn_factor`) is not
- * implemented. `pos` is M i32 positions, one per row. */
+/* In-place rotary on a fused qkv row: q, then k; v is untouched. `mode` is R3D_ROPE_NEOX,
+ * R3D_ROPE_GPTJ or R3D_ROPE_IMROPE; `rot` the rotary width (<= head_dim, even). `scale` divides the
+ * position: the angle of pair i is (pos / scale) * theta^-i, as in ref_rope. YaRN's magnitude
+ * (`yarn_factor`) is not implemented. With a rank-1 position plane `pos_cs` is 0 and `pos_rs` 1;
+ * an imrope plane is [3, M], component-major, and `s1`/`s2` are its first two sections' widths. */
 int r3d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_head, int n_head_kv, float theta,
-                  float scale, int mode, int rot, int qkv_ld, long stream);
+                  float scale, int mode, int rot, int qkv_ld, int pos_cs, int pos_rs, int s1,
+                  int s2, long stream);
 
 /* K and V into a paged cache at slot_mapping's slots. The cache is [blocks, kv_heads, block_size,
  * 2*head_dim] with the strides the shim reads off the operand (sb/sh/so/sd). A negative slot is
