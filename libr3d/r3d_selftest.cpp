@@ -430,6 +430,8 @@ static void check_shapes() {
                        PS("dtype", "fp8_e4m3") } },
         { "rmsnorm_quant_fp8", { PI("M", 1792), PI("n", 5120), PF("eps", 1e-5), PI("group", 128),
                                  PS("dtype", "bf16") } },
+        { "rmsnorm_had_quant_i8g", { PI("M", 1792), PI("n", 5120), PF("eps", 1e-5),
+                                     PI("group", 128), PS("dtype", "bf16") } },
         { "gemm_nt", { PI("M", 8), PI("N", 11008), PI("K", 4096), PS("dtype", "bf16") } },
         { "gemm_nt", { PI("M", 8), PI("N", 11008), PI("K", 4096), PS("dtype", "f16") } },
         { "gemm_nt_q", { PI("M", 8), PI("N", 11008), PI("K", 4096), PI("group", 128),
@@ -3732,6 +3734,171 @@ void check_rope_axial() {
     rope_axial_case("rope axial 24 12", ours, ref, 23, 8, 8, "24 12");
 }
 
+/* ---- rmsnorm_had_quant_i8g: byte-identical to rmsnorm + had_quant_act_i8g --------------------
+ *
+ * The fused op keeps the pair's intermediate out of VRAM, so the two must agree bit for bit: the
+ * bf16-rounded residual sum, the bf16-rounded norm output, the rotation and the int8 codes. Cases:
+ * M = 1, 5, 512, with the residual absent and present, plus a bound residual with wadd = 0, which
+ * proves the residual is read independently of wadd (as the reference reads it).
+ *
+ * libref cross-check is not possible for the i8g quantiser (libref declares no i8g op); the pair's
+ * two halves are picked up by the oracle separately, and the fused op is the contract that the two
+ * halves meet bit for bit. The scale is amax / 127, the rotation's 1/128 being the weight plane's,
+ * as libref and libr4d's i8g quantisers write it.
+ */
+void norm_had_pair_case(int M, bool residual, bool wadd_on, const char* what) {
+    const uint32_t n = 5120, ng = n / 128;
+    const float eps = 1e-6f, wadd = wadd_on ? 1.0f : 0.0f;
+    std::vector<uint16_t> hx((size_t)M * n), hr((size_t)M * n), hw(n);
+    for (int m = 0; m < M; ++m)
+        for (uint32_t j = 0; j < n; ++j) {
+            const float xv = 0.015625f * (float)((m * 37 + (int)j * 11) % 31 - 15);
+            const float rv = 0.0078125f * (float)((m * 13 + (int)j * 7) % 27 - 13);
+            hx[(size_t)m * n + j] = f32_to_bf16(xv);
+            hr[(size_t)m * n + j] = f32_to_bf16(rv);
+        }
+    for (uint32_t j = 0; j < n; ++j) hw[j] = f32_to_bf16(0.5f + 0.0005f * (float)((j * 3) % 17));
+
+    const size_t xb = hx.size() * 2, rb = hr.size() * 2, wb = hw.size() * 2,
+                 qb = (size_t)M * n, sb = (size_t)M * ng * 4;
+    void *dx = nullptr, *dr = nullptr, *drp = nullptr, *dw = nullptr, *dq = nullptr,
+         *ds = nullptr, *dob = nullptr, *dy = nullptr, *dsum = nullptr, *dqp = nullptr,
+         *dsp = nullptr;
+    bool okalloc = hipMalloc(&dx, xb) == hipSuccess && hipMalloc(&dr, rb) == hipSuccess &&
+                   hipMalloc(&dw, wb) == hipSuccess && hipMalloc(&dq, qb) == hipSuccess &&
+                   hipMalloc(&ds, sb) == hipSuccess && hipMalloc(&dob, xb) == hipSuccess &&
+                   hipMalloc(&dy, xb) == hipSuccess && hipMalloc(&dsum, xb) == hipSuccess &&
+                   hipMalloc(&drp, rb) == hipSuccess &&
+                   hipMalloc(&dqp, qb) == hipSuccess && hipMalloc(&dsp, sb) == hipSuccess;
+    if (!okalloc || hipMemcpy(dx, hx.data(), xb, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(dr, hr.data(), rb, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(drp, hr.data(), rb, hipMemcpyHostToDevice) != hipSuccess ||
+        hipMemcpy(dw, hw.data(), wb, hipMemcpyHostToDevice) != hipSuccess) {
+        if (dx) (void)hipFree(dx); if (dr) (void)hipFree(dr); if (drp) (void)hipFree(drp);
+        if (dw) (void)hipFree(dw);
+        if (dq) (void)hipFree(dq); if (ds) (void)hipFree(ds); if (dob) (void)hipFree(dob);
+        if (dy) (void)hipFree(dy); if (dsum) (void)hipFree(dsum);
+        if (dqp) (void)hipFree(dqp); if (dsp) (void)hipFree(dsp);
+        skip("%s: no device buffers", what);
+        return;
+    }
+
+    const RadKernelInfo* fused = row_by_name("rmsnorm_had_quant_i8g_bf16");
+    const RadKernelInfo* rn = row_by_name("rmsnorm_bf16");
+    const RadKernelInfo* hq = row_by_name("had_quant_act_i8g_bf16");
+    const RadKernelInfo* add = row_by_name("add_bf16");
+    if (!fused || !rn || !hq || (residual && !add)) { skip("%s: a row is absent", what); return; }
+    int64_t xd[2] = { M, n }, wd[1] = { n }, sd[2] = { M, ng };
+    RadParam pf[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                      { "n", RAD_P_INT, n, 0, nullptr, 0.0 },
+                      { "eps", RAD_P_F64, 0, 0, nullptr, eps },
+                      { "group", RAD_P_INT, 128, 0, nullptr, 0.0 },
+                      { "dtype", RAD_P_STR, 0, 0, "bf16", 0.0 },
+                      { "wadd", RAD_P_F64, 0, 0, nullptr, wadd } };
+    RadTensor tf[6] = { h256_tensor(dx, RAD_BF16, 2, xd),
+                        residual ? h256_tensor(dr, RAD_BF16, 2, xd) : RadTensor{},
+                        h256_tensor(dw, RAD_BF16, 1, wd), h256_tensor(dq, RAD_I8, 2, xd),
+                        h256_tensor(ds, RAD_F32, 2, sd), h256_tensor(dob, RAD_BF16, 2, xd) };
+    RadArgs af{ tf, 6, pf, 6, nullptr, 0, nullptr, 0, 1 };
+    const int rc = fused->launch(&af, nullptr);
+
+    /* The pair's residual form is add (bf16 store) then rmsnorm of the stored sum; the fused form
+     * stores the sum itself. */
+    void* nsrc = dx;
+    int rca = RAD_OK;
+    if (residual) {
+        RadParam pa[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                          { "n", RAD_P_INT, n, 0, nullptr, 0.0 },
+                          { "dtype", RAD_P_STR, 0, 0, "bf16", 0.0 } };
+        RadTensor ta[3] = { h256_tensor(dx, RAD_BF16, 2, xd), h256_tensor(drp, RAD_BF16, 2, xd),
+                            h256_tensor(dsum, RAD_BF16, 2, xd) };
+        RadArgs aa{ ta, 3, pa, 3, nullptr, 0, nullptr, 0, 1 };
+        rca = add->launch(&aa, nullptr);
+        nsrc = dsum;
+    }
+    RadParam pr[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                      { "n", RAD_P_INT, n, 0, nullptr, 0.0 },
+                      { "eps", RAD_P_F64, 0, 0, nullptr, eps },
+                      { "dtype", RAD_P_STR, 0, 0, "bf16", 0.0 },
+                      { "wadd", RAD_P_F64, 0, 0, nullptr, wadd } };
+    RadTensor tr[3] = { h256_tensor(nsrc, RAD_BF16, 2, xd), h256_tensor(dw, RAD_BF16, 1, wd),
+                        h256_tensor(dy, RAD_BF16, 2, xd) };
+    RadArgs ar{ tr, 3, pr, 5, nullptr, 0, nullptr, 0, 1 };
+    const int rc1 = rn->launch(&ar, nullptr);
+    RadParam ph[] = { { "M", RAD_P_INT, M, 0, nullptr, 0.0 },
+                      { "n", RAD_P_INT, n, 0, nullptr, 0.0 },
+                      { "group", RAD_P_INT, 128, 0, nullptr, 0.0 },
+                      { "dtype", RAD_P_STR, 0, 0, "bf16", 0.0 } };
+    RadTensor th[3] = { h256_tensor(dy, RAD_BF16, 2, xd), h256_tensor(dqp, RAD_I8, 2, xd),
+                        h256_tensor(dsp, RAD_F32, 2, sd) };
+    RadArgs ah{ th, 3, ph, 4, nullptr, 0, nullptr, 0, 1 };
+    const int rc2 = hq->launch(&ah, nullptr);
+
+    std::vector<uint8_t> qf(qb), qr(qb);
+    std::vector<float> sf((size_t)M * ng), sr((size_t)M * ng);
+    std::vector<uint16_t> obf(hx.size()), yp(hx.size());
+    const bool ran = rc == RAD_OK && rca == RAD_OK && rc1 == RAD_OK && rc2 == RAD_OK &&
+                     hipDeviceSynchronize() == hipSuccess &&
+                     hipMemcpy(qf.data(), dq, qb, hipMemcpyDeviceToHost) == hipSuccess &&
+                     hipMemcpy(qr.data(), dqp, qb, hipMemcpyDeviceToHost) == hipSuccess &&
+                     hipMemcpy(sf.data(), ds, sb, hipMemcpyDeviceToHost) == hipSuccess &&
+                     hipMemcpy(sr.data(), dsp, sb, hipMemcpyDeviceToHost) == hipSuccess &&
+                     hipMemcpy(obf.data(), dob, xb, hipMemcpyDeviceToHost) == hipSuccess &&
+                     hipMemcpy(yp.data(), dy, xb, hipMemcpyDeviceToHost) == hipSuccess;
+    bool rsame = true;
+    size_t rat = 0;
+    int rfv = 0, rav = 0;
+    if (residual && ran) {
+        std::vector<uint16_t> rf(hx.size()), ra(hx.size());
+        rsame = hipMemcpy(rf.data(), dr, xb, hipMemcpyDeviceToHost) == hipSuccess &&
+                hipMemcpy(ra.data(), dsum, xb, hipMemcpyDeviceToHost) == hipSuccess &&
+                std::memcmp(rf.data(), ra.data(), xb) == 0;
+        if (!rsame)
+            for (; rat < rf.size() && rf[rat] == ra[rat]; ++rat) {}
+        if (!rsame && rat < rf.size()) { rfv = (int)rf[rat]; rav = (int)ra[rat]; }
+    }
+    (void)hipFree(dx); (void)hipFree(dr); (void)hipFree(drp); (void)hipFree(dw); (void)hipFree(dq);
+    (void)hipFree(ds); (void)hipFree(dob); (void)hipFree(dy); (void)hipFree(dsum);
+    (void)hipFree(dqp); (void)hipFree(dsp);
+    if (!ran) { fail("%s: the launches failed (%d/%d/%d/%d)", what, rc, rca, rc1, rc2); return; }
+
+    const bool qsame = std::memcmp(qf.data(), qr.data(), qb) == 0;
+    const bool ssame = std::memcmp(sf.data(), sr.data(), sb) == 0;
+    const bool obsame = std::memcmp(obf.data(), yp.data(), xb) == 0;
+    if (qsame && ssame && obsame) { ok("%s: codes, scales and bf16 out identical to the pair", what); return; }
+    size_t at = 0;
+    for (; at < qb && qf[at] == qr[at]; ++at) {}
+    fail("%s: differs from rmsnorm + had_quant_act_i8g (q %s, scale %s, out_bf16 %s, residual %s; "
+         "first q byte %zu: %d vs %d)", what, qsame ? "ok" : "DIFF", ssame ? "ok" : "DIFF",
+         obsame ? "ok" : "DIFF", rsame ? "ok" : "DIFF", at < qb ? at : 0,
+         at < qb ? (int)(int8_t)qf[at] : 0, at < qb ? (int)(int8_t)qr[at] : 0);
+    if (!rsame) {
+        fail("  residual first diff at %zu: fused 0x%04x (%g) vs add 0x%04x (%g)", rat, (unsigned)rfv,
+             (double)bf16_to_f32((uint16_t)rfv), (unsigned)rav,
+             (double)bf16_to_f32((uint16_t)rav));
+    }
+}
+
+void check_norm_had_i8g() {
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) {
+        skip("norm_had_i8g: no device visible");
+        return;
+    }
+    if (!row_by_name("rmsnorm_had_quant_i8g_bf16") || !row_by_name("rmsnorm_bf16") ||
+        !row_by_name("had_quant_act_i8g_bf16")) {
+        skip("norm_had_i8g: a row is absent");
+        return;
+    }
+    norm_had_pair_case(1, false, false, "norm_had M=1");
+    norm_had_pair_case(1, true, true, "norm_had M=1 residual");
+    norm_had_pair_case(5, false, false, "norm_had M=5");
+    norm_had_pair_case(5, true, true, "norm_had M=5 residual");
+    norm_had_pair_case(5, true, false, "norm_had M=5 residual wadd=0");
+    norm_had_pair_case(512, false, false, "norm_had M=512");
+    norm_had_pair_case(512, true, true, "norm_had M=512 residual");
+}
+
 }  // namespace
 #else
 static void check_attn_h256() { skip("h256 attn: built without the HIP runtime"); }
@@ -3740,6 +3907,7 @@ static void check_rope_table() { skip("rope_table: built without the HIP runtime
 static void check_rope_imrope() { skip("rope imrope: built without the HIP runtime"); }
 static void check_attn_dense() { skip("attn_dense hd72: built without the HIP runtime"); }
 static void check_rope_axial() { skip("rope axial: built without the HIP runtime"); }
+static void check_norm_had_i8g() { skip("norm_had_i8g: built without the HIP runtime"); }
 #endif
 
 int main(int argc, char** argv) {
@@ -3751,15 +3919,17 @@ int main(int argc, char** argv) {
     bool h256_only = false;
     bool bands_only = false;
     bool vision_only = false;
+    bool norm_only = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--case") && i + 1 < argc) g_case = argv[++i];
         else if (!std::strcmp(argv[i], "--static")) static_only = true;
         else if (!std::strcmp(argv[i], "--h256-only")) h256_only = true;
         else if (!std::strcmp(argv[i], "--bands-only")) bands_only = true;
         else if (!std::strcmp(argv[i], "--vision-only")) vision_only = true;
+        else if (!std::strcmp(argv[i], "--norm-only")) norm_only = true;
         else if (!std::strcmp(argv[i], "--help")) {
             std::printf("usage: r3d_selftest <path>/libr3d.so [--case <row>] [--static] "
-                        "[--h256-only] [--bands-only] [--vision-only]\n");
+                        "[--h256-only] [--bands-only] [--vision-only] [--norm-only]\n");
             return 0;
         } else if (!path) path = argv[i];
     }
@@ -3807,6 +3977,12 @@ int main(int argc, char** argv) {
         return g_fail ? 1 : 0;
     }
 
+    if (norm_only && !g_case) {
+        check_norm_had_i8g();
+        dlclose(h);
+        return g_fail ? 1 : 0;
+    }
+
     if (h256_only && !g_case) {
         check_attn_h256();
         dlclose(h);
@@ -3827,6 +4003,7 @@ int main(int argc, char** argv) {
         check_rope_imrope();
         check_attn_dense();
         check_rope_axial();
+        check_norm_had_i8g();
 
         const int n = rows();
         int passed = 0, failed = 0;

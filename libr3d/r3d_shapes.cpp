@@ -757,6 +757,43 @@ int r3d_shape_rmsnorm_quant_fp8(const RadParam* p, int n_p, int operand, RadOpdD
     R3D_PICK(list);                          /* x, residual, w, q, scale, out_bf16 */
 }
 
+/* The fused add + norm + rotated int8 quantiser: the same operands as rmsnorm_quant_fp8, with `q`
+ * int8 (row-major) and one f32 scale per (row, 128). */
+int r3d_shape_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    const RadOpdDesc list[] = { opd(D, M, n), opd(D, M, n), opd(D, n),
+                                opd((uint32_t)RAD_I8, M, n), opd((uint32_t)RAD_F32, M, ng),
+                                opd((uint32_t)RAD_BF16, M, n) };
+    R3D_PICK(list);                          /* x, residual, w, q, scale, out_bf16 */
+}
+
+/* gemm_nt_q_gated over a rotated int8 (i8a8h) IQR weight: `a` is the trunk's int8 codes with one
+ * f32 scale per (row, 128 of K), `q` is int8 over the gate's n columns with one group-128 scale,
+ * and the intermediate gate_up is the row's scratch. The logical shapes match gemm_nt_q's i8a8
+ * operands; b/b_scale carry the IQR private layout, declared by the row's layout hooks. */
+int r3d_shape_gemm_nt_q_gated_i8a8h(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
+    const int64_t group = gi(p, n_p, "group", 0);
+    const char* dt = gs(p, n_p, "dtype");
+    if (!dt || std::strcmp(dt, "i8a8h") != 0) return RAD_E_UNSUPPORTED;
+    if (M < 1 || M > 16 || N < 2 || (N & 1) || K < 128) return RAD_E_UNSUPPORTED;
+    if (group != 128 || (K % group)) return RAD_E_UNSUPPORTED;
+    const int64_t n = N / 2, kb = K / group;
+    if (N % 256) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd((uint32_t)RAD_I8, M, K),              /* a: the rotated int8 trunk's codes */
+        opd((uint32_t)RAD_F32, M, kb),            /* a_scale */
+        opd((uint32_t)RAD_I8, N, K),              /* b: IQR codes, gate rows [0,n) then up */
+        in_unit(opd((uint32_t)RAD_F32, N, kb)),   /* b_scale: the container's IQR form */
+        opd((uint32_t)RAD_I8, M, n),              /* q */
+        opd((uint32_t)RAD_F32, M, n / 128),       /* scale */
+        opd((uint32_t)RAD_BF16, M, n),            /* out_bf16, optional */
+    };
+    R3D_PICK(list);
+}
+
 /* Paged attention over one sequence. A context equal to the query length exercises no deep paging,
  * KV split or window, so `ctx` wins when given and is never below the query. `q_len` is the ranged
  * parameter; decode and prefill chunks are different kernels (docs/OPS.md). */

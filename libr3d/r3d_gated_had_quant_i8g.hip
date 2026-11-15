@@ -2,10 +2,10 @@
  * then per-group int8 (row-major), in one pass.
  *
  * mode 0 (silu) is down_proj's input, mode 1 (sigmoid) a gated attention o_proj's. The gate and up
- * arrive as two halves of a fused gate_up of row pitch 2*n. The gated product is formed in fp32,
- * the 128-wide Hadamard shrinks the group maximum, and the codes are row-major int8 (the i8a8 dot2
- * GEMM reads stored order), with one scale per (row, group). The normalisation (1/sqrt(128)) is
- * folded into the scale.
+ * arrive as two halves of a fused gate_up of row pitch 2*n. The gated product is rounded to bf16 as
+ * the unfused pair stores it, the 128-wide Hadamard shrinks the group maximum, and the codes are
+ * row-major int8 (the i8a8 dot2 GEMM reads stored order), with one scale per (row, group). The
+ * rotation's 1/128 is the weight's, so the scale is amax / 127 and folds nothing.
  *
  * One wave a (token, 128-column group): the wave runs the group's whole FWHT with no group loop,
  * which is the form gfx1102 needs (a DPP exchange in a loop body miscompiles there) and lets a
@@ -66,19 +66,19 @@ __global__ __launch_bounds__(kThreads) void gated_had_quant_i8g_kernel(
     for (int j = 0; j < VPL; ++j) {
         const float xg = ld_bf(g, base + j);
         const float sg = 1.0f / (1.0f + expf(-xg));   /* full exp: the reference's sigmoid */
-        v[j] = (MODE == 0 ? xg * sg : sg) * ld_bf(u, base + j);
+        /* The unfused pair stores the gated product as bf16 and the quantiser reads it back. */
+        const uint16_t h = f32_to_bf16((MODE == 0 ? xg * sg : sg) * ld_bf(u, base + j));
+        if (yop) yop[base + j] = h;
+        v[j] = bf16_to_f32(h);
     }
     r3d_fwht_wave<HAD>(v, lane);
     float m = 0.0f;
 #pragma unroll
-    for (int j = 0; j < VPL; ++j) {
-        m = fmaxf(m, fabsf(v[j]));
-        if (yop) yop[base + j] = f32_to_bf16(v[j]);
-    }
+    for (int j = 0; j < VPL; ++j) m = fmaxf(m, fabsf(v[j]));
     m = wave_max_f(m);
-    m = m > 0.0f ? m : 1e-8f;
-    const float inv = kTopI8 / m;
-    if (lane == 0) s[(size_t)row * nkb + kg] = m * (1.0f / sqrtf((float)HAD)) / kTopI8;
+    const float sc = m > 0.0f ? m / kTopI8 : 1.0f;
+    const float inv = 1.0f / sc;
+    if (lane == 0) s[(size_t)row * nkb + kg] = sc;
     /* The codes in row-major order: each lane's VPL values are columns base .. base+VPL-1, so lane
      * l writes its own four (VPL = 4) bytes at l*4, and 32 lanes cover the group. */
     static_assert(VPL == 4, "one wave's 32 lanes hold the group's 128 columns as four each");

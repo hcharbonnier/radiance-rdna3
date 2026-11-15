@@ -982,6 +982,12 @@ static const RadOpSchema kSchemas[] = {
            "the unrounded sum). `wadd` is added to every "
            "gain in f32. `out_bf16` holds exactly the value the codes were taken over."),
 
+    SCHEMA("rmsnorm_had_quant_i8g", pRmsQuantFp8, oRmsQuantFp8,
+           "The same fused add and norm with had_quant_act_i8g's quantiser on its pass: a "
+           "128-wide Hadamard between the bf16-rounded norm output and the per-(row, 128) int8 "
+           "absmax. Byte-identical to `rmsnorm` + `had_quant_act_i8g`; `out_bf16` holds the "
+           "unrotated norm output, for a bf16 consumer."),
+
     /* ---- the vocabulary and the sampler: schemas first, rows with their kernels ---- */
     SCHEMA("silu_mul", pMnDtype, oGateUp,
            "y[i] = silu(gate_up[i]) * gate_up[n + i] over one fused [M, 2n] plane, the gate the "
@@ -1783,6 +1789,10 @@ static const RadConstraint cArGatherHc[] = { C_IN("dtype", "bf16"), C_GE("M", 1)
 static const RadConstraint cSiluMul[]     = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
 static const RadConstraint cRmsQuantFp8[] = { C_IN("dtype", "bf16"), C_EQ("group", R3D_FP8_BLOCK),
                                               C_DIV("n", R3D_FP8_BLOCK) };
+/* The rotated int8 twin: the rotation is 128 wide and one scale covers it, so the group is fixed
+ * and divides n. */
+static const RadConstraint cRmsQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
+                                              C_DIV("n", 128) };
 
 /* The sampler's pre-filters constrain only `n_vocab`. Their bands carry `n_vocab` and `M` (plus
  * `vocab_off`, and `k` for logprobs) and no `dtype` key, so a dtype constraint would match no band;
@@ -1858,6 +1868,12 @@ static const RadConstraint cGemmGated[]  = { C_IN("dtype", "fp8a8"),
                                              C_EQ("group", R3D_FP8_BLOCK), C_GE("M", 1),
                                              C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 2),
                                              C_GE("N", 2) };
+/* The same fold over a rotated int8 (i8a8h) IQR weight: the ffn block declares it for M up to 16,
+ * N and K multiples of 256 (whole 128-blocks on both sides). */
+static const RadConstraint cGemmGatedI8[] = { C_IN("dtype", "i8a8h"),
+                                              C_IN("act", "silu sigmoid"),
+                                              C_EQ("group", 128), C_GE("M", 1),
+                                              C_LE("M", 16), C_DIV("K", 256), C_DIV("N", 256) };
 
 /* Every key the walk reads is required and in the band, so all are bound; `top_k <= 256` gives each
  * candidate one lane. `anchor_stride` is deliberately unbound: it is optional, defaults to 1, and
@@ -2265,7 +2281,7 @@ static const RadKernelInfo kKernels[] = {
 { "had_quant_act_fp8_bf16", "had_quant_act_fp8", "quant",
   "a 128-wide block Hadamard, then per-group E4M3: the rotation shrinks the group maximum",
   "n == group == 128 (single-group form, the FWHT runs once per wave so its DPP stages stay out of "
-  "a loop); the codes row-major, the scale carrying the 1/sqrt(128)",
+  "a loop); the codes row-major, the scale amax/448 (the rotation's 1/128 is the weight plane's)",
   "bf16 in, E4M3 codes, f32 scale per group",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cHadQuantFp8), NOTUNE,
@@ -2275,7 +2291,7 @@ static const RadKernelInfo kKernels[] = {
 { "gated_had_quant_fp8_bf16", "gated_had_quant_fp8", "quant",
   "a gated product (silu or sigmoid), a 128-wide block Hadamard, then per-group E4M3",
   "n == group == 128 (single-group form, the FWHT runs once per wave so its DPP stages stay out of "
-  "a loop); the gated product in fp32, the codes row-major, the scale carrying the 1/sqrt(128)",
+  "a loop); the gated product rounded to bf16, the codes row-major, the scale amax/448",
   "bf16 gate_up [M,2n], E4M3 codes, f32 scale per group, optional bf16 product",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cGatedHadQuantFp8), NOTUNE,
@@ -2295,7 +2311,8 @@ static const RadKernelInfo kKernels[] = {
 { "had_quant_act_i8g_bf16", "had_quant_act_i8g", "quant",
   "a 128-wide block Hadamard, then per-group int8: the rotated form for the int8 trunk GEMMs",
   "n a multiple of 128, group 128 (one wave a (token, 128-group): the FWHT's DPP stages stay out "
-  "of a loop); the codes row-major for the i8a8 dot2 GEMM, the scale carrying the 1/sqrt(128)",
+  "of a loop); the codes row-major for the i8a8 dot2 GEMM, the scale amax/127 (the rotation's "
+  "1/128 is the weight plane's)",
   "bf16 in, int8 codes (row-major), f32 scale per group",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cHadQuantI8g), NOTUNE,
@@ -2305,8 +2322,8 @@ static const RadKernelInfo kKernels[] = {
 { "gated_had_quant_i8g_bf16", "gated_had_quant_i8g", "quant",
   "a gated product (silu or sigmoid), a 128-wide block Hadamard, then per-group int8",
   "n a multiple of 128, group 128 (one wave a (token, 128-group): the FWHT's DPP stages stay out "
-  "of a loop); the gated product in fp32, the codes row-major for the i8a8 dot2 GEMM, the scale "
-  "carrying the 1/sqrt(128)",
+  "of a loop); the gated product rounded to bf16, the codes row-major for the i8a8 dot2 GEMM, the "
+  "scale amax/127",
   "bf16 gate_up [M,2n], int8 codes (row-major), f32 scale per group, optional bf16 product",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cGatedHadQuantI8g), NOTUNE,
@@ -3001,6 +3018,19 @@ static const RadKernelInfo kKernels[] = {
       nullptr, nullptr, r3d_rad_rmsnorm_quant_fp8, nullptr, nullptr, nullptr,
       r3d_shape_rmsnorm_quant_fp8 },
 
+    { "rmsnorm_had_quant_i8g_bf16", "rmsnorm_had_quant_i8g", "quant",
+      "residual add, RMS norm, 128-wide Hadamard and per-group int8 in one pass: the int8 trunk's "
+      "rotated producer, byte-identical to rmsnorm followed by had_quant_act_i8g",
+      "group 128 and n a multiple of 128; a workgroup a row, a wave a group after the norm "
+      "reduction; the residual sum is stored before the variance reads it, so the norm is over the "
+      "bf16 sum, and the codes are taken over the bf16 norm output, which out_bf16 receives",
+      "bf16 x, residual, gain and optional out_bf16, int8 codes (row-major), f32 scales amax/127 "
+      "(the rotation's 1/128 is the weight plane's), fp32 arithmetic",
+      RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+      ROW(cRmsQuantI8g), NOTUNE,
+      nullptr, nullptr, r3d_rad_rmsnorm_had_quant_i8g, nullptr, nullptr, nullptr,
+      r3d_shape_rmsnorm_had_quant_i8g },
+
 
 /* ------------------------------------------------------------------ r3d_sample_pre_f32.hip
  *
@@ -3358,6 +3388,22 @@ static const RadKernelInfo kKernels[] = {
   ROW(cGemmGated), NOTUNE,
   nullptr, nullptr, r3d_rad_gemm_nt_q_gated, nullptr, nullptr, nullptr,
   r3d_shape_gemm_nt_q_gated },
+
+{ "gemm_iqr_gated_i8a8h", "gemm_nt_q_gated", "gemm",
+  "the gated MLP fold over a rotated int8 (i8a8h) IQR weight: gate_up in the op's scratch, then "
+  "silu, the 128-wide Hadamard and the per-group int8 quantiser",
+  "M <= 16, N and K multiples of 256, group 128; the same IQR forms and private layout as "
+  "gemm_iqr_m16, whose kernel computes the gate_up bf16 half, and gated_had_quant_i8g, whose "
+  "kernel gates, rounds, rotates and codes it. One graph edge and one host dispatch fewer than the "
+  "pair; the two device kernels still run through the op's scratch, which is the same bf16 gate_up "
+  "libr4d's fused gated GEMM stages (a one-launch epilogue is W12's work)",
+  "I8 a row-major with an f32 scale per (row, 128 of K), IQR b/b_scale, I8 q (row-major), f32 "
+  "scale per (row, 128 of n), optional bf16 out_bf16; fp32 arithmetic through the pair",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_M16,
+  ROW(cGemmGatedI8), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_gated, r3d_rad_gemm_nt_q_iqr_gated_scratch,
+  r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
+  r3d_shape_gemm_nt_q_gated_i8a8h, r3d_rad_unrelayout_iqr },
 
 { "dflash_select_bf16", "dflash_select", "draft",
   "DFlash2's greedy walk over the candidate lattice, one lane a (sequence, candidate) pair",

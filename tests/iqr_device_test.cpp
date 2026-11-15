@@ -47,6 +47,7 @@ struct Lib {
     LayoutFn layout = nullptr;
     RelayoutFn relayout = nullptr;
     LaunchFn gemm = nullptr;
+    LaunchFn tiled = nullptr;
     LaunchFn logits = nullptr;
     ScratchFn logits_scratch = nullptr;
     bool ok() const { return h && layout && relayout && gemm; }
@@ -60,6 +61,7 @@ Lib& lib() {
         x.layout = (LayoutFn)dlsym(x.h, "r3d_rad_layout_iqr");
         x.relayout = (RelayoutFn)dlsym(x.h, "r3d_rad_relayout_iqr");
         x.gemm = (LaunchFn)dlsym(x.h, "r3d_rad_gemm_nt_q_iqr_m16");
+        x.tiled = (LaunchFn)dlsym(x.h, "r3d_rad_gemm_nt_q_iqr_tiled");
         x.logits = (LaunchFn)dlsym(x.h, "r3d_rad_logits_gemm_vocab_iqr");
         x.logits_scratch = (ScratchFn)dlsym(x.h, "r3d_logits_gemm_vocab_iqr_scratch");
         return x;
@@ -375,7 +377,7 @@ bool run_case(const Case& c) {
     args.p = params;
     args.n_p = 5;
     args.kv_used_max_h = -1;
-    const int rc = lib().gemm(&args, (RadStream)0);
+    const int rc = (c.M > 16 ? lib().tiled : lib().gemm)(&args, (RadStream)0);
     const hipError_t he = hipDeviceSynchronize();
     if (rc != RAD_OK || he != hipSuccess) {
         std::fprintf(stderr, "%s: launch rc=%d hip=%d\n", c.what, rc, (int)he);
@@ -426,6 +428,7 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
         { "mad u4 L16 one-f32-row, 2 tokens", 4, 16, 0, kRowF32, 256, 512, 2 },
         { "mad u4 L16 bf16, 5 tokens", 4, 16, 0, kBf16, 256, 256, 5 },
         { "mad u4 L16 bf16, 16 tokens", 4, 16, 0, kBf16, 256, 512, 16 },
+        { "mad u4 L16 one-f32-row, 33 tokens (tiled)", 4, 16, 0, kRowF32, 512, 384, 33 },
     };
     for (const Case& c : cases) CHECK(run_case(c));
 }
@@ -563,76 +566,25 @@ bool run_vocab() {
     hipMemcpy(q.data(), dscratch, q.size(), hipMemcpyDeviceToHost);
     hipMemcpy(as.data(), (uint8_t*)dscratch + qbytes, as.size() * 4, hipMemcpyDeviceToHost);
     hipMemcpy(logits.data(), dl, logits.size() * 4, hipMemcpyDeviceToHost);
-    {
-        std::vector<uint16_t> ydbg((size_t)(M * rows));
-        const uint8_t* ybase = (const uint8_t*)dscratch + ((M * K + 255) & ~255ll) +
-                               ((M * (K / 128) * 4 + 255) & ~255ll);
-        hipMemcpy(ydbg.data(), ybase, ydbg.size() * 2, hipMemcpyDeviceToHost);
-        /* The same class through the decode row, to tell the tiled launcher from the GEMM. */
-        void* dy2 = nullptr;
-        hipMalloc(&dy2, ydbg.size() * 2);
-        RadTensor qa{}, qs{}, qb{}, qbs{}, qy{};
-        qa.data = dscratch; qa.dtype = RAD_I8; qa.rank = 2; qa.shape[0] = M; qa.shape[1] = K;
-        qs.data = (uint8_t*)dscratch + qbytes; qs.dtype = RAD_F32; qs.rank = 2; qs.shape[0] = M;
-        qs.shape[1] = K / 128;
-        qb.data = db[0]; qb.dtype = cls[0].L.dtype; qb.rank = 2; qb.shape[0] = rows; qb.shape[1] = K;
-        qbs.data = ds[0]; qbs.dtype = cls[0].LS.dtype; qbs.rank = 2;
-        qbs.shape[0] = rows; qbs.shape[1] = K / 128;
-        qy.data = dy2; qy.dtype = RAD_BF16; qy.rank = 2; qy.shape[0] = M; qy.shape[1] = rows;
-        for (RadTensor* p : { &qa, &qs, &qb, &qbs, &qy }) rad_tensor_pack(p);
-        RadTensor qops[7] = { qa, qs, qb, qbs, qy, RadTensor{}, RadTensor{} };
-        const RadParam qp[] = { pint("M", M), pint("N", rows), pint("K", K), pint("group", 128),
-                                pstr("dtype", "i8a8h") };
-        RadArgs qargs{};
-        qargs.t = qops; qargs.n_t = 7; qargs.p = qp; qargs.n_p = 5; qargs.kv_used_max_h = -1;
-        const int qrc = lib().gemm(&qargs, (RadStream)0);
-        std::vector<uint16_t> y2((size_t)(M * rows), 0);
-        hipDeviceSynchronize();
-        hipMemcpy(y2.data(), dy2, y2.size() * 2, hipMemcpyDeviceToHost);
-        std::fprintf(stderr, "vocab q0=%d q1=%d s0=%g y0=%g m16=%g (rc=%d)\n", (int)q[0], (int)q[1],
-                     as[0], bf16_to_f32(ydbg[0]), bf16_to_f32(y2[0]), qrc);
-        hipFree(dy2);
-    }
-
-    /* The reference from those exact codes and scales. */
+    /* The validated GEMM reference (the same function the m16 test checks) on the head's exact
+     * codes, scales and relaid class weight. The head's own scatter and class selection are the
+     * only things this adds. */
     std::vector<float> want((size_t)(M * n_vocab), 0.0f);
     std::vector<float> per[4];
     for (auto& p : per) p.assign((size_t)(M * n_vocab), 0.0f);
-    for (int ci = 0; ci < 1; ++ci) {
-        const Form f{ kTrellisMad, 4, 0, 16, 0, kRowF32, 0, 0 };
-        const uint32_t* ab = (const uint32_t*)cls[ci].w.data[(size_t)cls[ci].w.find("trellis.mad")].data();
-        std::vector<int8_t> dec((size_t)(rows * K));
-        for (int64_t r = 0; r < rows; ++r)
-            for (int64_t k = 0; k < K; ++k)
-                dec[(size_t)(r * K + k)] =
-                    (int8_t)mad_value(canonical_state(cls[ci].w, 4, 16, 256, r, k), ab[0], ab[1]);
-        const float* cf = (const float*)cls[ci].s.data() + ((rows * 4 + 255) & ~255ll) / 4;
+    {
+        const Case rc{ "head", 4, 16, 0, kRowF32, rows, K, M };
+        std::vector<int8_t> qi(q.size());
+        for (size_t i = 0; i < q.size(); ++i) qi[i] = (int8_t)q[i];
+        const std::vector<uint16_t> wr =
+            reference(cls[0].w, rc, qi, as, cls[0].s.data(), (int64_t)cls[0].s.size());
         for (int m = 0; m < M; ++m)
             for (int64_t r = 0; r < rows; ++r) {
-                float acc = 0.0f;
-                for (int64_t kb = 0; kb < nkb; ++kb) {
-                    int sub = 0;
-                    for (int64_t k = 0; k < 128; ++k)
-                        sub += (int)q[(size_t)(m * K + kb * 128 + k)] *
-                               (int)dec[(size_t)(r * K + kb * 128 + k)];
-                    const float t1 = (float)sub * as[(size_t)(m * nkb + kb)];
-                    acc += t1 * cf[kb];
-                }
-                const int32_t id = cls[ci].ids[(size_t)r];
-                if (ci == 0 && m == 0 && r == 0)
-                    std::fprintf(stderr, "vocab ref: rowscale=%g cf0=%g as0=%g sub0=%d acc=%g\n",
-                                 ((const float*)cls[ci].s.data())[0], cf[0], as[0],
-                                 [&] {
-                                     int s0 = 0;
-                                     for (int64_t k = 0; k < 128; ++k)
-                                         s0 += (int)q[(size_t)k] * (int)dec[(size_t)k];
-                                     return s0;
-                                 }(), acc);
-                if (id >= 0 && id < n_vocab) {
-                    const float v = bf16_to_f32(f32_to_bf16(acc * ((const float*)cls[ci].s.data())[r]));
-                    want[(size_t)(m * n_vocab + id)] = v;
-                    per[ci][(size_t)(m * n_vocab + id)] = v;
-                }
+                const int32_t id = cls[0].ids[(size_t)r];
+                if (id < 0 || id >= n_vocab) continue;
+                const float v = bf16_to_f32(wr[(size_t)(m * rows + r)]);
+                want[(size_t)(m * n_vocab + id)] = v;
+                per[0][(size_t)(m * n_vocab + id)] = v;
             }
     }
     size_t bad = 0, first = want.size();
@@ -766,9 +718,6 @@ void bench_one(int64_t N, int64_t K, int M, int B, int reps) {
 }
 
 TEST(iqr_vocab_head_matches_its_reference) {
-    /* The row refuses until the class-GEMM discrepancy is resolved (r3d_iqr_logits.hip); the test
-     * stays so the fix is verified by RAD_IQR_VOCAB=1. */
-    if (!std::getenv("RAD_IQR_VOCAB")) return;
     if (!lib().ok() || !lib().logits || !lib().logits_scratch) return;
     int nd = 0;
     if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) return;

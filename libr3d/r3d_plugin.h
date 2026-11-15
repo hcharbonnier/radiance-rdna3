@@ -425,6 +425,11 @@ int r3d_shape_gemm_nt_q_w8a8(const RadParam* p, int n_p, int operand, RadOpdDesc
  * layout hooks reorder the container's codes into the lane segments the decoder reads and invert;
  * the shim refuses the forms the W0 kernel does not decode yet. --- */
 int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* a, RadStream s);
+/* --- r3d_gemm_iqr_gated.hip: the i8a8h gated fold, gate_up in the op's scratch then the gated
+ * Hadamard quantiser, so the FFN's fusion resolves on the device. --- */
+int r3d_rad_gemm_nt_q_iqr_gated(const RadArgs* a, RadStream s);
+int64_t r3d_rad_gemm_nt_q_iqr_gated_scratch(const RadArgs* a);
+int r3d_shape_gemm_nt_q_gated_i8a8h(const RadParam*, int, int, RadOpdDesc*);
 int r3d_rad_gemm_nt_q_iqr_tiled(const RadArgs* a, RadStream s);
 int r3d_rad_embed_lookup_iqr(const RadArgs* a, RadStream s);
 int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream s);
@@ -484,6 +489,10 @@ int r3d_shape_logits_gemm_bf16  (const RadParam*, int, int, RadOpdDesc*);
 int r3d_rad_silu_mul             (const RadArgs* a, RadStream s);
 int r3d_rad_rmsnorm_quant_fp8    (const RadArgs* a, RadStream s);
 int r3d_shape_rmsnorm_quant_fp8  (const RadParam*, int, int, RadOpdDesc*);
+
+/* --- r3d_rmsnorm_had_quant_i8g.hip: add, norm, 128-wide Hadamard, per-group int8. --- */
+int r3d_rad_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s);
+int r3d_shape_rmsnorm_had_quant_i8g(const RadParam*, int, int, RadOpdDesc*);
 
 /* --- the PLE and HyperConnections rows (W9 then W8) --- */
 int r3d_rad_embed_lookup_q (const RadArgs* a, RadStream s);

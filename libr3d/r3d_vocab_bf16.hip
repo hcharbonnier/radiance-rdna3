@@ -604,7 +604,11 @@ int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, 
      * reference's `scaled_rows` in order: roles, then dtypes and blocks, then coverage (below,
      * once N and K are known).
      */
-    const RadPlanesHeader* ph = rad_planes_header(r3d_p(w));
+    /* A plain bf16 weight carries no header, and its first bytes live in VRAM: reading them as a
+     * `rad.planes` header from the host faults. Only a private (quantised) weight can be the mapped
+     * head this peek describes. */
+    const RadPlanesHeader* ph =
+        w->dtype == RAD_BF16 ? nullptr : rad_planes_header(r3d_p(w));
     if (ph) {
         if (!y_is_f32) return R3D_NO(RAD_E_DTYPE);   /* the bf16-y row takes a bf16 head only */
         if (rad_planes_find(r3d_p(w), "zero", nullptr))

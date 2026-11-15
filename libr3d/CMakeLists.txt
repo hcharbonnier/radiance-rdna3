@@ -71,6 +71,9 @@ set(R3D_UNITS
   # The IQR weight at decode heights (W0/W3): the computed trellis decoded where it is read, one
   # wave a 16-row tile, v_dot4 for the group sub-sums.
   "r3d_gemm_iqr_m16|"
+  # The i8a8h gated fold (the int8 trunk's feed-forward), gate_up in the op's scratch then the
+  # gated Hadamard quantiser, so the FFN fusion resolves on the device.
+  "r3d_gemm_iqr_gated|"
   # The embedding table at its codes' width: the gather decodes the rows it is asked for.
   "r3d_iqr_embed|"
   # The vocabulary-weighted head: rotated int8 activation, one IQR GEMM a class, the ids scatter.
@@ -111,6 +114,9 @@ set(R3D_UNITS
   "r3d_had_quant_act_i8g|"
   "r3d_gated_had_quant_i8g|"
   "r3d_rmsnorm_quant_i8|"
+  # The int8 trunk's rotated producer: the residual add, the RMS norm, the 128-wide Hadamard and
+  # the per-group int8 quantiser in one pass, byte-identical to rmsnorm + had_quant_act_i8g.
+  "r3d_rmsnorm_had_quant_i8g|"
   # The skinny bf16 GEMM for decode, M <= 16: one output element a lane, k ascending, so the
   # accumulation order is libref's.
   "r3d_gemm_bf16_nt_m16|"

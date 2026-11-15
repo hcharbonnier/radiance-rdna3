@@ -292,10 +292,12 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* arg, RadStream s) {
     if (M < 1 || M > kMTMax) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(A) < M * K) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(AS) < M * (K / 128)) return R3D_NO(RAD_E_SHAPE);
-    /* The private planes are described by their layout (r3d_iqr.h): [N, K] and [N, K/128] with the
-     * stored dtype; the core allocated layout.bytes for each. */
+    /* The private planes are described by their layout (r3d_iqr.h): [N, K] and the form's scale
+     * plane with the stored dtype; the core allocated layout.bytes for each. A `block=1x*` row
+     * scale lays its plane out over N*K logical entries (packed), not [N, K/128], so the scale
+     * operand's extent is the layout's, not the group count. */
     if (r3d_numel(B) != N * K) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(BS) != N * (K / 128)) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(BS) < 1) return R3D_NO(RAD_E_SHAPE);
 
     const long long ap = r3d_row_pitch(A);
     if (ap < K || ap % 4) return R3D_NO(RAD_E_STRIDE);
@@ -350,7 +352,7 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_tiled(const RadArgs* arg, RadStream s) {
     const long long M = ynel / N;
     if (M < 1) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(A) < M * K || r3d_numel(AS) < M * (K / 128)) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(B) != N * K || r3d_numel(BS) != N * (K / 128)) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(B) != N * K || r3d_numel(BS) < 1) return R3D_NO(RAD_E_SHAPE);
 
     const long long ap = r3d_row_pitch(A);
     if (ap < K || ap % 4) return R3D_NO(RAD_E_STRIDE);

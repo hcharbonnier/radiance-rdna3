@@ -6,7 +6,8 @@
  *
  * A separate op, not a parameter: it writes different numbers and a different code layout than
  * quant_act_i8 (step-ordered) or had_quant_act_i8 (step-ordered), so a swapped graph would run as
- * a different model. The normalisation (1/sqrt(128)) is folded into the scale.
+ * a different model. The rotation's 1/128 is the weight's (a `w8a8_fwht128`/IQR plane stores it),
+ * so the scale is amax / 127 and folds nothing, as libref and libr4d's i8g quantiser do.
  *
  * One wave a (token, 128-column group): the wave runs the group's whole FWHT with no group loop,
  * which is the form gfx1102 needs (a DPP exchange in a loop body miscompiles there) and lets a
@@ -67,9 +68,9 @@ __global__ __launch_bounds__(kThreads) void had_quant_act_i8g_kernel(
 #pragma unroll
     for (int j = 0; j < VPL; ++j) m = fmaxf(m, fabsf(v[j]));
     m = wave_max_f(m);
-    m = m > 0.0f ? m : 1e-8f;
-    const float inv = kTopI8 / m;
-    if (lane == 0) s[(size_t)row * nkb + kg] = m * (1.0f / sqrtf((float)HAD)) / kTopI8;
+    const float sc = m > 0.0f ? m / kTopI8 : 1.0f;
+    const float inv = 1.0f / sc;
+    if (lane == 0) s[(size_t)row * nkb + kg] = sc;
     *(uint32_t*)(qr + (uint32_t)base) = i8_codes4(v, inv);   // row-major (the i8a8 GEMM's layout)
 }
 

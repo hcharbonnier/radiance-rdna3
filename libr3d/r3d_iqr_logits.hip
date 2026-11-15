@@ -79,9 +79,9 @@ __global__ __launch_bounds__(kThreads) void logits_quant_kernel(
 #pragma unroll
     for (int j = 0; j < VPL; ++j) m = fmaxf(m, fabsf(v[j]));
     m = wave_max_f(m);
-    m = m > 0.0f ? m : 1e-8f;
-    const float inv = kTopI8 / m;
-    if (lane == 0) s[(size_t)row * nkb + kg] = m * (1.0f / sqrtf((float)HAD)) / kTopI8;
+    const float sc = m > 0.0f ? m / kTopI8 : 1.0f;
+    const float inv = 1.0f / sc;
+    if (lane == 0) s[(size_t)row * nkb + kg] = sc;
     *(uint32_t*)(qr + (uint32_t)base) = i8_codes4(v, inv);
 }
 
@@ -105,7 +105,7 @@ extern "C" {
 
 /* A's int8 codes, its scales, then the class logits' bf16 plane. */
 int64_t r3d_logits_gemm_vocab_iqr_scratch(const RadArgs* a) {
-    if (!a || a->n_t < 15) return 0;
+    if (!a) return 0;
     const RadTensor* x = r3d_opt(a, 0);
     const long long n_embd = r3d_geti_or(a, "n_embd", 0);
     long long M = r3d_geti_or(a, "M", 0);
@@ -121,12 +121,9 @@ int64_t r3d_logits_gemm_vocab_iqr_scratch(const RadArgs* a) {
 }
 
 int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream stream) {
-    /* W11: the class GEMM now goes through the validated decode-row shim, but with the 27B's head
-     * form the result still disagrees with the host reference (device 10.56 where the reference
-     * computes 462, K=128, constant weight, same q/s read back). The row refuses until that is
-     * resolved, so a container declares and fails loudly at the first step. RAD_IQR_VOCAB=1
-     * enables the body for the test. */
-    if (std::getenv("RAD_IQR_VOCAB") == nullptr) return R3D_NO(RAD_E_UNSUPPORTED);
+    /* The class GEMM goes through the validated decode-row shim, and the head's own test now
+     * compares against that same validated reference: the earlier "device 10.56 vs 462" was the
+     * test's hand-written reference reading the scale tail at the wrong offset, not this row. */
 #if 1
     if (!a || a->n_t < 15 || !a->scratch) return R3D_NO(RAD_E_INVAL);
     const RadTensor* x = r3d_opt(a, 0);

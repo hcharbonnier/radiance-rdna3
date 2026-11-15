@@ -2,10 +2,10 @@
  * then per-group E4M3, in one pass.
  *
  * mode 0 (silu) is down_proj's input, mode 1 (sigmoid) a gated attention o_proj's. The gate and up
- * arrive as two halves of a fused gate_up of row pitch 2*n. The gated product is formed in fp32,
- * the 128-wide Hadamard shrinks the group maximum (e4m3's exponent bits carry the outliers better
- * after the rotation), and the codes are row-major E4M3. The normalisation (1/sqrt(128)) is folded
- * into the scale.
+ * arrive as two halves of a fused gate_up of row pitch 2*n. The gated product is rounded to bf16 as
+ * the unfused pair stores it, the 128-wide Hadamard shrinks the group maximum (e4m3's exponent bits
+ * carry the outliers better after the rotation), and the codes are row-major E4M3. The rotation's
+ * 1/128 is the weight's, so the scale is absmax / 448 and folds nothing.
  *
  * gfx1102: the FWHT's cross-lane stages are DPP, and a DPP exchange in a loop body miscompiles here
  * (a non-first wave drops out). This serves the single-group form, n == group == 128: one wave runs
@@ -68,14 +68,16 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void gated_had_quant_fp
         for (int j = 0; j < VPL; ++j) {
             const float xg = ld_bf(g, base + j);
             const float sg = 1.0f / (1.0f + expf(-xg));   /* full exp: the reference's sigmoid */
-            v[j] = (MODE == 0 ? xg * sg : sg) * ld_bf(u, base + j);
+            /* The unfused pair stores the gated product as bf16 and the quantiser reads it back. */
+            const uint16_t h = f32_to_bf16((MODE == 0 ? xg * sg : sg) * ld_bf(u, base + j));
+            if (yop) yop[base + j] = h;
+            v[j] = bf16_to_f32(h);
         }
         r3d_fwht_wave<HAD>(v, lane);
 #pragma unroll
         for (int j = 0; j < VPL; ++j) {
             lds[base + j] = v[j];
             m = fmaxf(m, fabsf(v[j]));
-            if (yop) yop[base + j] = f32_to_bf16(v[j]);
         }
     }
     m = wave_max_f(m);
@@ -86,7 +88,7 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void gated_had_quant_fp
     for (uint32_t w = 1; w < kWaves; ++w) m = fmaxf(m, red[w]);
     const float scale = m > 0.0f ? m * (1.0f / kTopE4M3) : 1.0f;
     const float inv = 1.0f / scale;
-    if (threadIdx.x == 0) s[row] = scale * (1.0f / sqrtf((float)HAD));
+    if (threadIdx.x == 0) s[row] = scale;
 
     if (wave == 0)
         for (uint32_t c = lane * 4; c < n; c += kWave * 4) {
