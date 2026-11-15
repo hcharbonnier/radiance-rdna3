@@ -46,8 +46,8 @@
  * four partials are added in d-block order. That is not libref's single 256-add chain, so a
  * generic cache can land a few bf16 store ulps from the reference; the test below pins the parts
  * that must be bit-exact (the mask, the page walk, the per-slot scales, the value chain and its
- * key order) with a cache whose K row is the same for every key, and checks a random cache at
- * 2e-2. `exp` is the h128 row's polynomial, within one f32 ulp of (float)std::exp(double).
+ * key order) with a cache whose K row is the same for every key, and checks a random cache at one
+ * bf16 code. `exp` is the h128 row's polynomial, within one f32 ulp of (float)std::exp(double).
  *
  * Split-KV (decode only) stores four-lane partial rows of 260 floats (256 accumulators, sum,
  * max) and a second kernel rescales them. splits = 1 is the reference's key order; splits > 1
@@ -175,13 +175,22 @@ __device__ __forceinline__ int seq_of_row(const Args& A, int row)
     return lo < A.n_seq ? lo : A.n_seq - 1;
 }
 
+/* The staged tile lives in LDS. These address-space-qualified pointers keep every stage write and
+ * every dot/value read an `ds_` operation; a plain `int8_t*` parameter would decay to generic and
+ * let the compiler treat the store and the read as unrelated memory (the first device run showed
+ * exactly that: only the wave that wrote a slot saw its value). */
+typedef __attribute__((address_space(3))) int8_t   r3d_lds_i8;
+typedef __attribute__((address_space(3))) uint32_t r3d_lds_u32;
+typedef __attribute__((address_space(3))) float    r3d_lds_f32;
+
 /* Stage one int8 cache block (K codes, V codes) and its per-slot scales into LDS. Every lane of
  * the workgroup runs this; the caller barriers before and after. A slot row is 516 bytes, so the
  * copy moves 4-byte words (the rows are 4-aligned but not 16-aligned). */
 template <int BLOCK, int NTH>
 __device__ __forceinline__ void stage_i8(const Args& A, int blk, int kh, int tid,
-                                         int8_t* __restrict__ sK, int8_t* __restrict__ sV,
-                                         float* __restrict__ sks, float* __restrict__ svs)
+                                         r3d_lds_i8* __restrict__ sK, r3d_lds_i8* __restrict__ sV,
+                                         r3d_lds_f32* __restrict__ sks,
+                                         r3d_lds_f32* __restrict__ svs)
 {
     const long long base = (long long)blk * A.sb + (long long)kh * A.sh;
     const uint8_t* src = A.kv + base;
@@ -193,7 +202,7 @@ __device__ __forceinline__ void stage_i8(const Args& A, int blk, int kh, int tid
         const int word = j - slot * (kHeadDim / 4);
         const uint32_t v = *(const uint32_t*)(src + (long long)slot * A.so + half * kHeadDim
                                               + word * 4);
-        uint32_t* dst = (uint32_t*)(half ? sV : sK) + slot * (kHeadDim / 4) + word;
+        r3d_lds_u32* dst = (r3d_lds_u32*)((half ? sV : sK) + slot * kHeadDim) + word;
         *dst = v;
     }
     if (tid < 2 * BLOCK) {
@@ -210,17 +219,19 @@ __device__ __forceinline__ void stage_i8(const Args& A, int blk, int kh, int tid
  * and then the partials are added in d-block order. All lanes call this, including lanes whose
  * row is padding: only the shuffle is unconditional, the caller applies the visibility. */
 __device__ __forceinline__ float dot_group(const float* __restrict__ qf,
-                                           const int8_t* __restrict__ krow,
+                                           const r3d_lds_i8* __restrict__ krow,
                                            float ks, int gbase)
 {
     float p = 0.0f;
 #pragma unroll
     for (int i = 0; i < kDimsLane; ++i)
         p = p + qf[i] * ((float)(int8_t)krow[i] * ks);
-    float dot = p;
+    /* Every lane must start from the group's *first* partial, not its own: a lane that starts with
+     * its own p would double its slice and drop lane 0's. */
+    float dot = __shfl(p, gbase, kLanesWave);
 #pragma unroll
     for (int b = 1; b < kLanesRow; ++b)
-        dot = dot + __shfl_sync(~0ULL, p, gbase + b);
+        dot = dot + __shfl(p, gbase + b, kLanesWave);
     return dot;
 }
 
@@ -334,13 +345,13 @@ void attn_kernel(const Args A)
     for (int b = b0; b < b1; ++b) {
         const int blk = ld_ix(A.bt, (size_t)M.s * A.bt_rs + (size_t)b * A.bt_cs);
         group_barrier();
-        if (blk >= 0) stage_i8<BLOCK, NTH>(A, blk, kh, tid, sK, sV, sks, svs);
+        if (blk >= 0) stage_i8<BLOCK, NTH>(A, blk, kh, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
         group_barrier();
         if (blk < 0) continue;
         const int j0 = b * BLOCK;
         const int nu = jend_all - j0 < BLOCK ? jend_all - j0 : BLOCK;
         for (int u = 0; u < nu; ++u) {
-            const float dot = dot_group(qf, sK + u * kHeadDim + d0, sks[u], gbase);
+            const float dot = dot_group(qf, (const r3d_lds_i8*)(sK + u * kHeadDim + d0), ((const r3d_lds_f32*)sks)[u], gbase);
             const int j = j0 + u;
             const bool vis = active && visible(j, pos, CAUSAL, A.window);
             if (vis) {
@@ -350,22 +361,10 @@ void attn_kernel(const Args A)
         }
     }
 
-    if (mx == -INFINITY) {
-        if (row_ok) {
-            if (SPLIT) {
-                float* pp = A.part + ((size_t)row * A.n_head + h) * ((size_t)A.splits * kPartStride)
-                            + (size_t)blockIdx.z * kPartStride;
-                for (int i = 0; i < kDimsLane; i += 4)
-                    *(r3d_f32x4*)(void*)(pp + d0 + i) = r3d_f32x4{0.0f, 0.0f, 0.0f, 0.0f};
-                if (db == 0) { pp[kHeadDim] = 0.0f; pp[kHeadDim + 1] = -INFINITY; }
-            } else {
-                uint16_t* op = A.out + (long long)row * A.o_rs + (long long)h * kHeadDim + d0;
-                for (int i = 0; i < kDimsLane; i += 8)
-                    *(r3d_u32x4*)(void*)(op + i) = r3d_u32x4{0u, 0u, 0u, 0u};
-            }
-        }
-        return;
-    }
+    /* A row with no visible key (an empty window, or a padding slot) still walks pass two: the
+     * stage and the barriers are workgroup-wide, so an early return here would leave the surviving
+     * row groups reading LDS that only some waves wrote. Its visibility is false for every key, so
+     * sum stays 0 and the store below writes a zero row (or a zero partial record). */
 
     float acc[kDimsLane];
 #pragma unroll
@@ -376,20 +375,20 @@ void attn_kernel(const Args A)
     for (int b = b0; b < b1; ++b) {
         const int blk = ld_ix(A.bt, (size_t)M.s * A.bt_rs + (size_t)b * A.bt_cs);
         group_barrier();
-        if (blk >= 0) stage_i8<BLOCK, NTH>(A, blk, kh, tid, sK, sV, sks, svs);
+        if (blk >= 0) stage_i8<BLOCK, NTH>(A, blk, kh, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
         group_barrier();
         if (blk < 0) continue;
         const int j0 = b * BLOCK;
         const int nu = jend_all - j0 < BLOCK ? jend_all - j0 : BLOCK;
         for (int u = 0; u < nu; ++u) {
-            const float dot = dot_group(qf, sK + u * kHeadDim + d0, sks[u], gbase);
+            const float dot = dot_group(qf, (const r3d_lds_i8*)(sK + u * kHeadDim + d0), ((const r3d_lds_f32*)sks)[u], gbase);
             const int j = j0 + u;
             const bool vis = active && visible(j, pos, CAUSAL, A.window);
             if (vis) {
                 const float w = exp_ref(dot * A.scale - mx);
                 sum += w;
-                const float vm = svs[u];
-                const int8_t* vrow = sV + u * kHeadDim + d0;
+                const float vm = ((const r3d_lds_f32*)svs)[u];
+                const r3d_lds_i8* vrow = (const r3d_lds_i8*)(sV + u * kHeadDim + d0);
 #pragma unroll
                 for (int i = 0; i < kDimsLane; ++i)
                     acc[i] = acc[i] + w * ((float)(int8_t)vrow[i] * vm);

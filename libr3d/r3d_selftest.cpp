@@ -2995,7 +2995,8 @@ static void check_moe_numerics() {
  * operands here and calls both launches. The exact case makes every key's K row identical: the
  * softmax is uniform (exp(0) = 1 in both, the query/dot value is irrelevant), so the comparison
  * pins the page walk, the mask, the per-slot scales, the value chain and its key order, and the
- * bf16 store bit for bit. A random cache is compared at 2e-2 (the kernel's QK chain is four lane
+ * bf16 store bit for bit. A random cache and the split pass are compared at one bf16 code (the
+ * kernel's QK chain is four lane
  * partials rather than libref's one 256-add chain, and exp is the h128 polynomial). A scratch
  * arena is passed for the split smoke case; no arena forces splits = 1, the exact path.
  */
@@ -3216,15 +3217,53 @@ void h256_case(const char* what, const RadKernelInfo* ours, const RadKernelInfo*
     size_t first = got.size();
     for (size_t i = 0; i < got.size(); ++i) if (got[i] != want[i]) { first = i; break; }
     if (first == got.size()) { ok("%s: %zu bf16 values, identical to libref", what, got.size()); return; }
+    if (tol < 0.0) {
+        /* A generic cache: the dot is four lane partials rather than libref's one 256-add chain,
+         * and exp is the h128 polynomial. Both departures are sub-f32-ulp, but rounding to bf16
+         * can land on the adjacent bf16. One bf16 code is the bound; anything larger is a bug. */
+        long long worst = 0;
+        size_t at = 0;
+        double max_abs = 0.0;
+        bool all_ok = true;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const uint16_t g = got[i], w = want[i];
+            const bool gn = (g >> 15) != 0, wn = (w >> 15) != 0;
+            long long d;
+            if (gn == wn) d = (long long)(g & 0x7fffu) - (long long)(w & 0x7fffu);
+            else d = (g & 0x7fffu) == 0 || (w & 0x7fffu) == 0 ? 1 : 1000000;
+            if (d < 0) d = -d;
+            if (d > worst) { worst = d; at = i; }
+            const double ad = std::fabs((double)bf16_to_f32(g) - (double)bf16_to_f32(w));
+            if (ad > max_abs) max_abs = ad;
+            if (!(d <= 1 || ad <= 1e-5)) all_ok = false;
+        }
+        /* One bf16 code, or the 1e-5 floor that stands in for it when cancellation leaves a value
+         * near zero and code spacing is no longer a meaningful measure. A geometry or mask error
+         * misses both by orders of magnitude. */
+        if (all_ok) {
+            ok("%s: %zu values, %lld bf16 code(s) / max |diff| %.3g", what, got.size(), worst,
+               max_abs);
+            return;
+        }
+        const size_t row = at / ((size_t)qh * hd), rem = at % ((size_t)qh * hd);
+        fail("%s: %lld bf16 codes from libref at value %zu (row %zu, head %zu, dim %zu): "
+             "libr3d %g, libref %g", what, worst, at, row, rem / hd, rem % hd,
+             (double)bf16_to_f32(got[at]), (double)bf16_to_f32(want[at]));
+        return;
+    }
     if (tol > 0.0) {
         double worst = 0.0;
+        size_t at = 0;
         for (size_t i = 0; i < got.size(); ++i) {
             const double a = bf16_to_f32(got[i]), b = bf16_to_f32(want[i]);
             const double d = std::fabs(a - b);
-            if (d > worst) worst = d;
+            if (d > worst) { worst = d; at = i; }
         }
         if (worst <= tol) { ok("%s: %zu values, max |diff| %.3g <= %.3g", what, got.size(), worst, tol); return; }
-        fail("%s: max |diff| %.3g > %.3g", what, worst, tol);
+        const size_t row = at / ((size_t)qh * hd), rem = at % ((size_t)qh * hd);
+        fail("%s: max |diff| %.3g > %.3g at value %zu (row %zu, head %zu, dim %zu): "
+             "libr3d %g, libref %g", what, worst, tol, at, row, rem / hd, rem % hd,
+             (double)bf16_to_f32(got[at]), (double)bf16_to_f32(want[at]));
         return;
     }
     const size_t row = first / ((size_t)qh * hd), rem = first % ((size_t)qh * hd);
@@ -3262,16 +3301,16 @@ void check_attn_h256() {
     h256_case("h256 gqa6 prefill ragged", pre6, ref, 6, 16, { 20, 13 }, { 100, 70 }, true, 0, true, false, 0.0);
     h256_case("h256 gqa6 prefill empty", pre6, ref, 6, 16, { 20 }, { 20 }, false, 0, true, false, 0.0);
 
-    /* The random caches exercise the QK chain and the polynomial exp; 2e-2 is far above the
-     * lane-order/exp rounding and far below a geometry or mask error. */
-    h256_case("h256 gqa12 random", dec12, ref, 12, 4, { 4 }, { 37 }, false, 0, true, true, 2e-2);
-    h256_case("h256 gqa6 random", pre6, ref, 6, 16, { 20 }, { 100 }, false, 0, true, true, 2e-2);
+    /* The random caches exercise the QK chain and the polynomial exp; one bf16 code is the bound
+     * and is far below a geometry or mask error. */
+    h256_case("h256 gqa12 random", dec12, ref, 12, 4, { 4 }, { 37 }, false, 0, true, true, -1.0);
+    h256_case("h256 gqa6 random", pre6, ref, 6, 16, { 20 }, { 100 }, false, 0, true, true, -1.0);
 
     /* Split-KV's own path: an arena lets the shim pick slices, and the result is still the same
-     * softmax (up to the documented last-ulp parenthesisation), so the same 2e-2 bound. */
+     * softmax (up to the documented last-ulp parenthesisation), so the same one-code bound. */
     g_split_scratch = true;
-    h256_case("h256 gqa12 decode split", dec12, ref, 12, 4, { 4 }, { 157 }, false, 0, true, true, 2e-2);
-    h256_case("h256 gqa6 decode split", dec6, ref, 6, 16, { 1 }, { 500 }, false, 0, true, true, 2e-2);
+    h256_case("h256 gqa12 decode split", dec12, ref, 12, 4, { 4 }, { 157 }, false, 0, true, true, -1.0);
+    h256_case("h256 gqa6 decode split", dec6, ref, 6, 16, { 1 }, { 500 }, false, 0, true, true, -1.0);
     g_split_scratch = false;
 }
 
@@ -3286,11 +3325,14 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const char* path = nullptr;
     bool static_only = false;
+    bool h256_only = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--case") && i + 1 < argc) g_case = argv[++i];
         else if (!std::strcmp(argv[i], "--static")) static_only = true;
+        else if (!std::strcmp(argv[i], "--h256-only")) h256_only = true;
         else if (!std::strcmp(argv[i], "--help")) {
-            std::printf("usage: r3d_selftest <path>/libr3d.so [--case <row>] [--static]\n");
+            std::printf("usage: r3d_selftest <path>/libr3d.so [--case <row>] [--static] "
+                        "[--h256-only]\n");
             return 0;
         } else if (!path) path = argv[i];
     }
@@ -3320,6 +3362,12 @@ int main(int argc, char** argv) {
         check_shapes();
         dlclose(h);
         std::printf("== static checks %s\n", g_fail ? "FAILED" : "passed");
+        return g_fail ? 1 : 0;
+    }
+
+    if (h256_only && !g_case) {
+        check_attn_h256();
+        dlclose(h);
         return g_fail ? 1 : 0;
     }
 
