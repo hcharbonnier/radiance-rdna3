@@ -250,4 +250,36 @@ Décision : la row **refuse** (`RAD_E_UNSUPPORTED`) tant que le test
 franchement au premier pas au lieu d'émettre des logits faux. À reprendre en
 W11, avec le kernel de tête dédié (accumulation f32).
 
+## 2026-11-15 — J1 (suite) : W6 revu et fusionné, 27B à la vision près
+
+**W6** : trois commits (`aa86e04`, `3a1a2ff`, `ed99cde`). Revue indépendante :
+`r3d_selftest` complet depuis un build séparé, avec `libref.so` à côté du plugin.
+
+- 15/15 cas h256 verts contre libref : decode/prefill gqa12 et gqa6, causal,
+  ragged, windowed, empty, verify, split-KV ; `max |diff|` 0 à 0,125 bf16 selon
+  le cas.
+- Ajouts vérifiés : `kv_store` int8 head_dim 256 block 16, `rope_table` f32
+  rot 64, `rope` mode imrope h256.
+- Le seul échec du selftest était l'invariant statique « pas de hook de layout »
+  (rows IQR/HC) ; exception étendue à `hc_read` (tag `r4d.hc.e4m3` partagé).
+- Fusion `merge W6` dans `rdna3-iqr`, build et selftest depuis l'arbre fusionné :
+  **140 rows, 0 échec**, 13 skips (shims).
+
+**27B après W6**
+
+Il ne reste **que la tour vision** : 54 bandes, toutes `attn_dense` hd72
+(gqa 1, causal 0, seqlen 16384) et `rope` mode **axial** hd72 (sections 18 18).
+Toutes les bandes texte résolvent, y compris `attn_paged` h256 gqa 6 kv i8,
+`kv_store` i8, `imrope` et `rope_table`.
+
+Deux contraintes trop étroites corrigées : `rope_table` exigeait `M == 64` alors
+que la bande a `M=63` (désormais 1..64), et `rope imrope` exigeait la forme
+fusionnée 24/4 alors que le 27B appelle q seul (24, n_kv 0) puis k seul (4, n_kv
+0). Le shim lisait déjà la largeur du couple.
+
+**Prochaine étape** : W10-lite (attn_dense hd72 + rope axial), seule dépendance
+restante de M1 ; puis correction de la tête vocabulaire et premier lancement du
+27B.
+
+
 

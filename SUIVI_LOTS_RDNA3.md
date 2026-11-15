@@ -12,22 +12,23 @@
 | W3 — GEMM M ≤ 16 | en cours | 1,5 sem | GEMV 86 % ; m16 `v_dot4` à porter |
 | W4 — m64 et préfill | à faire | 2,5 sem | m64, tuile préfill, bout en bout 27B |
 | W5 — MoE IQR | à faire | 4 sem | run map, formes mixtes, experts bf16 |
-| W6 — attention h256/GQA/KV i8 | en cours (sous-agent) | 3,5 sem | branche `rdna3-w6-attn-h256` |
+| W6 — attention h256/GQA/KV i8 | **terminé (revu, 15/15 device)** | 3,5 sem | + kv_store i8, rope_table, imrope |
 | W7 — QSA | à faire | 2,5 sem | après W6 |
 | W8 — HC | **terminé (revu, device vert)** | 3,5 sem | 6 rows ; perf à mesurer en W12 |
 | W9 — PLE | **terminé (revu, device vert)** | 1,5 sem | 4 rows ; `opd_shape` en W11 |
-| W10 — vision | à faire | 3 sem | conteneur sans média autorisé (ADR-5) |
-| W11 — intégration | à faire | 1,5 sem | |
+| W10 — vision | en cours (W10-lite) | 3 sem | reste `attn_dense` hd72 et `rope` axial |
+| W11 — intégration | à faire | 1,5 sem | tête vocabulaire IQR à corriger |
 | W12 — optimisation | à faire | 3–4 sem | |
 | M0 — Go/No-Go | **GO (2026-11-15)** | fin S3 | `MEMO_M0_RDNA3.md` |
-| M1 — dense IQR | bloqué par W4 (+ W6, embed, tête) | fin S8 | |
+| M1 — dense IQR | bloqué par la vision uniquement | fin S8 | texte : toutes bandes résolvent |
 
 ## Risques ouverts
 
-- **R1** — Attention h256 GQA 6 absente de `libr3d` : M1 dépend de W6 ou d'un
-  repli libref. Décision : démarrer W6 dès M0 Go.
-- **R2** — Embedding à table L12 et tête vocabulaire IQR absentes : à planifier
-  avant M1 (opérations hors W0/W1).
+- **R1** — *résolu* : W6 (attn h256 gqa 6, kv_store i8, imrope) est vert.
+- **R2** — Tête vocabulaire IQR : le kernel existe mais échoue la référence ; il
+  se refuse au run. À corriger avant M1.
 - **R3** — Relayout hôte scalaire : le chargement du 27B peut être long ;
   mesurer, puis vectoriser si nécessaire.
 - **R4** — Aucune fixture MoE : référence hôte à produire en W5.
+- **R5** — La seule dépendance restante de M1 est la tour vision (`attn_dense`
+  hd72, `rope` axial). W10-lite la couvre ; ADR-5 reste le repli.
