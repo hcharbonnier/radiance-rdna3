@@ -19,8 +19,13 @@
  *
  *     W12 gave the kernel the walk the cost at M = 16384 asks for: a workgroup carries a block of
  *     query rows (and the whole of a small GQA group), one thread a row, and sweeps the segment's
- *     keys in LDS tiles of K and V widened to f32 once a tile element. The arithmetic order is
- *     untouched -- see "attn_dense, hd 72" below for what that buys and what it refuses to change.
+ *     keys in LDS tiles of K and V widened to f32 once a tile element. W13 runs four keys' dot
+ *     chains side by side inside a thread: the four independent chains fill the f32 add latency
+ *     that a single key's ascending dot exposes, and the four rows' 16-byte reads are issued
+ *     together. That is a scheduling change only -- each score still accumulates d ascending, the
+ *     four scores are consumed in ascending key order, and the maximum, `sum` and acc[d] still see
+ *     the keys ascending -- so every result is bit-identical to W12's. See "attn_dense, hd 72"
+ *     below for what that buys and what it refuses to change.
  *
  *   rope axial (ref_attn.c:ref_rope, rope_freqs ROPE_AXIAL)
  *     * NeoX pairs (i, i + rotary_dim / 2), q heads then k heads, v untouched;
@@ -71,6 +76,17 @@ constexpr int kThr   = 128;      /* four wave32s: one thread a (row, head) or a 
  * `exp(m_old - m_new)`, bracketing every sum differently; r3d_attn_paged_h128.hip states why that
  * arm is not taken, and this kernel makes the same choice.
  *
+ * Inside a thread the walk runs four keys at a time: the four dots' chains are independent and
+ * their elements interleave them, so one chain's next add is four mul/add pairs behind the previous
+ * one -- the f32 latency -- and the group's reads of a dword group are issued together. The group
+ * changes no addend and no bracketing -- each dot still runs d ascending, and the scores, weights
+ * and value rows are consumed in ascending key order -- and a tile whose tail is not a whole group
+ * falls back to one key a step. At M = 16384 the walk is issue-bound, so what matters is the
+ * instruction count: the four-row walk is ~7% leaner than the one-key walk it replaces, and the
+ * remaining cost is the two dots and the accumulators the reference's bracketing requires. A
+ * vector array would say the same thing more shortly, but LLVM spills it here (256 VGPRs, 900 B a
+ * lane); the group is written out a row at a time instead.
+ *
  * ============================== the stage ==============================
  *
  * A workgroup stages the tile's K rows -- and, in walk two, its V rows -- into LDS as f32: kStage
@@ -101,6 +117,7 @@ constexpr int kThr   = 128;      /* four wave32s: one thread a (row, head) or a 
  */
 
 constexpr int kStage = 16;                  /* keys one staged tile carries */
+constexpr int kGroup = 4;                   /* keys whose dot chains run side by side */
 constexpr int kQuad  = kHd / 4;             /* 16-byte reads a staged row: 18 */
 constexpr int kChunk = kHd / 8;             /* 16-byte chunks a key row: 9 */
 constexpr int kMaxHb = 8;                   /* query heads a block keeps of one KV group */
@@ -157,6 +174,75 @@ __device__ __forceinline__ float dot_row(const float* qv, const float* krow) {
         dot += qv[4 * c + 3] * __uint_as_float(raw.w);
     }
     return dot;
+}
+
+struct KeyScores { float s0, s1, s2, s3; };
+
+/* Four keys' dots at once, each still over d ascending and each still narrowed by `scale` after
+ * the whole dot. The chains are independent and their elements interleave them -- an element's add
+ * reaches the same chain again four mul/add pairs later -- so the f32 latency is filled without an
+ * explicit ALU wait, and the four rows' reads of a dword group are issued together. The caller
+ * consumes the scores in ascending key order, so the maximum, `sum` and every acc[d] see exactly
+ * the keys and addends the one-key walk saw. Written out rather than looped: an indexed vector
+ * array here costs the kernel its register budget (W13 saw 256 VGPRs and 900 bytes of spill). */
+__device__ __forceinline__ KeyScores dot_row4(const float* qv, const float* k0, const float* k1,
+                                              const float* k2, const float* k3, float scale) {
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kQuad; ++c) {
+        const r3d_u32x4 a0 = *(const r3d_u32x4*)(const void*)(k0 + 4 * c);
+        const r3d_u32x4 a1 = *(const r3d_u32x4*)(const void*)(k1 + 4 * c);
+        const r3d_u32x4 a2 = *(const r3d_u32x4*)(const void*)(k2 + 4 * c);
+        const r3d_u32x4 a3 = *(const r3d_u32x4*)(const void*)(k3 + 4 * c);
+        const float q0 = qv[4 * c], q1 = qv[4 * c + 1], q2 = qv[4 * c + 2], q3 = qv[4 * c + 3];
+        d0 += q0 * __uint_as_float(a0.x);
+        d1 += q0 * __uint_as_float(a1.x);
+        d2 += q0 * __uint_as_float(a2.x);
+        d3 += q0 * __uint_as_float(a3.x);
+        d0 += q1 * __uint_as_float(a0.y);
+        d1 += q1 * __uint_as_float(a1.y);
+        d2 += q1 * __uint_as_float(a2.y);
+        d3 += q1 * __uint_as_float(a3.y);
+        d0 += q2 * __uint_as_float(a0.z);
+        d1 += q2 * __uint_as_float(a1.z);
+        d2 += q2 * __uint_as_float(a2.z);
+        d3 += q2 * __uint_as_float(a3.z);
+        d0 += q3 * __uint_as_float(a0.w);
+        d1 += q3 * __uint_as_float(a1.w);
+        d2 += q3 * __uint_as_float(a2.w);
+        d3 += q3 * __uint_as_float(a3.w);
+    }
+    return KeyScores{ d0 * scale, d1 * scale, d2 * scale, d3 * scale };
+}
+
+/* Four keys' value rows folded into acc, one dword group of the four rows at a time. Every acc[d]
+ * still receives w0*v0[d], then w1*v1[d], then w2 and w3, in that order; the four keys' adds to
+ * different d are the independent work that hides the acc[d] add latency. */
+__device__ __forceinline__ void acc_row4(float* acc, const float* v0, const float* v1,
+                                         const float* v2, const float* v3, const KeyScores& w) {
+#pragma unroll
+    for (int c = 0; c < kQuad; ++c) {
+        const r3d_u32x4 b0 = *(const r3d_u32x4*)(const void*)(v0 + 4 * c);
+        const r3d_u32x4 b1 = *(const r3d_u32x4*)(const void*)(v1 + 4 * c);
+        const r3d_u32x4 b2 = *(const r3d_u32x4*)(const void*)(v2 + 4 * c);
+        const r3d_u32x4 b3 = *(const r3d_u32x4*)(const void*)(v3 + 4 * c);
+        acc[4 * c] += w.s0 * __uint_as_float(b0.x);
+        acc[4 * c + 1] += w.s0 * __uint_as_float(b0.y);
+        acc[4 * c + 2] += w.s0 * __uint_as_float(b0.z);
+        acc[4 * c + 3] += w.s0 * __uint_as_float(b0.w);
+        acc[4 * c] += w.s1 * __uint_as_float(b1.x);
+        acc[4 * c + 1] += w.s1 * __uint_as_float(b1.y);
+        acc[4 * c + 2] += w.s1 * __uint_as_float(b1.z);
+        acc[4 * c + 3] += w.s1 * __uint_as_float(b1.w);
+        acc[4 * c] += w.s2 * __uint_as_float(b2.x);
+        acc[4 * c + 1] += w.s2 * __uint_as_float(b2.y);
+        acc[4 * c + 2] += w.s2 * __uint_as_float(b2.z);
+        acc[4 * c + 3] += w.s2 * __uint_as_float(b2.w);
+        acc[4 * c] += w.s3 * __uint_as_float(b3.x);
+        acc[4 * c + 1] += w.s3 * __uint_as_float(b3.y);
+        acc[4 * c + 2] += w.s3 * __uint_as_float(b3.z);
+        acc[4 * c + 3] += w.s3 * __uint_as_float(b3.w);
+    }
 }
 
 __global__ __launch_bounds__(kThr) R3D_WAVES(4) void attn_dense_h72_kernel(
@@ -220,11 +306,21 @@ __global__ __launch_bounds__(kThr) R3D_WAVES(4) void attn_dense_h72_kernel(
          * barrier, but nothing it computes is stored: skip its arithmetic, so a short segment's idle
          * waves do not spend the block's issue slots on it. A wave is all-live or all-idle unless it
          * straddles the tile's end, so the test is uniform in the common case. */
-        if (live)
-            for (int u = 0; u < nu; ++u) {
+        if (live) {
+            int u = 0;
+            for (; u + kGroup <= nu; u += kGroup) {
+                const KeyScores s = dot_row4(qv, sK + u * kHd, sK + (u + 1) * kHd,
+                                             sK + (u + 2) * kHd, sK + (u + 3) * kHd, scale);
+                if (s.s0 > mx) mx = s.s0;
+                if (s.s1 > mx) mx = s.s1;
+                if (s.s2 > mx) mx = s.s2;
+                if (s.s3 > mx) mx = s.s3;
+            }
+            for (; u < nu; ++u) {
                 const float sc = dot_row(qv, sK + u * kHd) * scale;
                 if (sc > mx) mx = sc;
             }
+        }
         group_barrier();
     }
 
@@ -245,8 +341,21 @@ __global__ __launch_bounds__(kThr) R3D_WAVES(4) void attn_dense_h72_kernel(
             stage_plane<false>(sV, vsrc, v_ld, nu, tid);
         }
         group_barrier();
-        if (live)
-            for (int u = 0; u < nu; ++u) {
+        if (live) {
+            int u = 0;
+            for (; u + kGroup <= nu; u += kGroup) {
+                const KeyScores s = dot_row4(qv, sK + u * kHd, sK + (u + 1) * kHd,
+                                             sK + (u + 2) * kHd, sK + (u + 3) * kHd, scale);
+                const KeyScores w = { expf(s.s0 - mx), expf(s.s1 - mx), expf(s.s2 - mx),
+                                      expf(s.s3 - mx) };
+                sum += w.s0;
+                sum += w.s1;
+                sum += w.s2;
+                sum += w.s3;
+                acc_row4(acc, sV + u * kHd, sV + (u + 1) * kHd, sV + (u + 2) * kHd,
+                         sV + (u + 3) * kHd, w);
+            }
+            for (; u < nu; ++u) {
                 const float w = expf(dot_row(qv, sK + u * kHd) * scale - mx);
                 sum += w;
                 const float* vrow = sV + u * kHd;
@@ -259,6 +368,7 @@ __global__ __launch_bounds__(kThr) R3D_WAVES(4) void attn_dense_h72_kernel(
                     acc[4 * c + 3] += w * __uint_as_float(raw.w);
                 }
             }
+        }
         group_barrier();
     }
 

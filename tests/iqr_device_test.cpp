@@ -54,6 +54,7 @@ struct Lib {
     LaunchFn fused = nullptr;
     LaunchFn logits = nullptr;
     ScratchFn gemm_scratch = nullptr;
+    LaunchFn attn = nullptr;
     ScratchFn logits_scratch = nullptr;
     SlicesFn slices = nullptr;
     bool ok() const { return h && layout && relayout && gemm; }
@@ -72,6 +73,7 @@ Lib& lib() {
         x.fused = (LaunchFn)dlsym(x.h, "r3d_rad_gemm_nt_q_iqr_gated");
         x.logits = (LaunchFn)dlsym(x.h, "r3d_rad_logits_gemm_vocab_iqr");
         x.gemm_scratch = (ScratchFn)dlsym(x.h, "r3d_rad_gemm_nt_q_iqr_m16_scratch");
+        x.attn = (LaunchFn)dlsym(x.h, "r3d_rad_attn_dense");
         x.logits_scratch = (ScratchFn)dlsym(x.h, "r3d_logits_gemm_vocab_iqr_scratch");
         x.slices = (SlicesFn)dlsym(x.h, "r3d_iqr_split_slices");
         return x;
@@ -1201,6 +1203,112 @@ TEST(iqr_vocab_head_is_bit_exact_across_mt) {
     };
     CHECK(same(one, two, "four classes of 4 bits"));
     CHECK(same(one_mixed, two_mixed, "classes of 2/3/5/7 bits"));
+}
+
+/* The vision tower's dense attention at the height an image asks for. One K row per (segment,
+ * head) makes every key's score the same value s, so the maximum is s and every weight is
+ * exp(0) = 1. The denominator is the segment length L; with L a power of two and a V row of
+ * halves and quarters, k * v[d] and every partial sum are exact in f32, and (L * v[d]) * (1 / L)
+ * is v[d]. The store is therefore exactly V, a bit-exact oracle at 16384 rows that forms no host
+ * dot product: 2 segments of 8192 rows, 16 heads, 64 query tiles a segment, and max_seqlen below
+ * the total row count. The two segments' K and V differ so a walk that crosses a boundary shows. */
+TEST(attn_dense_hd72_is_exact_over_a_large_uniform_segment) {
+    if (!lib().h || !lib().attn) {
+        radtest::skip("attn_dense: the row is absent");
+        return;
+    }
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) {
+        radtest::skip("attn_dense: no device visible");
+        return;
+    }
+    const int hd = 72, nh = 16, seg = 8192, M = 2 * seg;
+    const size_t n = (size_t)M * nh * hd;
+    std::vector<uint16_t> q(n), k(n), v(n), out(n, 0xffffu);
+    for (int s = 0; s < 2; ++s)
+        for (int r = s * seg; r < (s + 1) * seg; ++r)
+            for (int h = 0; h < nh; ++h)
+                for (int d = 0; d < hd; ++d) {
+                    const size_t i = ((size_t)r * nh + h) * hd + d;
+                    q[i] = rad_f32_to_bf16(0.002f * (float)(int)(rnd() % 1001) - 1.0f);
+                    k[i] = rad_f32_to_bf16((float)((d + 2 * h + 5 * s) % 5 - 2) * 0.5f);
+                    v[i] = rad_f32_to_bf16((float)((d + 3 * h + 7 * s) % 9 - 4) * 0.25f);
+                }
+    const int32_t cu[3] = { 0, seg, M };
+    void *dq = nullptr, *dk = nullptr, *dv = nullptr, *dout = nullptr, *dcu = nullptr;
+    auto clean = [&] {
+        (void)hipFree(dq);
+        (void)hipFree(dk);
+        (void)hipFree(dv);
+        (void)hipFree(dout);
+        (void)hipFree(dcu);
+    };
+    if (hipMalloc(&dq, n * 2) != hipSuccess || hipMalloc(&dk, n * 2) != hipSuccess ||
+        hipMalloc(&dv, n * 2) != hipSuccess || hipMalloc(&dout, n * 2) != hipSuccess ||
+        hipMalloc(&dcu, sizeof cu) != hipSuccess) {
+        clean();
+        radtest::skip("attn_dense: no device buffers");
+        return;
+    }
+    const bool copied = hipMemcpy(dq, q.data(), n * 2, hipMemcpyHostToDevice) == hipSuccess &&
+                        hipMemcpy(dk, k.data(), n * 2, hipMemcpyHostToDevice) == hipSuccess &&
+                        hipMemcpy(dv, v.data(), n * 2, hipMemcpyHostToDevice) == hipSuccess &&
+                        hipMemcpy(dout, out.data(), n * 2, hipMemcpyHostToDevice) == hipSuccess &&
+                        hipMemcpy(dcu, cu, sizeof cu, hipMemcpyHostToDevice) == hipSuccess;
+    RadTensor tq{}, tk{}, tv{}, tcu{}, to{};
+    RadTensor* t[5] = { &tq, &tk, &tv, &tcu, &to };
+    void* d[5] = { dq, dk, dv, dcu, dout };
+    const uint32_t dt[5] = { RAD_BF16, RAD_BF16, RAD_BF16, RAD_I32, RAD_BF16 };
+    const int64_t s3[3] = { M, nh, hd }, s1[1] = { 3 };
+    for (int i = 0; i < 5; ++i) {
+        t[i]->data = d[i];
+        t[i]->dtype = dt[i];
+        t[i]->rank = i == 3 ? 1 : 3;
+        if (i == 3) t[i]->shape[0] = s1[0];
+        else {
+            t[i]->shape[0] = s3[0];
+            t[i]->shape[1] = s3[1];
+            t[i]->shape[2] = s3[2];
+        }
+        rad_tensor_pack(t[i]);
+    }
+    const RadParam params[] = { pint("head_dim", hd), pint("gqa", 1), pint("causal", 0),
+                                pstr("dtype", "bf16"), pint("max_seqlen", seg) };
+    RadTensor ops[5] = { tq, tk, tv, tcu, to };
+    RadArgs args{};
+    args.t = ops;
+    args.n_t = 5;
+    args.p = params;
+    args.n_p = 5;
+    args.kv_used_max_h = -1;
+    const int rc = copied ? lib().attn(&args, (RadStream)0) : RAD_E_DEVICE;
+    const bool ran = rc == RAD_OK && hipDeviceSynchronize() == hipSuccess &&
+                     hipMemcpy(out.data(), dout, n * 2, hipMemcpyDeviceToHost) == hipSuccess;
+    clean();
+    CHECK(ran);
+    if (!ran) return;
+    size_t bad = 0, first = n;
+    for (int s = 0; s < 2; ++s)
+        for (int r = s * seg; r < (s + 1) * seg; ++r)
+            for (int h = 0; h < nh; ++h)
+                for (int d = 0; d < hd; ++d) {
+                    const size_t i = ((size_t)r * nh + h) * hd + d;
+                    if (out[i] != v[i]) {
+                        ++bad;
+                        if (first == n) first = i;
+                    }
+                }
+    if (bad) {
+        const size_t i = first;
+        std::fprintf(stderr,
+                     "  attn_dense 16384: %zu of %zu values differ; first row %zu head %zu dim %zu: "
+                     "got %g want %g\n",
+                     bad, n, i / ((size_t)nh * hd), (i / hd) % nh, i % hd,
+                     (double)rad_load_f32(out.data(), RAD_BF16, (int64_t)i),
+                     (double)rad_load_f32(v.data(), RAD_BF16, (int64_t)i));
+    }
+    CHECK(bad == 0);
+    if (!bad) std::printf("  attn_dense 16384: %zu uniform-segment values exact\n", n);
 }
 
 TEST(iqr_gemm_bench_on_the_27b_shapes_when_asked) {    if (!std::getenv("RAD_IQR_BENCH") || !lib().ok()) return;
