@@ -790,11 +790,11 @@ void reference16(const Cls& cl, const std::vector<float>& xr, int64_t M, int64_t
 }
 
 /* The activation is held at sixteen bits (|q| <= 127 * 128), so the kernel and this f32 reference
- * differ by the quantiser's rounding alone: at most half a step (amax / 16256) a value, spread over
- * the 128-K dot and folded by the row's scale (0.001 .. 0.0019 here). The measured worst case over
- * M = 1 and 7 and four classes is 3.2e-3 absolute with wanted logits up to ~22 (1.5e-4 relative);
- * 5e-3 + 2e-4 * |want| leaves >1.5x headroom. That is far below bf16's rounding at these
- * magnitudes (ulp 0.125 at 22), which is the point of the sixteen-bit activation. */
+ * differ by the quantiser's rounding alone: at most half a step, a step being amax / 16256, spread
+ * over the 128-K dot and folded by the row's scale (0.001 .. 0.0019 here). The measured worst case
+ * over M = 1 and 7 and four classes is 3.2e-3 absolute with wanted logits up to ~22 (1.5e-4
+ * relative); 5e-3 + 2e-4 * |want| leaves >1.5x headroom. That is far below bf16's rounding at
+ * these magnitudes (ulp 0.125 at 22), which is the point of the sixteen-bit activation. */
 constexpr float kLogitAtol = 5e-3f, kLogitRtol = 2e-4f;
 
 bool run_vocab(int64_t M) {

@@ -73,7 +73,10 @@ __global__ __launch_bounds__(kThreads) void logits_quant_kernel(
     uint32_t hp = 0, lp = 0;
 #pragma unroll
     for (int j = 0; j < VPL; ++j) {
-        const int q = (int)rintf(fminf(fmaxf(v[j] * inv, -kQMax), kQMax));
+        /* NaN -> 0, as the int8 form's f32_to_i8_rtne does; fmaxf/fminf would otherwise turn it
+         * into the negative rail. */
+        const float t = v[j] * inv;
+        const int q = (int)rintf(fminf(fmaxf(t == t ? t : 0.0f, -kQMax), kQMax));
         const int hi = (q + 64) >> 7, lo = q - hi * 128;
         hp |= ((uint32_t)hi & 0xFFu) << (8u * (uint32_t)j);
         lp |= ((uint32_t)lo & 0xFFu) << (8u * (uint32_t)j);
@@ -112,7 +115,7 @@ __global__ void __launch_bounds__(kThreads) R3D_WAVES(4) logits16_kernel(
     c.run_tiles = run_tiles;
     c.tab = nullptr;   /* the head's classes are the computed trellis */
 
-    __shared__ uint8_t sW[16 * 128];
+    __shared__ __align__(4) uint8_t sW[16 * 128];
 
     const int row0 = (int)rt * 16;
     constexpr int NP = (MT * 16 + (int)kThreads - 1) / (int)kThreads;
