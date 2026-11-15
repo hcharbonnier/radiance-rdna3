@@ -91,6 +91,9 @@ set(R3D_UNITS
   # score one wave sum, split history with an f32 partial merge, the optional head gate.
   "r3d_mla_attn_paged|"
   "r3d_attn_paged_h256|"
+  # The vision tower's two remaining ops (W10-lite): dense non-causal attention at head_dim 72 and
+  # the axial 2-D rotary (sections 18 18) over [2, M] positions. Both transcribe libref's order.
+  "r3d_vision_bf16|"
   # The sampler's spine: the row's top-R in one scan, and the stages that turn the candidate plane
   # the top-R produces into one token -- argmax, temp, top-k, the draw, and the four narrowings.
   "r3d_sample_f32|"

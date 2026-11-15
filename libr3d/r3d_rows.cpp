@@ -564,6 +564,19 @@ static const RadOperandSpec oMlaAttnPaged[] = { { "q", RAD_OPD_IN, 0 },
                                                 { "cu_seqlens", RAD_OPD_IN, 0 },
                                                 { "gate", RAD_OPD_IN, 1 },
                                                 { "out", RAD_OPD_OUT, 0 } };
+/* Dense, unpaged attention over cu_seqlens segments (the vision tower's), transcribed from libref:
+ * the same keys, types, requiredness and operand roles, in the same order. `max_seqlen`, `window`,
+ * `cu_div`, `block` and `window_right` are optional and ignored by a caller that does not need
+ * them; the vision band states `max_seqlen` only. */
+static const RadParamSpec pAttnDense[] = {
+    P_INT("M"), P_INT("head_dim"), P_INT("gqa"), P_INT("causal"), P_STR("dtype"),
+    P_F64O("scale"), P_INTO("max_seqlen"), P_INTO("window"), P_INTO("cu_div"),
+    P_INTO("block"), P_INTO("window_right")
+};
+static const RadOperandSpec oAttnDense[] = {
+    { "q", RAD_OPD_IN, 0 }, { "k", RAD_OPD_IN, 0 }, { "v", RAD_OPD_IN, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "out", RAD_OPD_OUT, 0 }
+};
 
 /* The row's top-R over a vocabulary slice, and the sampler's stages. The history stages write this
  * rank's columns and read global ids, so they carry `vocab_off`; the narrowing stages work on the
@@ -987,6 +1000,13 @@ static const RadOpSchema kSchemas[] = {
            "sequences as in attn_paged. With `gate`, out = bf16(bf16(out) * bf16(sigmoid(gate[head])))."),
     SCHEMA("mla_project", pMlaProject, oGemm,
            "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix."),
+    SCHEMA("attn_dense", pAttnDense, oAttnDense,
+           "Dense varlen attention over cu_seqlens segments: q, k and v may be [tokens, heads, "
+           "head_dim] or [tokens, heads * head_dim] (a column slice of a fused projection at its "
+           "row pitch); nothing is paged. `gqa` is the query/key head ratio, `causal` and `window` "
+           "the mask, `scale` 1/sqrt(head_dim) by default. `window` is attn_paged's rule over a "
+           "segment's own positions, `block` cuts a segment into blocks, `cu_div` reads the "
+           "boundaries in units of rows, and `window_right` is the non-causal window's right side."),
     SCHEMA("row_topk", pRowTopk, oRowTopk,
            "Exact per-row top-R, descending, ties to the lower column. `vocab_off` shifts every "
            "column reported, so a rank's slice reports global ids; `pairs` is the [M, R, 2] plane an "
@@ -1846,6 +1866,22 @@ static const RadConstraint cDflashSelect[] = { C_IN("dtype", "bf16"), C_GE("M", 
                                                C_GE("steps", 1), C_GE("top_k", 1),
                                                C_LE("top_k", 256), C_GE("rank", 1),
                                                C_GE("n_vocab", 1) };
+
+/* The vision tower's two remaining bands (W10-lite). `attn_dense` is non-causal full attention
+ * within each cu segment, q/k/v as the column slices of the fused qkv projection (three separate
+ * GEMMs' outputs in the reference; the tower's buffer form in the graph). `rope` is the 2-D axial
+ * rotary the ViT applies before that attention, over [2, M] (row, column) positions and two
+ * 18-frequency ladders.
+ *
+ * The selector would otherwise fall back to the unconstrained rope row, which refuses axial at
+ * launch; the axial row's priority is what puts it first. Its constraints name only parameters the
+ * band states, because a constraint on an optional parameter the band omits does not hold. */
+static const RadConstraint cAttnDenseH72[] = {
+    C_EQ("head_dim", 72), C_EQ("gqa", 1), C_EQ("causal", 0), C_IN("dtype", "bf16")
+};
+static const RadConstraint cRopeAxialH72[] = {
+    C_EQ("head_dim", 72), C_EQ("rotary_dim", 72), C_IN("mode", "axial")
+};
 
 static const RadKernelInfo kKernels[] = {
 /* ------------------------------------------------------------------ r3d_model_bf16.hip
@@ -3650,6 +3686,34 @@ static const RadKernelInfo kKernels[] = {
   ROW(cRopeImrope), NOTUNE,
   nullptr, nullptr, r3d_rad_rope, nullptr, nullptr, nullptr, r3d_shape_rope },
 
+
+/* ------------------------------------------------------------------ the vision tower (W10-lite)
+ *
+ * The two rows the 27B's vision tower needs, and the constraints defined above the table.
+ */
+
+{ "attn_dense_bf16_h72", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens segments: one thread a (query row, query head), two "
+  "passes with the score recomputed, every f32 sum in ascending key order, softmax f32 and one "
+  "bf16 store; an empty segment writes zeros",
+  "head_dim 72; gqa 1; causal 0; no window, block, window_right or cu_div; q/k/v bf16 over their "
+  "row pitch (a column slice of a fused qkv is read in place); positions come from cu_seqlens "
+  "(i32); the softmax uses expf, one bf16 code from libref's double exp",
+  "bf16 q, k, v and out; i32 cu_seqlens; softmax f32, output narrowed once",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cAttnDenseH72), NOTUNE,
+  nullptr, nullptr, r3d_rad_attn_dense, nullptr, nullptr, nullptr, r3d_shape_attn_dense },
+
+{ "rope_axial_bf16_h72", "rope", "attn",
+  "the vision tower's 2-D axial rotary over NeoX pairs, two sections and a ladder restarted in "
+  "each, in place on a fused qkv row: q heads then k heads, v untouched",
+  "head_dim 72; rotary_dim 72; mode axial; two sections summing 36 (18 18 on the 27B); positions "
+  "[2, M] component-major (row, column) read at their own strides; the angles are f32 products of "
+  "double cos/sin and double pow, narrowed once",
+  "bf16 qkv in place, i32 positions, fp32 angles",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ROPE_AXIAL,
+  ROW(cRopeAxialH72), NOTUNE,
+  nullptr, nullptr, r3d_rad_rope_axial, nullptr, nullptr, nullptr, r3d_shape_rope_axial },
 
 };
 

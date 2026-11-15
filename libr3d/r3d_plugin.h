@@ -51,7 +51,12 @@ enum {
 
     /* One row per sampler stage, on f32 logits, so there is nothing to rank yet. A second row for
      * a stage (an i8 logits form, say) would rank against this value. */
-    R3D_PRIO_SAMPLE = 50
+    R3D_PRIO_SAMPLE = 50,
+
+    /* `rope` has an unconstrained row for neox/gptj/imrope, so a mode-specific row must outrank it
+     * to be selected; the unconstrained row then refuses the mode at launch. The axial row is the
+     * vision tower's two-component rotary. */
+    R3D_PRIO_ROPE_AXIAL = 80
 };
 
 /* ================================================================== the dtype codes a C
@@ -100,9 +105,10 @@ static inline int r3d_dt_size(int code) {
 /* The activation an `act` parameter names, as the kernels' template argument. */
 enum { R3D_ACT_SILU = 0, R3D_ACT_SIGMOID = 1, R3D_ACT_GELU = 2 };
 
-/* rope's `mode`, numbered as libref's kModes. neox, gptj and imrope are implemented; the rows'
- * constraints say so, so a model that needs mrope or axial is not routed here. */
-enum { R3D_ROPE_NEOX = 0, R3D_ROPE_GPTJ = 1, R3D_ROPE_IMROPE = 3 };
+/* rope's `mode`, numbered as libref's kModes. neox, gptj and imrope are implemented by the general
+ * row; axial (the vision tower's 2-D rotary) has its own row. The rows' constraints say so, so a
+ * model that needs mrope is not routed here. */
+enum { R3D_ROPE_NEOX = 0, R3D_ROPE_GPTJ = 1, R3D_ROPE_IMROPE = 3, R3D_ROPE_AXIAL = 4 };
 
 /* ================================================================== the row table's entry points
  *
@@ -322,6 +328,8 @@ extern "C" int r3d_shape_attn_paged        (const RadParam*, int, int, RadOpdDes
 extern "C" int r3d_shape_attn_paged_i8     (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_kv_store_i8       (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_rope_table        (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_attn_dense        (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_rope_axial        (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_gemm_nt_q_gated (const RadParam*, int, int, RadOpdDesc*);
 /* r3d_gemm_nt_q_w2a8.hip: the w2a8 vocab projection's layout hook, one of the library's three
  * (with the fp8 weight's and the logits head's, below). It repacks nothing: it presents the
@@ -379,6 +387,12 @@ int r3d_rad_attn_prefill_h128      (const RadArgs* a, RadStream s);
  * Flash-Next or (gqa 6, block 16) for the 27B. Decode split-KVs; prefill is one pass. */
 int r3d_rad_attn_decode_h256       (const RadArgs* a, RadStream s);
 int r3d_rad_attn_prefill_h256      (const RadArgs* a, RadStream s);
+
+/* --- r3d_vision_bf16.hip: the vision tower's two missing ops (W10-lite). `attn_dense` is the
+ * ViT's non-causal full attention at head_dim 72, gqa 1; `rope` is its axial 2-D rotary (head_dim
+ * 72, sections 18 18, positions [2, M]). */
+int r3d_rad_attn_dense            (const RadArgs* a, RadStream s);
+int r3d_rad_rope_axial            (const RadArgs* a, RadStream s);
 
 /* --- r3d_gemm_fp8a8_tiled.hip: the quantised GEMM above the decode heights, and the reader for
  * the container's fp8 weight: codes and per-128x128 scale as two planes behind `b_scale`. The row

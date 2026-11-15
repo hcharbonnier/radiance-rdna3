@@ -35,6 +35,7 @@
  */
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #include "r3d_plugin.h"
@@ -251,6 +252,35 @@ int r3d_shape_rope(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const RadOpdDesc list[] = {
         opd((uint32_t)RAD_BF16, M, (nh + 2 * nkv) * hd),   /* qkv, INOUT */
         opd_idx(M, 0)                                     /* positions */
+    };
+    R3D_PICK(list);
+}
+
+/* The vision tower's axial rotary: the same fused qkv row, and a [2, M] integer position plane
+ * (component-major, row then column). The two sections must fill rotary_dim / 2; a geometry that
+ * does not state them is not this op's. */
+int r3d_shape_rope_axial(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M   = gi(p, n_p, "M", 0);
+    const int64_t hd  = gi(p, n_p, "head_dim", 0);
+    const int64_t nh  = gi(p, n_p, "n_head", 0);
+    const int64_t nkv = gi(p, n_p, "n_head_kv", nh);
+    const char* sec = gs(p, n_p, "sections");
+    int n = 0, s[2] = { 0, 0 };
+    const char* q = sec;
+    for (; q && *q && n < 2; ) {
+        char* end = nullptr;
+        const long v = std::strtol(q, &end, 10);
+        if (end == q || v <= 0) return RAD_E_UNSUPPORTED;
+        s[n++] = (int)v;
+        q = end;
+    }
+    while (q && (*q == ' ' || *q == ',')) ++q;
+    if (q && *q) return RAD_E_UNSUPPORTED;
+    if (M <= 0 || hd <= 0 || hd % 2 || nh <= 0 || nkv < 0 || n != 2 || s[0] + s[1] != hd / 2)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd((uint32_t)RAD_BF16, M, (nh + 2 * nkv) * hd),   /* qkv, INOUT */
+        opd((uint32_t)RAD_I32, 2, M)                      /* positions [2, M] */
     };
     R3D_PICK(list);
 }
@@ -805,6 +835,15 @@ int r3d_shape_mla_attn_paged(const RadParam* p, int n_p, int operand, RadOpdDesc
  * whose V codes are exact integers), so a kbench case is skipped rather than fabricated; the
  * device test in r3d_selftest.cpp covers the row. */
 extern "C" int r3d_shape_attn_paged_i8(const RadParam*, int, int, RadOpdDesc*)
+{
+    return RAD_E_UNSUPPORTED;
+}
+
+/* Dense attention's cu_seqlens is a monotone boundary plane ending at the row count. No fill code
+ * expresses that: a random draw would make a segment point past the q/k/v planes and the row would
+ * read out of bounds. The device test in r3d_selftest.cpp builds the boundaries by hand, as it does
+ * for the h256 cache. */
+extern "C" int r3d_shape_attn_dense(const RadParam*, int, int, RadOpdDesc*)
 {
     return RAD_E_UNSUPPORTED;
 }
