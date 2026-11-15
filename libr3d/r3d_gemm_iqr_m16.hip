@@ -404,11 +404,12 @@ int form_supported(const Form& f) {
     /* W0: the computed trellis, L = 16, one scale a row or a bf16 scale a (row, 128). W14 adds the
      * two IQR-V1 forms the decoded-lane kernels already read: a scalar codebook (kTable, u2..u5) and
      * a vector codebook (kGrid, V = 4, u8/u9/u10/u12), both under a bf16 scale a (row, 128). The
-     * built() list is the authority for the added forms, so a width or scale the layout cannot
-     * produce stays refused with the same code. */
+     * built() list is the authority for every form, so a width or scale the layout cannot produce is
+     * refused here with the same code. */
     if (is_trellis(f.kind))
         return f.kind == kTrellisMad && f.L == 16 && f.lrb == 0 &&
-               (f.scale == kRowF32 || f.scale == kBf16) && f.bits >= 2 && f.bits <= 7;
+               (f.scale == kRowF32 || f.scale == kBf16) && f.bits >= 2 && f.bits <= 7 &&
+               built(kernel_word(word(f)));
     if (f.kind != kTable && f.kind != kGrid) return 0;
     if (!built(kernel_word(word(f)))) return 0;
     if (f.kind == kTable)
@@ -501,12 +502,9 @@ extern "C" int r3d_gemm_iqr_splitk(long a, long as, long b, long bs, long y, int
  * only: the split is chosen by the geometry, not by the launch's M. N and K are the logical
  * extents. Attaching scratch makes the row non-concurrent (rad_kernel_concurrent is
  * `scratch == nullptr`), the price of the partials; the narrow band pays it at every height because
- * the hook cannot see a launch's M. Only the computed trellis has a split kernel, so the other
- * forms answer 0 and keep the row concurrent. */
+ * the hook cannot see a launch's M. */
 extern "C" int64_t r3d_rad_gemm_nt_q_iqr_m16_scratch(const RadArgs* a) {
     if (!a) return 0;
-    const RadTensor* B = r3d_opt(a, 2);
-    if (!B || !is_weight_dtype(B->dtype) || form(B->dtype).kind != kTrellisMad) return 0;
     long long N = 0, K = 0;
     if (!rad_args_geti(a, "N", &N) || !rad_args_geti(a, "K", &K)) return 0;
     const int splits = r3d_iqr_split_slices(N, K);
