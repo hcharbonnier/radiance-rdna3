@@ -309,12 +309,12 @@ __global__ __launch_bounds__(kThr) R3D_WAVES(4) void attn_dense_h72_kernel(
         if (live) {
             int u = 0;
             for (; u + kGroup <= nu; u += kGroup) {
-                const KeyScores s = dot_row4(qv, sK + u * kHd, sK + (u + 1) * kHd,
-                                             sK + (u + 2) * kHd, sK + (u + 3) * kHd, scale);
-                if (s.s0 > mx) mx = s.s0;
-                if (s.s1 > mx) mx = s.s1;
-                if (s.s2 > mx) mx = s.s2;
-                if (s.s3 > mx) mx = s.s3;
+                const KeyScores ks = dot_row4(qv, sK + u * kHd, sK + (u + 1) * kHd,
+                                              sK + (u + 2) * kHd, sK + (u + 3) * kHd, scale);
+                if (ks.s0 > mx) mx = ks.s0;
+                if (ks.s1 > mx) mx = ks.s1;
+                if (ks.s2 > mx) mx = ks.s2;
+                if (ks.s3 > mx) mx = ks.s3;
             }
             for (; u < nu; ++u) {
                 const float sc = dot_row(qv, sK + u * kHd) * scale;
@@ -344,10 +344,10 @@ __global__ __launch_bounds__(kThr) R3D_WAVES(4) void attn_dense_h72_kernel(
         if (live) {
             int u = 0;
             for (; u + kGroup <= nu; u += kGroup) {
-                const KeyScores s = dot_row4(qv, sK + u * kHd, sK + (u + 1) * kHd,
-                                             sK + (u + 2) * kHd, sK + (u + 3) * kHd, scale);
-                const KeyScores w = { expf(s.s0 - mx), expf(s.s1 - mx), expf(s.s2 - mx),
-                                      expf(s.s3 - mx) };
+                const KeyScores ks = dot_row4(qv, sK + u * kHd, sK + (u + 1) * kHd,
+                                              sK + (u + 2) * kHd, sK + (u + 3) * kHd, scale);
+                const KeyScores w = { expf(ks.s0 - mx), expf(ks.s1 - mx), expf(ks.s2 - mx),
+                                      expf(ks.s3 - mx) };
                 sum += w.s0;
                 sum += w.s1;
                 sum += w.s2;
