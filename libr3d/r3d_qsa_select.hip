@@ -91,8 +91,11 @@ __global__ __launch_bounds__(kThreads) void qsa_select_kernel(
 
     if (t == 0) {
         int s = 0;
-        for (int i = 0; i < nseq; ++i)
-            if (m >= cu[i * cu_step] && m < cu[(i + 1) * cu_step]) { s = i; break; }
+        for (int i = 0; i < nseq; ++i) {
+            const long long lo = (long long)i * cu_step;
+            const long long hi = (long long)(i + 1) * cu_step;
+            if (m >= cu[lo] && m < cu[hi]) { s = i; break; }
+        }
         sh_seq = s;
     }
     __syncthreads();
@@ -225,18 +228,18 @@ int r3d_rad_qsa_select(const RadArgs* a, RadStream s)
     const long long ratio = r3d_geti_or(a, "ratio", 0);
     const long long sgn   = r3d_geti_or(a, "signed", 0);
     if (topk <= 0 || ratio <= 0) return R3D_NO(RAD_E_SHAPE);
+    if (topk > 0x7fffffffLL || ratio > 0x7fffffffLL) return R3D_NO(RAD_E_SHAPE);
     if (sgn != 0 && sgn != 1) return R3D_NO(RAD_E_INVAL);
 
     const long long M    = sc->shape[0];
     const long long nb   = bt->shape[1] < sc->shape[1] ? bt->shape[1] : sc->shape[1];
     const long long nseq = r3d_numel(cu) - 1;
     if (M <= 0 || nb <= 0 || nseq <= 0) return R3D_NO(RAD_E_SHAPE);
+    if (M > 0x7fffffffLL || nb > 0x7fffffffLL || nseq > 0x7fffffffLL)
+        return R3D_NO(RAD_E_SHAPE);
     if (bt->shape[0] < nseq || r3d_numel(nc) < nseq) return R3D_NO(RAD_E_SHAPE);
     if (se->shape[0] < M || se->shape[1] < topk + 1) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(ns) < M || r3d_numel(po) < M || r3d_numel(su) < M)
-        return R3D_NO(RAD_E_SHAPE);
-    if (M > 0x7fffffffLL || nb > 0x7fffffffLL || topk > 0x7fffffffLL ||
-        ratio > 0x7fffffffLL || nseq > 0x7fffffffLL)
         return R3D_NO(RAD_E_SHAPE);
 
     if (!r3d_is_f32(sc) || !r3d_is_i32(bt) || !r3d_is_i32(nc) || !r3d_is_i32(po) ||

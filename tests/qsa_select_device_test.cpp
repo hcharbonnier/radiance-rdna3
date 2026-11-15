@@ -100,6 +100,9 @@ constexpr int32_t kSentinel = 0x5A5A5A5A;
 
 struct Fixture {
     int M = 0, nb = 0, snb = 0, topk = 0, ratio = 0, nseq = 0, sgn = 0;
+    /* A row pitch above the width is the architecture's narrowed score plane: shape [M, snb]
+     * with stride[0] still the declaration's `blocks`. 0 means dense. */
+    int s_ld = 0, t_ld = 0, o_ld = 0;
     std::vector<float> score;
     std::vector<int32_t> bt, nc, pos, cu;
     std::vector<int32_t> sel, nsel, seqused;
@@ -108,17 +111,24 @@ struct Fixture {
     Fixture(int M_, int nb_, int topk_, int ratio_, int nseq_, int sgn_)
         : M(M_), nb(nb_), snb(nb_), topk(topk_), ratio(ratio_), nseq(nseq_), sgn(sgn_)
     {
-        score.assign((size_t)M * snb, 0.0f);
-        bt.assign((size_t)nseq * nb, -1);
+        score.assign(score_elems(), 0.0f);
+        bt.assign(bt_elems(), -1);
         nc.assign((size_t)nseq, 0);
         pos.assign((size_t)M, 0);
         cu.assign((size_t)nseq + 1, 0);
         reset_out();
     }
 
+    int sstep() const { return s_ld > 0 ? s_ld : snb; }
+    int tstep() const { return t_ld > 0 ? t_ld : nb; }
+    int ostep() const { return o_ld > 0 ? o_ld : topk + 1; }
+    size_t score_elems() const { return M > 0 ? (size_t)(M - 1) * sstep() + snb : 0; }
+    size_t bt_elems() const { return nseq > 0 ? (size_t)(nseq - 1) * tstep() + nb : 0; }
+    size_t sel_elems() const { return M > 0 ? (size_t)(M - 1) * ostep() + topk + 1 : 0; }
+
     void reset_out()
     {
-        sel.assign((size_t)M * (topk + 1), kSentinel);
+        sel.assign(sel_elems(), kSentinel);
         nsel.assign((size_t)M, kSentinel);
         seqused.assign((size_t)M, kSentinel);
     }
@@ -126,11 +136,11 @@ struct Fixture {
     void score_width(int w)
     {
         snb = w;
-        score.assign((size_t)M * snb, 0.0f);
+        score.assign(score_elems(), 0.0f);
     }
 
-    float& sc(int m, int b) { return score[(size_t)m * snb + b]; }
-    int32_t& page(int s, int b) { return bt[(size_t)s * nb + b]; }
+    float& sc(int m, int b) { return score[(size_t)m * sstep() + b]; }
+    int32_t& page(int s, int b) { return bt[(size_t)s * tstep() + b]; }
 };
 
 RadParam pint(const char* k, long long v)
@@ -156,7 +166,14 @@ RadTensor tensor(void* p, uint32_t dt, std::initializer_list<int64_t> dims)
 
 size_t tbytes(const RadTensor& t)
 {
-    return (size_t)rad_dtype_bytes(t.dtype, rad_tensor_numel(&t));
+    int64_t elems = 1;
+    if (t.rank > 0) {
+        elems = 0;
+        for (uint32_t i = 0; i < t.rank; ++i)
+            if (t.shape[i] > 0) elems += (t.shape[i] - 1) * t.stride[i];
+        elems += 1;
+    }
+    return (size_t)rad_dtype_bytes(t.dtype, elems);
 }
 
 struct Dev {
@@ -194,6 +211,8 @@ void expect_same(const char* what, const char* plane, const std::vector<int32_t>
     }
 }
 
+std::vector<int32_t> gather_sel(const Fixture& f, const std::vector<int32_t>& src);
+
 void run_fixture(const char* what, Fixture& f)
 {
     RadParam pp[6] = { pint("M", f.M),      pint("blocks", f.nb), pint("topk", f.topk),
@@ -209,6 +228,9 @@ void run_fixture(const char* what, Fixture& f)
         tensor(f.nsel.data(), RAD_I32, { f.M }),
         tensor(f.seqused.data(), RAD_I32, { f.M }),
     };
+    if (f.sstep() != f.snb) th[0].stride[0] = f.sstep();
+    if (f.tstep() != f.nb) th[1].stride[0] = f.tstep();
+    if (f.ostep() != f.topk + 1) th[5].stride[0] = f.ostep();
     RadArgs ra{ th, 8, pp, 6, nullptr, 0, nullptr, 0, 1 };
     const int rc = reference().row->launch(&ra, nullptr);
     ++::radtest::checks();
@@ -217,7 +239,8 @@ void run_fixture(const char* what, Fixture& f)
                         std::string(what) + ": libref refused the case (" + std::to_string(rc) + ")");
         return;
     }
-    const std::vector<int32_t> want_sel = f.sel, want_ns = f.nsel, want_su = f.seqused;
+    const std::vector<int32_t> want_sel = gather_sel(f, f.sel), want_ns = f.nsel,
+                               want_su = f.seqused;
 
     Dev dev;
     RadTensor td[8];
@@ -258,12 +281,21 @@ void run_fixture(const char* what, Fixture& f)
             return;
         }
     }
-    expect_same(what, "sel", want_sel, f.sel, f.topk);
+    expect_same(what, "sel", want_sel, gather_sel(f, f.sel), f.topk);
     expect_same(what, "nsel", want_ns, f.nsel, f.topk);
     expect_same(what, "seqused", want_su, f.seqused, f.topk);
 }
 
-int32_t& sel_at(Fixture& f, int m, int j) { return f.sel[(size_t)m * (f.topk + 1) + j]; }
+std::vector<int32_t> gather_sel(const Fixture& f, const std::vector<int32_t>& src)
+{
+    std::vector<int32_t> out((size_t)f.M * (f.topk + 1));
+    for (int m = 0; m < f.M; ++m)
+        for (int j = 0; j <= f.topk; ++j)
+            out[(size_t)m * (f.topk + 1) + j] = src[(size_t)m * f.ostep() + j];
+    return out;
+}
+
+int32_t& sel_at(Fixture& f, int m, int j) { return f.sel[(size_t)m * f.ostep() + j]; }
 
 void expect_row(const char* what, Fixture& f, int m, std::initializer_list<int32_t> want)
 {
@@ -456,16 +488,17 @@ TEST(qsa_select_prefill_query_bounds)
 TEST(qsa_select_partial_page_rules)
 {
     if (!ready()) return;
-    Fixture f(5, 6, 2, 4, 5, 0);
-    f.cu = { 0, 1, 2, 3, 4, 5 };
-    f.nc = { 6, 6, 6, 6, 0 };
-    f.pos = { 23, 22, 22, 0, 0 };
-    for (int s = 0; s < 5; ++s)
+    Fixture f(6, 6, 2, 4, 6, 0);
+    f.cu = { 0, 1, 2, 3, 4, 5, 6 };
+    f.nc = { 6, 6, 6, 6, 0, 6 };
+    f.pos = { 23, 22, 22, 0, 0, 23 };
+    for (int s = 0; s < 6; ++s)
         for (int b = 0; b < f.nb; ++b) f.page(s, b) = 100 * (s + 1) + b;
     f.page(1, 5) = 177;    /* appended */
     f.page(2, 5) = -1;     /* absent: no partial page */
     for (int b = 0; b < f.nb; ++b) f.page(4, b) = -1;
-    for (int m = 0; m < 5; ++m)
+    for (int b = 0; b < f.nb; ++b) f.page(5, b) = -1;
+    for (int m = 0; m < 6; ++m)
         for (int b = 0; b < f.nb; ++b) f.sc(m, b) = (float)(1 + (m * 5 + b * 7) % 13);
     run_fixture("partial page rules", f);
     /* n = 6 on a boundary: no partial even though n == nb. */
@@ -482,7 +515,58 @@ TEST(qsa_select_partial_page_rules)
     CHECK_EQ(f.nsel[4], 0);
     CHECK_EQ(f.seqused[4], 0);
     CHECK_EQ(sel_at(f, 4, 0), -1);
+    /* n = 6 with every page -1: the complete blocks exist but none is live, and n == nb means
+     * no partial page, so the table is empty too. */
+    CHECK_EQ(f.nsel[5], 0);
+    CHECK_EQ(f.seqused[5], 0);
+    CHECK_EQ(sel_at(f, 5, 0), -1);
 }
+
+TEST(qsa_select_signed_negative_threshold)
+{
+    if (!ready()) return;
+    Fixture f(1, 8, 3, 4, 1, 1);
+    f.cu = { 0, 1 };
+    f.nc = { 8 };
+    f.pos = { 31 };
+    for (int b = 0; b < f.nb; ++b) f.page(0, b) = 40 + b;
+    const float v[8] = { -1, -2, -2, -3, -3, -3, -4, -5 };
+    for (int b = 0; b < f.nb; ++b) f.sc(0, b) = v[b];
+    run_fixture("signed negative threshold", f);
+    /* -1 above the threshold, then the first two of the three -2s (blocks 1 and 2). */
+    expect_row("signed negatives", f, 0, { 40, 41, 42, -1 });
+}
+
+TEST(qsa_select_padded_pitches)
+{
+    if (!ready()) return;
+    Fixture f(2, 32, 5, 4, 2, 0);
+    f.cu = { 0, 1, 2 };
+    f.nc = { 32, 24 };
+    f.pos = { 127, 93 };
+    /* The architecture's narrowed score plane: shape [M, live] with the declaration's pitch.
+     * bt and sel carry a pitch above their width too. */
+    f.s_ld = 32;
+    f.score_width(10);
+    f.t_ld = 40;
+    f.bt.assign(f.bt_elems(), -1);
+    f.o_ld = 9;
+    f.reset_out();
+    for (int s = 0; s < 2; ++s)
+        for (int b = 0; b < f.nb; ++b) f.page(s, b) = 1000 * (s + 1) + b;
+    for (int m = 0; m < 2; ++m)
+        for (int b = 0; b < f.snb; ++b) f.sc(m, b) = (float)(1 + (m * 7 + b * 3) % 19);
+    run_fixture("padded pitches", f);
+    /* nb is the narrower score width, so both queries select from ten blocks. */
+    CHECK_EQ(f.nsel[0], 5);
+    CHECK_EQ(f.nsel[1], 5);
+    /* The three columns past topk + 1 between rows are untouched; the last row's pad is not
+     * part of the tensor's storage. */
+    for (int m = 0; m + 1 < f.M; ++m)
+        for (int j = f.topk + 1; j < f.ostep(); ++j)
+            CHECK_EQ(f.sel[(size_t)m * f.ostep() + j], kSentinel);
+}
+
 
 TEST(qsa_select_score_narrower_than_table)
 {
