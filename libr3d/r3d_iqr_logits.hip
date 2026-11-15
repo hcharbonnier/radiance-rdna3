@@ -12,7 +12,9 @@
  * W12: this replaces the per-class int8 GEMM and bf16 logits plane. The int8 grid cost the head
  * 2e-5 KL on its own (libr4d/r4d_logits_vocab.hip); sixteen bits are below bf16's rounding, and the
  * accumulation stays exact until the fold. One launch decodes a class, as the row's contract
- * allows; the classes are independent and write disjoint ids.
+ * allows; the classes are independent and write disjoint ids. At the decode height (M = 1) the
+ * wave's two halves take the hi and lo planes of the same tile and join their exact sums with
+ * v_permlanex16, so no lane sits idle and the dot chain halves; the bits are unchanged.
  */
 #include "r3d_args.h"
 #include "r3d_codecs.h"
@@ -132,30 +134,53 @@ __global__ void __launch_bounds__(kThreads) R3D_WAVES(4) logits16_kernel(
         for (int q = 0; q < 16; ++q) *(uint32_t*)(sW + q * 128 + 4u * lane) = w[q];
         __syncthreads();
 
+        if constexpr (MT == 1) {
+            /* The decode height: 16 rows and two planes over 32 lanes. Lanes 0-15 take the hi
+             * plane, 16-31 the lo, each its row's full 128-K sum, so both halves of the wave do
+             * 32 v_dot4 instead of 16 lanes doing 64. The low lane takes its partner's lo sum with
+             * v_permlanex16 (no LDS round trip) and forms the same exact integer the unsplit path
+             * does; the f32 fold, the block factor and the row's factor are untouched. */
+            const bool hi = lane < 16u;
+            const int q = (int)(lane & 15u);
+            const int tok = tok0;
+            if (tok < M) {
+                const int8_t* ap = (hi ? xh : xl) + (long long)tok * K + (long long)kb * 128;
+                const uint32_t* wp = (const uint32_t*)(sW + q * 128);
+                int s = 0;
 #pragma unroll
-        for (int i = 0; i < NP; ++i) {
-            const int p = (int)lane + (int)kThreads * i;
-            if constexpr (MT * 16 < (int)kThreads) {
-                if (p >= MT * 16) continue;
+                for (int c4 = 0; c4 < 32; ++c4)
+                    s = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], s);
+                const int partner = (int)r3d_xor_lane_u32<16>((uint32_t)s);
+                if (hi) {
+                    const int total = s * 128 + partner;
+                    const float sa = xs[(size_t)tok * nkb + kb];
+                    const float sb = fold_f32<F>(c, (uint32_t)(row0 + q), kb);
+                    acc[0] += (float)total * sa * sb;
+                }
             }
-            const int m = p / 16, q = p % 16;
-            const int tok = tok0 + m;
-            if (tok >= M) continue;
-            const int8_t* h = xh + (long long)tok * K + (long long)kb * 128;
-            const int8_t* l = xl + (long long)tok * K + (long long)kb * 128;
-            const uint32_t* wp = (const uint32_t*)(sW + q * 128);
-            int sh = 0, sl = 0;
+        } else {
 #pragma unroll
-            for (int c4 = 0; c4 < 32; ++c4) {
-                const uint32_t ww = wp[c4];
-                sh = dot4_i8(*(const uint32_t*)(h + 4 * c4), ww, sh);
-                sl = dot4_i8(*(const uint32_t*)(l + 4 * c4), ww, sl);
+            for (int i = 0; i < NP; ++i) {
+                const int p = (int)lane + (int)kThreads * i;
+                const int m = p / 16, q = p % 16;
+                const int tok = tok0 + m;
+                if (tok >= M) continue;
+                const int8_t* h = xh + (long long)tok * K + (long long)kb * 128;
+                const int8_t* l = xl + (long long)tok * K + (long long)kb * 128;
+                const uint32_t* wp = (const uint32_t*)(sW + q * 128);
+                int sh = 0, sl = 0;
+#pragma unroll
+                for (int c4 = 0; c4 < 32; ++c4) {
+                    const uint32_t ww = wp[c4];
+                    sh = dot4_i8(*(const uint32_t*)(h + 4 * c4), ww, sh);
+                    sl = dot4_i8(*(const uint32_t*)(l + 4 * c4), ww, sl);
+                }
+                /* q = 128 hi + lo: the exact integer this block adds before any f32 rounding */
+                const int total = sh * 128 + sl;
+                const float sa = xs[(size_t)tok * nkb + kb];
+                const float sb = fold_f32<F>(c, (uint32_t)(row0 + q), kb);
+                acc[i] += (float)total * sa * sb;
             }
-            /* q = 128 hi + lo: the exact integer this block adds before any f32 rounding */
-            const int total = sh * 128 + sl;
-            const float sa = xs[(size_t)tok * nkb + kb];
-            const float sb = fold_f32<F>(c, (uint32_t)(row0 + q), kb);
-            acc[i] += (float)total * sa * sb;
         }
         __syncthreads();
     }
