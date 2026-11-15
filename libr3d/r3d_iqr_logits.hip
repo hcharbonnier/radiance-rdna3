@@ -27,6 +27,9 @@ using namespace r3d_iqr;
 /* r3d_gemm_iqr_m16.hip: the chunked m16 launch the class GEMMs use until W11's head kernel. */
 extern "C" int r3d_gemm_iqr_tiled(long a, long as, long b, long bs, long y, int M, int N, int K,
                                   int a_ld, int y_ld, uint32_t word, long stream);
+/* The validated decode-row shim (r3d_plugin.h): the class GEMMs take this path so the head cannot
+ * drift from the row the dense fixtures and the host-reference test cover. */
+extern "C" int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* a, RadStream s);
 
 constexpr uint32_t kThreads = 32;
 constexpr float kTopI8 = 127.0f;
@@ -118,14 +121,13 @@ int64_t r3d_logits_gemm_vocab_iqr_scratch(const RadArgs* a) {
 }
 
 int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream stream) {
-    /* W11: the class GEMM through the decode row disagrees with the host reference on the 27B's
-     * head form (same q/s, same weight: device 0.0449, reference -0.279). The row refuses until
-     * that is resolved, so a container with a vocabulary-weighted head declares and fails loudly
-     * at the first step instead of emitting wrong logits. See JOURNAL_RDNA3.md. */
-    (void)a;
-    (void)stream;
-    return R3D_NO(RAD_E_UNSUPPORTED);
-#if 0
+    /* W11: the class GEMM now goes through the validated decode-row shim, but with the 27B's head
+     * form the result still disagrees with the host reference (device 10.56 where the reference
+     * computes 462, K=128, constant weight, same q/s read back). The row refuses until that is
+     * resolved, so a container declares and fails loudly at the first step. RAD_IQR_VOCAB=1
+     * enables the body for the test. */
+    if (std::getenv("RAD_IQR_VOCAB") == nullptr) return R3D_NO(RAD_E_UNSUPPORTED);
+#if 1
     if (!a || a->n_t < 15 || !a->scratch) return R3D_NO(RAD_E_INVAL);
     const RadTensor* x = r3d_opt(a, 0);
     const RadTensor* lg = r3d_opt(a, 14);
@@ -177,12 +179,26 @@ int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream stream) {
 
     for (int i = 0; i < 4; ++i) {
         if (!w[i]) continue;
-        const int rc = r3d_gemm_iqr_tiled((long)(uintptr_t)q, (long)(uintptr_t)s,
-                                          (long)(uintptr_t)r3d_p(w[i]),
-                                          (long)(uintptr_t)r3d_p(sc[i]), (long)(uintptr_t)y,
-                                          (int)M, (int)rows[i], (int)n_embd, (int)n_embd,
-                                          (int)rows[i], w[i]->dtype, (long)stream);
-        if (rc) return R3D_NO(RAD_E_DEVICE);
+        RadTensor qa{}, qs{}, qy{};
+        qa.data = q; qa.dtype = RAD_I8; qa.rank = 2; qa.shape[0] = M; qa.shape[1] = n_embd;
+        qs.data = s; qs.dtype = RAD_F32; qs.rank = 2; qs.shape[0] = M;
+        qs.shape[1] = n_embd / 128;
+        qy.data = y; qy.dtype = RAD_BF16; qy.rank = 2; qy.shape[0] = M; qy.shape[1] = rows[i];
+        for (RadTensor* t : { &qa, &qs, &qy }) rad_tensor_pack(t);
+        RadParam gp[5] = {};
+        gp[0].key = "M"; gp[0].kind = RAD_P_INT; gp[0].ival = M;
+        gp[1].key = "N"; gp[1].kind = RAD_P_INT; gp[1].ival = rows[i];
+        gp[2].key = "K"; gp[2].kind = RAD_P_INT; gp[2].ival = n_embd;
+        gp[3].key = "group"; gp[3].kind = RAD_P_INT; gp[3].ival = 128;
+        gp[4].key = "dtype"; gp[4].kind = RAD_P_STR; gp[4].sval = "i8a8h";
+        RadTensor gt[7] = { qa, qs, *w[i], *sc[i], qy, RadTensor{}, RadTensor{} };
+        RadArgs ga{};
+        ga.t = gt;
+        ga.n_t = 7;
+        ga.p = gp;
+        ga.n_p = 5;
+        ga.kv_used_max_h = -1;
+        if (r3d_rad_gemm_nt_q_iqr_m16(&ga, stream) != RAD_OK) return R3D_NO(RAD_E_DEVICE);
         const dim3 sgrid((uint32_t)M, (uint32_t)((rows[i] + 127) / 128));
         R3D_KLAUNCH(R3D_KNAME(logits_scatter_kernel), sgrid, dim3(128), (hipStream_t)stream, y,
                     (const int32_t*)r3d_p(id[i]), (float*)r3d_wp(lg), (uint32_t)n_vocab,
