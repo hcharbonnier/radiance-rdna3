@@ -17,6 +17,11 @@
  *     below the bf16 store's 1/256. The selftest states the bound (one bf16 code) and adds a
  *     uniform-score case where exp(0) is exactly 1 and the answer is bit-identical.
  *
+ *     W12 gave the kernel the walk the cost at M = 16384 asks for: a workgroup carries a block of
+ *     query rows (and the whole of a small GQA group), one thread a row, and sweeps the segment's
+ *     keys in LDS tiles of K and V widened to f32 once a tile element. The arithmetic order is
+ *     untouched -- see "attn_dense, hd 72" below for what that buys and what it refuses to change.
+ *
  *   rope axial (ref_attn.c:ref_rope, rope_freqs ROPE_AXIAL)
  *     * NeoX pairs (i, i + rotary_dim / 2), q heads then k heads, v untouched;
  *     * section c owns a contiguous run of the rotary_dim / 2 frequencies and restarts the ladder
@@ -45,63 +50,229 @@ constexpr int kHalf  = kHd / 2;  /* NeoX pairs: i and i + 36 */
 constexpr int kThr   = 128;      /* four wave32s: one thread a (row, head) or a rotary pair */
 
 /* ================================================================== attn_dense, hd 72 */
-/* One thread owns one (query row, query head). Its q head is widened into registers once; the two
- * passes walk the segment's keys in ascending order, so every f32 sum has the reference's
- * bracketing. With gqa 1 a head group is one head; the general ratio is kept because it costs
- * nothing here and keeps the kernel's contract honest. */
-__global__ __launch_bounds__(kThr) void attn_dense_h72_kernel(
+/*
+ * One thread owns one (query row, query head): 72 f32 of q live in registers beside 72 f32 of
+ * accumulator. A workgroup owns one cu segment, one KV head (or the whole of a small GQA group of
+ * query heads), and the segment's next kThr / heads-per-block query rows; its waves sweep the
+ * segment's keys in tiles of kStage keys.
+ *
+ * ============================== the two walks ==============================
+ *
+ * The reference is two-pass: walk one takes the maximum of `dot * scale` over the segment's keys;
+ * walk two recomputes the score, exponentiates against that maximum, accumulates `sum += w` and
+ * `acc[d] += w * v[d]` ascending in key, then narrows `acc[d] * (1 / sum)` once. Every f32 sum
+ * keeps the reference's bracketing -- dot over d ascending, one multiply by `scale` after it, both
+ * sums ascending in key -- and `expf` is the file header's one divergence.
+ *
+ * Keeping the scores between the walks would need 4 bytes a (row, key): 64 KiB a row, 8 MiB for a
+ * 16384-key image at a block's 128 rows, against 64 KiB of LDS a workgroup, so walk two recomputes
+ * them with the same operands and the same order and the two walks produce the same bits. Online
+ * (flash) softmax would instead rescale the running accumulator and the denominator by
+ * `exp(m_old - m_new)`, bracketing every sum differently; r3d_attn_paged_h128.hip states why that
+ * arm is not taken, and this kernel makes the same choice.
+ *
+ * ============================== the stage ==============================
+ *
+ * A workgroup stages the tile's K rows -- and, in walk two, its V rows -- into LDS as f32: kStage
+ * rows of 72 f32, 4.5 KiB a plane. Every lane of a wave is reading the same key of the same KV
+ * head, so a read is a broadcast of one address rather than 32 scattered rows and a tile costs a
+ * wave one broadcast a dword, not a read a lane. That is why the codes are widened once a tile
+ * element instead of once a (row, element): 128 rows share the widening, and the 16-byte global
+ * read that feeds it moves eight bf16 codes at once. The stage holds f32 rather than bf16 codes
+ * because a code read costs a shift and a mask a value on every use -- two ALU ops a value, where
+ * an f32 dword serves two values with none -- and the same argument rejects f16 pairs and dot2
+ * here: gfx11 has no bf16 dot2 (r3d_common.h), and narrowing to f16 would put the reference's
+ * exact widening behind a lossy convert, which is not this row's contract.
+ *
+ * A tile costs two barriers: one after the workgroup-wide load, one before the next tile overwrites
+ * it. Walk one stages K only; walk two stages K and V. When the shim sees every operand 16-byte
+ * aligned and every pitch a multiple of eight, a tile row is kChunk 16-byte loads; otherwise the
+ * same rows are loaded a halfword a thread, so an unaligned base is served rather than refused
+ * (`align16` is the shim's promise, and the branch is workgroup-uniform).
+ *
+ * ============================== the grid ==============================
+ *
+ * grid = (ceil(total_q / rows-per-block), q_heads / heads-per-block, n_seq): one block a (segment,
+ * KV head or group, query-row tile). A tile that starts past its segment's last row returns at
+ * once, so a ragged batch pays one empty block a tile bound instead of a cu_seqlens scan a thread.
+ * A block carries `hpb = min(gqa, kMaxHb)` of the group's query heads when the group fits in a
+ * block, so with gqa > 1 each staged tile is reused in LDS across the whole group; a wider group
+ * falls back to one head a block (its heads still meet in L2) rather than refusing the geometry.
+ */
+
+constexpr int kStage = 16;                  /* keys one staged tile carries */
+constexpr int kQuad  = kHd / 4;             /* 16-byte reads a staged row: 18 */
+constexpr int kChunk = kHd / 8;             /* 16-byte chunks a key row: 9 */
+constexpr int kMaxHb = 8;                   /* query heads a block keeps of one KV group */
+
+/* bf16 codes in a dword, widened in place: the low half is the even element, the high the odd. */
+__device__ __forceinline__ void widen8(const uint32_t* d, float* f) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        f[2 * j]     = __uint_as_float(d[j] << 16);
+        f[2 * j + 1] = __uint_as_float(d[j] & 0xffff0000u);
+    }
+}
+
+/* One plane's tile: `nu` key rows from `row0` (already at the KV head's column), widened to f32 in
+ * LDS. ALIGN16 is the shim's promise that every row starts on a 16-byte boundary. */
+template <bool ALIGN16>
+__device__ __forceinline__ void stage_plane(float* dst, const uint16_t* row0, long ld, int nu,
+                                            int tid) {
+    if constexpr (ALIGN16) {
+        const int nchunk = nu * kChunk;
+        for (int e = tid; e < nchunk; e += kThr) {
+            const int u = e / kChunk, c = e - u * kChunk;
+            const r3d_u32x4 raw = *(const __attribute__((address_space(1)))
+                                    r3d_u32x4*)(const void*)(row0 + (long)u * ld + c * 8);
+            const uint32_t d[4] = { raw.x, raw.y, raw.z, raw.w };
+            float f[8];
+            widen8(d, f);
+            *(r3d_u32x4*)(void*)(dst + u * kHd + c * 8) =
+                r3d_u32x4{ __float_as_uint(f[0]), __float_as_uint(f[1]),
+                           __float_as_uint(f[2]), __float_as_uint(f[3]) };
+            *(r3d_u32x4*)(void*)(dst + u * kHd + c * 8 + 4) =
+                r3d_u32x4{ __float_as_uint(f[4]), __float_as_uint(f[5]),
+                           __float_as_uint(f[6]), __float_as_uint(f[7]) };
+        }
+    } else {
+        const int n = nu * kHd;
+        for (int e = tid; e < n; e += kThr) {
+            const int u = e / kHd, d = e - u * kHd;
+            dst[u * kHd + d] = bf16_to_f32((uint16_t)ldg_u16(row0 + (long)u * ld + d));
+        }
+    }
+}
+
+/* The score's dot over d ascending, f32, no FMA: the reference's expression over a staged row. The
+ * row is read a 16-byte dword at a time, which is one broadcast for the whole wave. */
+__device__ __forceinline__ float dot_row(const float* qv, const float* krow) {
+    float dot = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kQuad; ++c) {
+        const r3d_u32x4 raw = *(const r3d_u32x4*)(const void*)(krow + 4 * c);
+        dot += qv[4 * c] * __uint_as_float(raw.x);
+        dot += qv[4 * c + 1] * __uint_as_float(raw.y);
+        dot += qv[4 * c + 2] * __uint_as_float(raw.z);
+        dot += qv[4 * c + 3] * __uint_as_float(raw.w);
+    }
+    return dot;
+}
+
+__global__ __launch_bounds__(kThr) R3D_WAVES(4) void attn_dense_h72_kernel(
     const uint16_t* __restrict__ q, const uint16_t* __restrict__ k,
     const uint16_t* __restrict__ v, uint16_t* __restrict__ o,
-    const int32_t* __restrict__ cu, int total_q, int n_seq, int q_heads, int gqa,
-    long q_ld, long k_ld, long v_ld, long o_ld, float scale) {
-    const long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long total = (long)total_q * q_heads;
-    if (tid >= total) return;
-    const int i = (int)(tid / q_heads);
-    const int h = (int)(tid - (long)i * q_heads);
+    const int32_t* __restrict__ cu, int total_q, int gqa, int hpb,
+    long q_ld, long k_ld, long v_ld, long o_ld, float scale, int align16) {
+    __shared__ __attribute__((aligned(16))) float sK[kStage * kHd];
+    __shared__ __attribute__((aligned(16))) float sV[kStage * kHd];
 
-    /* The sequence that owns row i, exactly ref's seq_of scan. */
-    int s = 0;
-    while (s + 1 < n_seq && cu[s + 1] <= i) ++s;
-    const int b0 = cu[s], b1 = cu[s + 1];
-    const int kh = h / gqa;
+    const int tid = (int)threadIdx.x;
+    const int s = (int)blockIdx.z;
+    const int r = tid / hpb, hl = tid - r * hpb;     /* row in the tile, head in the group */
+    const int h = (int)blockIdx.y * hpb + hl;        /* the query head */
+    const int kh = h / gqa;                          /* its KV head */
+    const int rows = kThr / hpb;                     /* query rows a block carries */
 
-    const uint16_t* qrow = q + (size_t)i * q_ld + (size_t)h * kHd;
+    /* `cu` is the description's promise; a last boundary past the query plane is clamped here so a
+     * long descriptor cannot make a key read leave K or V (`seq_of`'s rows are the reference's). */
+    const int b0 = cu[s];
+    int b1 = cu[s + 1];
+    if (b1 > total_q) b1 = total_q;
+    const int row0 = b0 + (int)blockIdx.x * rows;
+    if (b1 <= b0 || row0 >= b1) return;
+    const int i = row0 + r;
+    /* A row the block does not carry -- the last tile's tail, or the padding `gqa` leaves when it
+     * does not divide kThr -- loads a row that exists so the walk stays branch-free, and stores
+     * nothing. */
+    const bool live = r < rows && i < b1;
+    const int row = live ? i : b1 - 1;
+
+    const uint16_t* qrow = q + (size_t)row * q_ld + (size_t)h * kHd;
     float qv[kHd];
+    if (align16) {
 #pragma unroll
-    for (int d = 0; d < kHd; ++d) qv[d] = bf16_to_f32((uint16_t)ldg_u16(qrow + d));
-
-    float mx = -INFINITY;
-    for (int j = b0; j < b1; ++j) {
-        const uint16_t* krow = k + (size_t)j * k_ld + (size_t)kh * kHd;
-        float dot = 0.0f;
+        for (int c = 0; c < kChunk; ++c) {
+            const r3d_u32x4 raw = *(const __attribute__((address_space(1)))
+                                    r3d_u32x4*)(const void*)(qrow + c * 8);
+            const uint32_t d[4] = { raw.x, raw.y, raw.z, raw.w };
+            widen8(d, qv + c * 8);
+        }
+    } else {
 #pragma unroll
-        for (int d = 0; d < kHd; ++d) dot += qv[d] * bf16_to_f32((uint16_t)ldg_u16(krow + d));
-        dot *= scale;
-        if (dot > mx) mx = dot;
+        for (int d = 0; d < kHd; ++d) qv[d] = bf16_to_f32((uint16_t)ldg_u16(qrow + d));
     }
 
+    const uint16_t* kbase = k + (size_t)kh * kHd;
+    const uint16_t* vbase = v + (size_t)kh * kHd;
+
+    /* Walk one: the maximum of the scaled scores, ascending in key. */
+    float mx = -INFINITY;
+    for (int j0 = b0; j0 < b1; j0 += kStage) {
+        const int nu = b1 - j0 < kStage ? b1 - j0 : kStage;
+        const uint16_t* src = kbase + (size_t)j0 * k_ld;
+        if (align16) stage_plane<true>(sK, src, k_ld, nu, tid);
+        else stage_plane<false>(sK, src, k_ld, nu, tid);
+        group_barrier();
+        for (int u = 0; u < nu; ++u) {
+            const float sc = dot_row(qv, sK + u * kHd) * scale;
+            if (sc > mx) mx = sc;
+        }
+        group_barrier();
+    }
+
+    /* Walk two: the same scores, exponentiated against the maximum, accumulated ascending. */
     float acc[kHd];
 #pragma unroll
     for (int d = 0; d < kHd; ++d) acc[d] = 0.0f;
-
     float sum = 0.0f;
-    for (int j = b0; j < b1; ++j) {
-        const uint16_t* krow = k + (size_t)j * k_ld + (size_t)kh * kHd;
-        float dot = 0.0f;
+    for (int j0 = b0; j0 < b1; j0 += kStage) {
+        const int nu = b1 - j0 < kStage ? b1 - j0 : kStage;
+        const uint16_t* ksrc = kbase + (size_t)j0 * k_ld;
+        const uint16_t* vsrc = vbase + (size_t)j0 * v_ld;
+        if (align16) {
+            stage_plane<true>(sK, ksrc, k_ld, nu, tid);
+            stage_plane<true>(sV, vsrc, v_ld, nu, tid);
+        } else {
+            stage_plane<false>(sK, ksrc, k_ld, nu, tid);
+            stage_plane<false>(sV, vsrc, v_ld, nu, tid);
+        }
+        group_barrier();
+        for (int u = 0; u < nu; ++u) {
+            const float w = expf(dot_row(qv, sK + u * kHd) * scale - mx);
+            sum += w;
+            const float* vrow = sV + u * kHd;
 #pragma unroll
-        for (int d = 0; d < kHd; ++d) dot += qv[d] * bf16_to_f32((uint16_t)ldg_u16(krow + d));
-        const float w = expf(dot * scale - mx);
-        sum += w;
-        const uint16_t* vrow = v + (size_t)j * v_ld + (size_t)kh * kHd;
-#pragma unroll
-        for (int d = 0; d < kHd; ++d) acc[d] += w * bf16_to_f32((uint16_t)ldg_u16(vrow + d));
+            for (int c = 0; c < kQuad; ++c) {
+                const r3d_u32x4 raw = *(const r3d_u32x4*)(const void*)(vrow + 4 * c);
+                acc[4 * c] += w * __uint_as_float(raw.x);
+                acc[4 * c + 1] += w * __uint_as_float(raw.y);
+                acc[4 * c + 2] += w * __uint_as_float(raw.z);
+                acc[4 * c + 3] += w * __uint_as_float(raw.w);
+            }
+        }
+        group_barrier();
     }
 
+    if (!live) return;
     const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-    uint16_t* orow = o + (size_t)i * o_ld + (size_t)h * kHd;
+    uint16_t* orow = o + (size_t)row * o_ld + (size_t)h * kHd;
+    if (align16) {
 #pragma unroll
-    for (int d = 0; d < kHd; ++d) orow[d] = f32_to_bf16(acc[d] * inv);
+        for (int c = 0; c < kChunk; ++c) {
+            uint32_t d[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int t = c * 8 + 2 * j;
+                d[j] = (uint32_t)f32_to_bf16(acc[t] * inv) |
+                       ((uint32_t)f32_to_bf16(acc[t + 1] * inv) << 16);
+            }
+            *(r3d_u32x4*)(void*)(orow + c * 8) = r3d_u32x4{ d[0], d[1], d[2], d[3] };
+        }
+    } else {
+#pragma unroll
+        for (int d = 0; d < kHd; ++d) orow[d] = f32_to_bf16(acc[d] * inv);
+    }
 }
 
 }  // namespace
@@ -114,14 +285,26 @@ extern "C" int r3d_attn_dense_h72(long q, long k, long v, long o, long cu, int t
     if (q_ld < (long)q_heads * kHd || k_ld < (long)(q_heads / gqa) * kHd ||
         v_ld < (long)(q_heads / gqa) * kHd || o_ld < (long)q_heads * kHd)
         return -3;
-    const long total = (long)total_q * q_heads;
-    const long grid = (total + kThr - 1) / kThr;
-    if (grid > 0x7fffffffL) return -2;
-    R3D_KLAUNCH(attn_dense_h72_kernel, dim3((uint32_t)grid), dim3(kThr),
-                (hipStream_t)(uintptr_t)stream, (const uint16_t*)(uintptr_t)q,
+    /* A GQA group up to kMaxHb heads is carried by one block, so its staged K and V are shared in
+     * LDS; a wider group is served one head a block, which is a different grid, not a different
+     * kernel. `rows` floors, so a gqa that does not divide kThr leaves its last threads idle. */
+    const int hpb = gqa <= kMaxHb ? gqa : 1;
+    const long rows = kThr / hpb;
+    const long long tiles = ((long long)total_q + rows - 1) / rows;
+    const long long heads = (long long)q_heads / hpb;
+    if (tiles > 0x7fffffffLL || heads > 0x7fffffffLL) return -2;
+    /* A row is kHd bf16 wide, so a pitch that is a multiple of eight keeps it 16-byte aligned
+     * whenever the operand's base is; the kernel reads 16 bytes at a time when both hold. */
+    const int align16 = r3d_aligned((const void*)(uintptr_t)q, 16) &&
+                        r3d_aligned((const void*)(uintptr_t)k, 16) &&
+                        r3d_aligned((const void*)(uintptr_t)v, 16) &&
+                        r3d_aligned((const void*)(uintptr_t)o, 16) &&
+                        (q_ld % 8 == 0) && (k_ld % 8 == 0) && (v_ld % 8 == 0) && (o_ld % 8 == 0);
+    R3D_KLAUNCH(attn_dense_h72_kernel, dim3((uint32_t)tiles, (uint32_t)heads, (uint32_t)n_seq),
+                dim3(kThr), (hipStream_t)(uintptr_t)stream, (const uint16_t*)(uintptr_t)q,
                 (const uint16_t*)(uintptr_t)k, (const uint16_t*)(uintptr_t)v,
-                (uint16_t*)(uintptr_t)o, (const int32_t*)(uintptr_t)cu, total_q, n_seq,
-                q_heads, gqa, q_ld, k_ld, v_ld, o_ld, scale);
+                (uint16_t*)(uintptr_t)o, (const int32_t*)(uintptr_t)cu, total_q, gqa, hpb,
+                q_ld, k_ld, v_ld, o_ld, scale, align16);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
