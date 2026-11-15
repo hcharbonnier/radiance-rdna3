@@ -1490,10 +1490,12 @@ static const RadConstraint cMlaAttnPaged[] = {
 static const RadConstraint cKvI8[] = { C_IN("kv_dtype", "i8"), C_EQ("head_dim", 256),
                                        C_EQ("block_size", 16) };
 static const RadConstraint cRopeTableF32[] = { C_IN("dtype", "f32"), C_EQ("rot", 64),
-                                               C_EQ("M", 64) };
+                                               C_GE("M", 1), C_LE("M", 64) };
+/* The 27B calls imrope once for q (24 heads, no KV) and once for k (4 heads, no KV); the fused
+ * q+k form (24/4) is Flash-Next's. The shim reads the width from the pair and refuses the rest. */
 static const RadConstraint cRopeImrope[] = { C_IN("mode", "imrope"), C_EQ("head_dim", 256),
-                                             C_EQ("n_head", 24), C_EQ("n_head_kv", 4),
-                                             C_EQ("rotary_dim", 64) };
+                                             C_EQ("rotary_dim", 64), C_GE("n_head", 1),
+                                             C_LE("n_head", 24), C_LE("n_head_kv", 4) };
 
 static const RadConstraint cEmbed[] = { C_IN("dtype", "bf16"), C_DIV("n_embd", 2) };
 /* An IQR table: the gather decodes the rows it is asked for, so n_embd is whole 128-blocks. */
