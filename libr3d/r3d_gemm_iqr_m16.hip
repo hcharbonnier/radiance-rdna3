@@ -35,6 +35,14 @@
  *
  * K and N must be multiples of 128 and 16 and the trellis run must divide N; the shim refuses
  * everything else.
+ *
+ * ---- split-K ------------------------------------------------------------------------------------
+ *
+ * At M = 1 with a narrow N (the `down` shape) one wave a 16-row tile leaves the card underfilled.
+ * The shim hands that band to r3d_gemm_iqr_splitk.hip when the row's scratch holds the partials the
+ * scratch hook sizes; the kernel below is untouched and serves every other geometry, so a caller
+ * without scratch still gets the exact bytes it got before. The split's arithmetic and its one
+ * documented rounding difference are described in that unit.
  */
 #include "r3d_args.h"
 #include "r3d_codecs.h"
@@ -429,8 +437,30 @@ static int launch_wmma(const uint8_t* b, const uint8_t* bs, long a, long as, lon
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+/* The split-K slice rule and launcher (r3d_gemm_iqr_splitk.hip). */
+extern "C" int r3d_iqr_split_slices(long long N, long long K);
+extern "C" int r3d_gemm_iqr_splitk(long a, long as, long b, long bs, long y, int N, int K,
+                                   uint32_t word, int splits, long scratch, long stream);
+
+/* The row's scratch hook: [splits][N] f32 partials for the split band, nothing otherwise. The hook
+ * runs at declare, where the m16 row's M is the band's upper bound (16), so it keys on N and K
+ * only: the split is chosen by the geometry, not by the launch's M. N and K are the logical
+ * extents. Attaching scratch makes the row non-concurrent (rad_kernel_concurrent is
+ * `scratch == nullptr`), the price of the partials; the narrow band pays it at every height because
+ * the hook cannot see a launch's M. */
+extern "C" int64_t r3d_rad_gemm_nt_q_iqr_m16_scratch(const RadArgs* a) {
+    if (!a) return 0;
+    long long N = 0, K = 0;
+    if (!rad_args_geti(a, "N", &N) || !rad_args_geti(a, "K", &K)) return 0;
+    const int splits = r3d_iqr_split_slices(N, K);
+    if (splits <= 1) return 0;
+    const long long bytes = (long long)splits * N * 4;
+    return (bytes + 255) & ~255ll;   /* the arena is page-aligned; keep the request 256-multiple */
+}
+
 extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M, int N, int K,
-                                int a_ld, int y_ld, uint32_t word, long stream) {
+                                int a_ld, int y_ld, uint32_t word, long scratch, long scratch_bytes,
+                                long stream) {
     const Form f = form(word);
     if (!form_supported(f)) return -6;
     if (!a || !as || !b || !bs || !y) return -1;
@@ -449,6 +479,16 @@ extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M,
         return -5;
     const uint8_t* B_ = (const uint8_t*)b;
     const uint8_t* S_ = (const uint8_t*)bs;
+
+    /* The split band: the GEMV (M = 1) at a narrow N, when the caller's scratch holds the
+     * partials the row's hook asked for. Without it the unsplit path below runs, unchanged, so a
+     * direct caller that allocates no scratch still gets the old kernel and bytes. */
+    if (mt == 1) {
+        const int splits = r3d_iqr_split_slices(N, K);
+        if (splits > 1 && scratch &&
+            scratch_bytes >= (long long)splits * N * (long long)sizeof(float))
+            return r3d_gemm_iqr_splitk(a, as, b, bs, y, N, K, word, splits, scratch, stream);
+    }
 
 #define R3D_IQR_SC_CASE(B)                                                                        \
     do {                                                                                          \
@@ -575,7 +615,7 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* arg, RadStream s) {
 
     const int rc = r3d_gemm_iqr_m16(r3d_addr(A), r3d_addr(AS), r3d_addr(B), r3d_addr(BS),
                                     r3d_addr(Y), (int)M, (int)N, (int)K, (int)ap, (int)yp,
-                                    B->dtype, (long)s);
+                                    B->dtype, (long)arg->scratch, arg->scratch_bytes, (long)s);
     if (rc == -1) return R3D_NO(RAD_E_INVAL);
     if (rc == -2) return R3D_NO(RAD_E_SHAPE);
     if (rc == -3) return R3D_NO(RAD_E_STRIDE);

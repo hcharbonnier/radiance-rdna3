@@ -42,6 +42,7 @@ typedef int (*RelayoutFn)(const RadParam*, int, int, const RadEncoding*, const i
                           int, void*, int64_t);
 typedef int (*LaunchFn)(const RadArgs*, RadStream);
 typedef int64_t (*ScratchFn)(const RadArgs*);
+typedef int (*SlicesFn)(long long, long long);
 
 struct Lib {
     void* h = nullptr;
@@ -52,7 +53,9 @@ struct Lib {
     LaunchFn gated = nullptr;
     LaunchFn fused = nullptr;
     LaunchFn logits = nullptr;
+    ScratchFn gemm_scratch = nullptr;
     ScratchFn logits_scratch = nullptr;
+    SlicesFn slices = nullptr;
     bool ok() const { return h && layout && relayout && gemm; }
 };
 
@@ -68,7 +71,9 @@ Lib& lib() {
         x.gated = (LaunchFn)dlsym(x.h, "r3d_rad_gated_had_quant_i8g");
         x.fused = (LaunchFn)dlsym(x.h, "r3d_rad_gemm_nt_q_iqr_gated");
         x.logits = (LaunchFn)dlsym(x.h, "r3d_rad_logits_gemm_vocab_iqr");
+        x.gemm_scratch = (ScratchFn)dlsym(x.h, "r3d_rad_gemm_nt_q_iqr_m16_scratch");
         x.logits_scratch = (ScratchFn)dlsym(x.h, "r3d_logits_gemm_vocab_iqr_scratch");
+        x.slices = (SlicesFn)dlsym(x.h, "r3d_iqr_split_slices");
         return x;
     }();
     return l;
@@ -200,35 +205,60 @@ struct Case {
     Scale sc;
     int64_t N, K;
     int M;
+    bool split = false;   /* ask the row for its split-K scratch (the GEMV's narrow band) */
 };
+
+/* Split-K sums S slab partials instead of the reference's one ascending chain: the same group
+ * terms, associated differently. The seeded down fixture measures zero bf16 ulp of difference; two
+ * covers a value that sits on a bf16 rounding boundary and is still orders below any decode or
+ * scale error. */
+constexpr int kSplitMaxUlps = 2;
+
+/* The decoded weight, row-major [N, K]. The values are canonical_state's, one (n, k) at a time,
+ * but the state advances by one code as n rises inside a 256-row run instead of restarting from
+ * the run's seed: N * K steps rather than N * K * run. The down shape (5120 x 17408) is otherwise
+ * too slow for the device test. */
+std::vector<int8_t> decode_rows(const W& w, uint32_t B, uint32_t L, uint32_t RB, Scale sc,
+                                int64_t N, int64_t K, const uint8_t* sb, int64_t nkb) {
+    const Form f{ kTrellisMad, B, 0, L, RB, sc, 0, 0 };
+    const uint32_t A = ((const uint32_t*)(w.data[(size_t)w.find("trellis.mad")].data()))[0];
+    const uint32_t Bc = ((const uint32_t*)(w.data[(size_t)w.find("trellis.mad")].data()))[1];
+    std::vector<int8_t> dec((size_t)(N * K));
+    const int64_t run = 256;
+    const uint32_t mask = (1u << L) - 1u;
+    const int64_t nspan = (L + B - 1) / B;
+    for (int64_t base = 0; base < N; base += run) {
+        const int64_t len = (N - base < run) ? N - base : run;
+        for (int64_t k = 0; k < K; ++k) {
+            uint32_t st = 0;
+            for (int64_t j = 0; j < nspan; ++j)
+                st = ((st << B) | code_at(w, base + run - nspan + j, k, B)) & mask;
+            for (int64_t j = 0; j < len; ++j) {
+                const int64_t n = base + j;
+                st = ((st << B) | code_at(w, n, k, B)) & mask;
+                int v = mad_value(st, A, Bc);
+                if (RB) {
+                    const int64_t i = tile_major(n, (uint32_t)(k / 128), nkb);
+                    const float own = bf16_to_f32(*(const uint16_t*)(sb + i * 2));
+                    const uint16_t* bp = (const uint16_t*)(sb + blk_off(f, N, K));
+                    const float bb = bf16_to_f32(bp[(n >> RB) * nkb + k / 128]);
+                    const float rq = bb > 0.0f ? own / bb : 0.0f;
+                    v = (int)std::nearbyintf((float)v * rq);
+                }
+                dec[(size_t)(n * K + k)] = (int8_t)v;
+            }
+        }
+    }
+    return dec;
+}
 
 /* The host answer: the decoded weight, then the int8 grid's order. */
 std::vector<uint16_t> reference(const W& w, const Case& c, const std::vector<int8_t>& a,
                                 const std::vector<float>& as, const uint8_t* sb, int64_t sbytes) {
-    const uint32_t run_tiles = 16;   /* the table's run is 256 rows (tcq_rows) */
-    const Form f{ kTrellisMad, c.B, 0, c.L, c.RB, c.sc, 0, 0 };
     const int64_t nkb = c.K / 128;
     (void)sbytes;
-    const uint32_t A = ((const uint32_t*)(w.data[(size_t)w.find("trellis.mad")].data()))[0];
-    const uint32_t Bc = ((const uint32_t*)(w.data[(size_t)w.find("trellis.mad")].data()))[1];
-    std::vector<int8_t> dec((size_t)(c.N * c.K));
-    const int64_t run = 256;
-    for (int64_t n = 0; n < c.N; ++n) {
-        for (int64_t k = 0; k < c.K; ++k) {
-            const uint32_t kb = (uint32_t)(k / 128);
-            const uint32_t st = canonical_state(w, c.B, c.L, run, n, k);
-            int v = mad_value(st, A, Bc);
-            if (c.RB) {
-                const int64_t i = tile_major(n, kb, nkb);
-                const float own = bf16_to_f32(*(const uint16_t*)(sb + i * 2));
-                const uint16_t* bp = (const uint16_t*)(sb + blk_off(f, c.N, c.K));
-                const float bb = bf16_to_f32(bp[(n >> c.RB) * nkb + kb]);
-                const float rq = bb > 0.0f ? own / bb : 0.0f;
-                v = (int)std::nearbyintf((float)v * rq);
-            }
-            dec[(size_t)(n * c.K + k)] = (int8_t)v;
-        }
-    }
+    const Form f{ kTrellisMad, c.B, 0, c.L, c.RB, c.sc, 0, 0 };
+    const std::vector<int8_t> dec = decode_rows(w, c.B, c.L, c.RB, c.sc, c.N, c.K, sb, nkb);
     /* The scales the GEMM folds. */
     std::vector<uint16_t> y((size_t)(c.M * c.N));
     for (int m = 0; m < c.M; ++m)
@@ -351,12 +381,14 @@ bool run_case(const Case& c) {
     std::vector<uint16_t> y((size_t)(c.M * c.N), 0xDEADu);
 
     void *dA = nullptr, *dS = nullptr, *dB = nullptr, *dBS = nullptr, *dY = nullptr;
+    void* dPart = nullptr;
     auto clean = [&] {
         hipFree(dA);
         hipFree(dS);
         hipFree(dB);
         hipFree(dBS);
         hipFree(dY);
+        hipFree(dPart);
     };
     if (hipMalloc(&dA, a.size()) != hipSuccess) return false;
     if (hipMalloc(&dS, as.size() * 4) != hipSuccess) { clean(); return false; }
@@ -410,6 +442,47 @@ bool run_case(const Case& c) {
     args.p = params;
     args.n_p = 5;
     args.kv_used_max_h = -1;
+
+    /* The GEMV's split band: the row's own scratch hook sizes [splits][N] f32 partials. The hook
+     * is queried for every GEMV case, so the wide shape (no split) must answer 0, and a case that
+     * asks for the split must get a buffer at least the logical size. */
+    int splits = 1;
+    int64_t npart = 0;
+    if (c.M <= 16 && lib().gemm_scratch) {
+        npart = lib().gemm_scratch(&args);
+        if (lib().slices) splits = lib().slices(c.N, c.K);
+        if (c.split) {
+            if (!lib().slices || splits < 2) {
+                std::fprintf(stderr, "%s: the row does not split this geometry\n", c.what);
+                clean();
+                return false;
+            }
+            if (npart < (int64_t)splits * c.N * 4) {
+                std::fprintf(stderr, "%s: scratch hook answered %lld bytes, needs %lld\n", c.what,
+                             (long long)npart, (long long)((int64_t)splits * c.N * 4));
+                clean();
+                return false;
+            }
+            if (hipMalloc(&dPart, (size_t)npart) != hipSuccess) {
+                clean();
+                return false;
+            }
+            /* Poison: every partial the split writes must replace these NaNs. */
+            hipMemset(dPart, 0x7F, (size_t)npart);
+            args.scratch = dPart;
+            args.scratch_bytes = npart;
+        } else if (c.M == 1 && c.N > 8192 && npart != 0) {
+            std::fprintf(stderr, "%s: the wide GEMV must not ask for split scratch (%lld)\n",
+                         c.what, (long long)npart);
+            clean();
+            return false;
+        }
+    } else if (c.split) {
+        std::fprintf(stderr, "%s: the row has no scratch hook\n", c.what);
+        clean();
+        return false;
+    }
+
     const int rc = (c.M > 16 ? lib().tiled : lib().gemm)(&args, (RadStream)0);
     const hipError_t he = hipDeviceSynchronize();
     if (rc != RAD_OK || he != hipSuccess) {
@@ -418,15 +491,42 @@ bool run_case(const Case& c) {
         return false;
     }
     hipMemcpy(y.data(), dY, y.size() * 2, hipMemcpyDeviceToHost);
+    if (c.split) {
+        std::vector<float> part((size_t)((int64_t)splits * c.N));
+        hipMemcpy(part.data(), dPart, part.size() * 4, hipMemcpyDeviceToHost);
+        size_t unwritten = 0;
+        for (float v : part)
+            if (!std::isfinite(v)) ++unwritten;
+        if (unwritten) {
+            std::fprintf(stderr, "%s: %zu of %zu split partials were never written\n", c.what,
+                         unwritten, part.size());
+            clean();
+            return false;
+        }
+    }
     clean();
 
     const std::vector<uint16_t> want = reference(w, c, a, as, sbs.data(), (int64_t)sbs.size());
-    size_t bad = 0, first = y.size();
-    for (size_t i = 0; i < y.size(); ++i)
-        if (y[i] != want[i]) {
+    /* bf16 ordered key: monotonically increasing across the sign, so a difference of 1 is one
+     * representable bf16 step. */
+    const auto order = [](uint16_t h) {
+        return (h & 0x8000u) ? -(int)(h & 0x7fffu) : (int)h;
+    };
+    size_t bad = 0, first = y.size(), nonzero = 0;
+    int worst = 0;
+    for (size_t i = 0; i < y.size(); ++i) {
+        const int gap = std::abs(order(y[i]) - order(want[i]));
+        if (gap) ++nonzero;
+        if (gap > worst) worst = gap;
+        const bool differs = c.split ? gap > kSplitMaxUlps : gap != 0;
+        if (differs) {
             ++bad;
             if (first == y.size()) first = i;
         }
+    }
+    if (c.split)
+        std::printf("%s: worst %d bf16 ulp, %zu of %zu outputs differ (tolerance %d)\n", c.what,
+                    worst, nonzero, y.size(), kSplitMaxUlps);
     if (bad) {
         std::fprintf(stderr, "%s: %zu of %zu differ; first y[%zu]: got 0x%04x want 0x%04x "
                      "(got %.6f want %.6f)\n",
@@ -672,6 +772,7 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
     const Case cases[] = {
         { "mad u4 L16 one-f32-row, GEMV", 4, 16, 0, kRowF32, 512, 384, 1 },
         { "mad u4 L16 one-f32-row, 16 tokens", 4, 16, 0, kRowF32, 512, 384, 16 },
+        { "mad u4 L16 one-f32-row, wide GEMV (no split)", 4, 16, 0, kRowF32, 12288, 1280, 1 },
         { "mad u4 L16 one-f32-row, 2 tokens", 4, 16, 0, kRowF32, 256, 512, 2 },
         { "mad u4 L16 bf16, 5 tokens", 4, 16, 0, kBf16, 256, 256, 5 },
         { "mad u4 L16 bf16, 16 tokens", 4, 16, 0, kBf16, 256, 512, 16 },
@@ -681,6 +782,12 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
         { "mad u4 L16 bf16, 512 tokens (WMMA)", 4, 16, 0, kBf16, 256, 384, 512 },
         { "mad u4 L16 one-f32-row, 512 tokens (WMMA)", 4, 16, 0, kRowF32, 512, 384, 512 },
         { "mad u4 L16 bf16, 4096 tokens (WMMA)", 4, 16, 0, kBf16, 256, 384, 4096 },
+        /* The 27B's down vector (N = 5120, K = 17408, u4, one f32 scale a row, M = 1): the shape
+         * the W0 table measures at 51.5 %. It takes the split band, so the comparison is in bf16
+         * ulps (2). Every other case above stays bit-identical: it either passes no scratch (the
+         * shim's unsplit fallback) or is wide enough that the split rule declines. */
+        { "down 5120x17408 u4 L16 one-f32-row, GEMV split-K", 4, 16, 0, kRowF32, 5120, 17408, 1,
+          true },
     };
     for (const Case& c : cases) CHECK(run_case(c));
 }

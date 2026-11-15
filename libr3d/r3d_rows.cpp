@@ -1412,6 +1412,10 @@ static int64_t attn_h256_scratch(const RadArgs* a) {
     return want < cap ? want : cap;
 }
 
+/* The IQR GEMV's split-K partials (r3d_gemm_iqr_m16.hip): [splits][N] f32 for the narrow band, 0
+ * otherwise. Declared here because the plugin's own header is not the ABI. */
+extern "C" int64_t r3d_rad_gemm_nt_q_iqr_m16_scratch(const RadArgs* a);
+
 /* A split's partials are f32 over the output, plus one arrival counter per split. Sized at the
  * band's bounds and the axis's widest split, because a scratch hook runs at declare, where the
  * range may still be open: the buffer must hold any point the tuner can pick. */
@@ -2958,7 +2962,9 @@ static const RadKernelInfo kKernels[] = {
   "wave a 16-row tile, each lane its 32-lane segment of a unit; at M = 1 the lanes dot their four "
   "columns and fold the group in LDS, above 1 the tile is staged and each lane owns whole "
   "(token, row) pairs",
-  "M <= 16; K a multiple of 128 and N of 16; a trellis run divides N. W0 reads the computed "
+  "M <= 16; K a multiple of 128 and N of 16; a trellis run divides N. At M = 1 with N <= 8192 "
+  "the GEMV splits K over 8, 4 or 2 whole-group slices through the row's scratch, reduced in "
+  "split order; wider N and M > 1 keep the unsplit kernel. W0 reads the computed "
   "trellis (tcq_code=mad, L = 16) under one f32 scale a row or a bf16 scale a (row, 128); the "
   "table and grid forms are refused until the MoE lot",
   "I8 a row-major with an f32 scale per (row, 128 of K), W an IQR form's codes decoding to int8 "
@@ -2966,8 +2972,8 @@ static const RadKernelInfo kKernels[] = {
   "own factor in the epilogue under kRowF32",
   RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_M16,
   ROW(cGemmQIqrM16), NOTUNE,
-  nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_m16,
-  nullptr, r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_m16, r3d_rad_gemm_nt_q_iqr_m16_scratch,
+  r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
   r3d_shape_gemm_nt_q, r3d_rad_unrelayout_iqr },
 
 { "gemm_iqr_tiled", "gemm_nt_q", "gemm",

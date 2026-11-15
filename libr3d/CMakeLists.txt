@@ -71,6 +71,10 @@ set(R3D_UNITS
   # The IQR weight at decode heights (W0/W3): the computed trellis decoded where it is read, one
   # wave a 16-row tile, v_dot4 for the group sub-sums.
   "r3d_gemm_iqr_m16|"
+  # Split-K for that GEMV's narrow-N band: whole 128-K slices into f32 partials, reduced in split
+  # order. The unsplit kernel above is untouched; the shim picks this one only when M = 1, N is
+  # narrow, and the row's scratch holds the partials.
+  "r3d_gemm_iqr_splitk|"
   # The i8a8h gated fold (the int8 trunk's feed-forward): one workgroup a 128-column group, the
   # gate's and the up's IQR decode, the gate, the bf16 rounding, the Hadamard and the codes in one
   # launch, with no [M,N] intermediate and no scratch.
