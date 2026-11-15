@@ -382,21 +382,41 @@ extern "C" int r3d_rad_moe_gemm_iqr(const RadArgs* a, RadStream s) {
     const long long a_group = r3d_geti_or(a, "a_group", 128);
     if (group != 128) return R3D_NO(RAD_E_SHAPE);
     if (a_group != 128 && a_group != 256) return R3D_NO(RAD_E_UNSUPPORTED);
-    if (N <= 0 || K <= 0 || T <= 0) return R3D_NO(RAD_E_SHAPE);
+    if (N <= 0 || K <= 0) return R3D_NO(RAD_E_SHAPE);
     if (K % 128 || K % a_group) return R3D_NO(RAD_E_SHAPE);
     if (N % (long long)kCols) return R3D_NO(RAD_E_SHAPE);
     const long long parts = r3d_geti_or(a, "parts", 1);
-    if (parts < 1 || N % (16 * parts)) return R3D_NO(RAD_E_SHAPE);
+    if (parts < 1 || parts > N / 16 || N % (16 * parts)) return R3D_NO(RAD_E_SHAPE);
     const long long run = 1ll << f.lrun;
     if (f.lrun < 4 || f.lrun > 15 || N % run) return R3D_NO(RAD_E_SHAPE);
-    if (T > 0x7FFFFFFFll || E * T > 0x7FFFFFFFll) return R3D_NO(RAD_E_SHAPE);
+    if (T > 0x7FFFFFFFll) return R3D_NO(RAD_E_SHAPE);
+    if (N > 0x7FFFFFFFll || K > 0x7FFFFFFFll) return R3D_NO(RAD_E_SHAPE);
+
+    /* The activation and its scales must carry every token the slots name. The contract's own
+     * check uses T / top_k, which is one row short when top_k does not divide T. */
+    long long ar = 0, ak = 0, asr = 0, asc = 0;
+    if (r3d_rows_of(c.a, &ar, &ak) != RAD_OK || r3d_rows_of(c.a_scale, &asr, &asc) != RAD_OK)
+        return R3D_NO(RAD_E_SHAPE);
+    const long long trows = c.a_sorted ? T : (T + c.top_k - 1) / c.top_k;
+    if (ar < trows || asr < trows || asc < K / a_group) return R3D_NO(RAD_E_SHAPE);
+
+    /* IQR weights are pointer tables (libr4d's r4d_moe_iqr takes the same contract): an entry is a
+     * whole layout buffer with its own aux and scales, so a stacked plane's stride[0] would not be
+     * the entry's byte size and is refused rather than read at the wrong offset. */
+    if (c.w->stride[0] != 0 || c.w_scale->stride[0] != 0 ||
+        (E >= 2 && (c.w_odd->stride[0] != 0 || c.w_odd_scale->stride[0] != 0)))
+        return R3D_NO(RAD_E_UNSUPPORTED);
 
     R3dMoeTabs tw;
     rc = r3d_moe_q_tabs(c, c.w->dtype, (int)f.bits, c.w_scale->dtype, 32, 1, 1, &tw);
     if (rc != RAD_OK) return rc;
 
-    const int a_ld = (int)c.a->stride[0], as_ld = (int)c.a_scale->stride[0];
-    const int y_ld = (int)c.y->stride[0];
+    const long long a_ld64 = c.a->stride[0], as_ld64 = c.a_scale->stride[0];
+    const long long y_ld64 = c.y->stride[0];
+    if (a_ld64 > 0x7FFFFFFFll || as_ld64 > 0x7FFFFFFFll || y_ld64 > 0x7FFFFFFFll)
+        return R3D_NO(RAD_E_STRIDE);
+    const int a_ld = (int)a_ld64, as_ld = (int)as_ld64;
+    const int y_ld = (int)y_ld64;
     if (a_ld < K || a_ld % 4 || as_ld < K / a_group || y_ld < N)
         return R3D_NO(RAD_E_STRIDE);
     if (!r3d_aligned(r3d_p(c.a), 4) || !r3d_aligned(r3d_p(c.a_scale), 4) ||
@@ -411,6 +431,7 @@ extern "C" int r3d_rad_moe_gemm_iqr(const RadArgs* a, RadStream s) {
         const long long cap = map_cap(T, E);
         const long long need = map_bytes(T, E);
         if (!a->scratch || a->scratch_bytes < need) return R3D_NO(RAD_E_SCRATCH);
+        if (!r3d_aligned(a->scratch, 4)) return R3D_NO(RAD_E_ALIGN);
         map = (uint32_t*)a->scratch;
         R3D_KLAUNCH(moe_iqr_blockmap_kernel, dim3(1), dim3(256), (hipStream_t)s,
                     (const int32_t*)r3d_p(c.off), (uint32_t)E, (uint32_t)T, (uint32_t)kMapRows,
@@ -477,6 +498,7 @@ extern "C" int64_t r3d_rad_moe_gemm_iqr_scratch(const RadArgs* a) {
         !rad_args_geti(a, "M", &M))
         return 0;
     if (n_expert <= 0 || n_expert > (long long)kMaxExpert || top_k <= 0 || M <= 0) return 0;
+    if (M > 0x7FFFFFFFll / top_k) return 0;   /* the launch refuses a T past int32 */
     const long long T = M * top_k;
     if (2 * T <= 3 * n_expert) return 0;
     return map_bytes(T, n_expert);

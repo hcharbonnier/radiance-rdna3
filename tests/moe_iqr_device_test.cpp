@@ -548,6 +548,10 @@ TEST(moe_iqr_decode_parts) {
 TEST(moe_iqr_decode_two_bit) {
     CHECK(run_case(Case{ "decode B=2 N=64", 2, 6, 64, 128, 128, 4, 1, 2, 1, 0, 0, 1 }));
 }
+/* lrun = 4 is a 16-row trellis run, one tile: the seed is the tile's own last row. */
+TEST(moe_iqr_decode_run_16) {
+    CHECK(run_case(Case{ "decode run=16", 4, 4, 128, 128, 128, 8, 2, 6, 1, 0, 0, 2 }));
+}
 TEST(moe_iqr_decode_all_dropped) {
     CHECK(run_case(Case{ "decode all dropped", 4, 6, 128, 128, 128, 4, 1, 4, 1, 0, 0, 4 }));
 }
