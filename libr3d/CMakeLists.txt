@@ -71,6 +71,8 @@ set(R3D_UNITS
   # The IQR weight at decode heights (W0/W3): the computed trellis decoded where it is read, one
   # wave a 16-row tile, v_dot4 for the group sub-sums.
   "r3d_gemm_iqr_m16|"
+  # The embedding table at its codes' width: the gather decodes the rows it is asked for.
+  "r3d_iqr_embed|"
   # The wave-matrix arm of the w8a8 grid: V_WMMA_I32_16X16X16_IU8 chains an exact i32 group
   # sub-sum, the group term the reference's. The `impl` point of the dot2 arm's row.
   "r3d_gemm_inta8_wmma|"

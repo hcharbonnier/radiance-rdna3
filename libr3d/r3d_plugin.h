@@ -401,6 +401,22 @@ int r3d_shape_gemm_nt_q_w8a8(const RadParam* p, int n_p, int operand, RadOpdDesc
  * layout hooks reorder the container's codes into the lane segments the decoder reads and invert;
  * the shim refuses the forms the W0 kernel does not decode yet. --- */
 int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* a, RadStream s);
+int r3d_rad_gemm_nt_q_iqr_tiled(const RadArgs* a, RadStream s);
+int r3d_rad_embed_lookup_iqr(const RadArgs* a, RadStream s);
+int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream s);
+int r3d_rad_layout_iqr_embed(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                             const int* sel, const RadTensor* pl, int n, RadLayout* out);
+int r3d_rad_relayout_iqr_embed(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                               const int* sel, const RadTensor* pl, int n, void* dst,
+                               int64_t dst_bytes);
+int r3d_rad_layout_iqr_vocab(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                             const int* sel, const RadTensor* pl, int n, RadLayout* out);
+int r3d_rad_relayout_iqr_vocab(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                               const int* sel, const RadTensor* pl, int n, void* dst,
+                               int64_t dst_bytes);
+int r3d_rad_unrelayout_iqr_vocab(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                 const int* sel, const void* src, int64_t src_bytes,
+                                 const RadTensor* pl, int n);
 int r3d_rad_layout_iqr(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                        const int* sel, const RadTensor* pl, int n, RadLayout* out);
 int r3d_rad_relayout_iqr(const RadParam* p, int n_p, int operand, const RadEncoding* enc,

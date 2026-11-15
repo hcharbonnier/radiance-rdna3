@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -127,6 +128,8 @@ uint32_t Builder::err(int code, const char* f, ...) {
     vsnprintf(msg, sizeof msg, f, ap);
     va_end(ap);
     errors_.emplace_back(msg);
+    if (std::getenv("RAD_BUILD_TRACE"))
+        std::fprintf(stderr, "[build] err %d: %s\n", code, msg);
     /* First class wins; later errors are usually consequences, and the list keeps them all. */
     if (status_ == RAD_OK) status_ = code;
     RAD_ERR("declare: %s", msg);
@@ -541,6 +544,11 @@ void Builder::resolve_bands(OpInfo& oi) {
             RadTensor t[RAD_ENC_MAX_PLANES];
             weight_planes(w, t);
             std::string why = weight_refusal(ki, g, operand, w.enc, w.sel, t, w.n_sel, w.name);
+            /* RAD_BUILD_TRACE: every row that turns a weight down says why, the one record of a
+             * declaration that failed for want of a kernel. */
+            if (!why.empty() && std::getenv("RAD_BUILD_TRACE"))
+                std::fprintf(stderr, "[build] weight[%zu] '%s': row %s refused: %s\n", wi,
+                             w.name.c_str(), ki->name ? ki->name : "?", why.c_str());
             if (!why.empty()) return why;
         }
         return std::string();

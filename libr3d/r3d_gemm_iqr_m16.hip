@@ -224,6 +224,36 @@ extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M,
 #undef R3D_IQR_MT_CASE
 }
 
+/* The tiled row's launch: M chunks of 16 through the m16 kernel. Correct and enough to declare
+ * and serve; W4 replaces it with a tile that keeps the weight resident across its M, and W12 with
+ * WMMA. Each chunk re-reads the weight, so this is a placeholder for prefill shapes. */
+extern "C" int r3d_gemm_iqr_tiled(long a, long as, long b, long bs, long y, int M, int N, int K,
+                                  int a_ld, int y_ld, uint32_t word, long stream) {
+    const Form f = form(word);
+    if (!form_supported(f)) return -6;
+    if (!a || !as || !b || !bs || !y) return -1;
+    if (M < 1 || N < 1 || K < 128) return -2;
+    if (N % 16 || K % 128) return -2;
+    const unsigned lrun = (unsigned)((word >> 22) & 15u);
+    if (lrun < 4 || (N % (int)(1u << lrun))) return -2;
+    if (!a_ld) a_ld = K;
+    if (!y_ld) y_ld = N;
+    if (a_ld < K || a_ld % 4 || y_ld < N) return -3;
+    if (((uintptr_t)a & 3u) || ((uintptr_t)as & 3u) || ((uintptr_t)b & 15u) ||
+        ((uintptr_t)bs & 15u) || ((uintptr_t)y & 1u))
+        return -5;
+    const int64_t nkb = K / 128;
+    for (int m0 = 0; m0 < M; m0 += 16) {
+        const int mt = M - m0 < 16 ? M - m0 : 16;
+        const int rc = r3d_gemm_iqr_m16(a + (long long)m0 * a_ld,
+                                        as + (long long)m0 * nkb * 4,
+                                        b, bs, y + (long long)m0 * y_ld * 2, mt, N, K, a_ld, y_ld,
+                                        word, stream);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
 extern "C" int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* arg, RadStream s) {
     if (!arg) return R3D_NO(RAD_E_INVAL);
     const char* dt = r3d_gets(arg, "dtype");
@@ -279,6 +309,61 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* arg, RadStream s) {
     const int rc = r3d_gemm_iqr_m16(r3d_addr(A), r3d_addr(AS), r3d_addr(B), r3d_addr(BS),
                                     r3d_addr(Y), (int)M, (int)N, (int)K, (int)ap, (int)yp,
                                     B->dtype, (long)s);
+    if (rc == -1) return R3D_NO(RAD_E_INVAL);
+    if (rc == -2) return R3D_NO(RAD_E_SHAPE);
+    if (rc == -3) return R3D_NO(RAD_E_STRIDE);
+    if (rc == -5) return R3D_NO(RAD_E_ALIGN);
+    if (rc == -6) return R3D_NO(RAD_E_UNSUPPORTED);
+    if (rc == -4) return R3D_NO(RAD_E_DEVICE);
+    return RAD_OK;
+}
+
+extern "C" int r3d_rad_gemm_nt_q_iqr_tiled(const RadArgs* arg, RadStream s) {
+    if (!arg) return R3D_NO(RAD_E_INVAL);
+    const char* dt = r3d_gets(arg, "dtype");
+    if (dt && std::strcmp(dt, "i8a8h") != 0) return R3D_NO(RAD_E_DTYPE);
+
+    const RadTensor* A = r3d_opt(arg, 0);
+    const RadTensor* AS = r3d_opt(arg, 1);
+    const RadTensor* B = r3d_opt(arg, 2);
+    const RadTensor* BS = r3d_opt(arg, 3);
+    const RadTensor* Y = r3d_opt(arg, 4);
+    const RadTensor* ASUM = r3d_opt(arg, 5);
+    const RadTensor* BREF = r3d_opt(arg, 6);
+    if (!r3d_p(A) || !r3d_p(AS) || !r3d_p(B) || !r3d_p(BS) || !r3d_p(Y)) return R3D_NO(RAD_E_INVAL);
+    if (r3d_has(ASUM) || r3d_has(BREF)) return R3D_NO(RAD_E_DTYPE);
+    if (!r3d_is_i8(A) || !r3d_is_f32(AS) || !r3d_is_bf16(Y)) return R3D_NO(RAD_E_DTYPE);
+    if (!is_weight_dtype(B->dtype) || !is_scale_dtype(BS->dtype)) return R3D_NO(RAD_E_DTYPE);
+
+    const Form fw = form(B->dtype);
+    if (kernel_word(B->dtype) != kernel_word(BS->dtype)) return R3D_NO(RAD_E_DTYPE);
+    if (!form_supported(fw)) return R3D_NO(RAD_E_UNSUPPORTED);
+
+    const long long N = r3d_geti_or(arg, "N", 0), K = r3d_geti_or(arg, "K", 0);
+    if (N < 1 || K < 1 || K % 128 || N % 16) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_geti_or(arg, "group", 128) != 128) return R3D_NO(RAD_E_SHAPE);
+    const unsigned lrun = (unsigned)((B->dtype >> 22) & 15u);
+    if (lrun < 4 || (N % (long long)(1u << lrun))) return R3D_NO(RAD_E_SHAPE);
+
+    const long long ynel = r3d_numel(Y);
+    if (ynel % N) return R3D_NO(RAD_E_SHAPE);
+    const long long M = ynel / N;
+    if (M < 1) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(A) < M * K || r3d_numel(AS) < M * (K / 128)) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(B) != N * K || r3d_numel(BS) != N * (K / 128)) return R3D_NO(RAD_E_SHAPE);
+
+    const long long ap = r3d_row_pitch(A);
+    if (ap < K || ap % 4) return R3D_NO(RAD_E_STRIDE);
+    long long yrows = 0;
+    const long long yp = r3d_rows_pitch(Y, N, &yrows);
+    if (yp < N || yrows < M) return R3D_NO(RAD_E_STRIDE);
+    if (!r3d_aligned(r3d_p(A), 4) || !r3d_aligned(r3d_p(AS), 4) || !r3d_aligned(r3d_p(B), 16) ||
+        !r3d_aligned(r3d_p(BS), 16) || !r3d_aligned(r3d_p(Y), 2))
+        return R3D_NO(RAD_E_ALIGN);
+
+    const int rc = r3d_gemm_iqr_tiled(r3d_addr(A), r3d_addr(AS), r3d_addr(B), r3d_addr(BS),
+                                      r3d_addr(Y), (int)M, (int)N, (int)K, (int)ap, (int)yp,
+                                      B->dtype, (long)s);
     if (rc == -1) return R3D_NO(RAD_E_INVAL);
     if (rc == -2) return R3D_NO(RAD_E_SHAPE);
     if (rc == -3) return R3D_NO(RAD_E_STRIDE);

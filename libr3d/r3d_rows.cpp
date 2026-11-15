@@ -148,6 +148,24 @@ static const RadOperandSpec oEmbed[] = { { "tokens", RAD_OPD_IN, 0 },
                                          { "wte", RAD_OPD_WEIGHT, 0 },
                                          { "x", RAD_OPD_OUT, 0 } };
 
+/* The lm_head as up to four width classes, each a (codes, scales, ids) triple (r3d_iqr.h's lm
+ * form); `vrow` is the inverse. Copied from libr4d's schema: the op is device-only and no
+ * reference declares it. */
+static const RadParamSpec pLogitsVocab[] = {
+    { "M", RAD_P_INT, RAD_REQUIRED },       { "n_vocab", RAD_P_INT, RAD_REQUIRED },
+    { "n_embd", RAD_P_INT, RAD_REQUIRED },  { "dtype", RAD_P_STR, RAD_REQUIRED },
+    { "vocab_offset", RAD_P_INT, RAD_REQUIRED }, { "rows0", RAD_P_INT, RAD_REQUIRED },
+    { "rows1", RAD_P_INT, RAD_OPTIONAL },   { "rows2", RAD_P_INT, RAD_OPTIONAL },
+    { "rows3", RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oLogitsVocab[] = {
+    { "x", RAD_OPD_IN, 0 },      { "w0", RAD_OPD_WEIGHT, 0 }, { "s0", RAD_OPD_WEIGHT, 0 },
+    { "ids0", RAD_OPD_WEIGHT, 0 }, { "w1", RAD_OPD_WEIGHT, 1 }, { "s1", RAD_OPD_WEIGHT, 1 },
+    { "ids1", RAD_OPD_WEIGHT, 1 }, { "w2", RAD_OPD_WEIGHT, 1 }, { "s2", RAD_OPD_WEIGHT, 1 },
+    { "ids2", RAD_OPD_WEIGHT, 1 }, { "w3", RAD_OPD_WEIGHT, 1 }, { "s3", RAD_OPD_WEIGHT, 1 },
+    { "ids3", RAD_OPD_WEIGHT, 1 }, { "vrow", RAD_OPD_WEIGHT, 0 }, { "logits", RAD_OPD_OUT, 0 },
+};
+
 static const RadOperandSpec oGather[] = { { "x", RAD_OPD_IN, 0 }, { "idx", RAD_OPD_IN, 0 },
                                           { "y", RAD_OPD_OUT, 0 } };
 static const RadOperandSpec oScatter[] = { { "v", RAD_OPD_IN, 0 }, { "idx", RAD_OPD_IN, 0 },
@@ -687,6 +705,11 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("embed_lookup", pEmbed, oEmbed,
            "x[r] = wte[tokens[r] - vocab_offset] * wscale * mult, the id global and the table "
            "sharded by `vocab_offset`. An id outside the shard's range yields a zero row."),
+    SCHEMA("logits_gemm_vocab", pLogitsVocab, oLogitsVocab,
+           "logits[M, n_vocab] = x[M, n_embd] @ lm_head^T over a head stored as width classes of "
+           "the vocabulary's rows: class i is a weight of rows<i> rows on this rank (w<i> its "
+           "codes, s<i> its scales) and ids<i> the global id of each, whose logit it writes; ids "
+           "outside [vocab_offset, vocab_offset + n_vocab) are dropped. vrow is the inverse."),
     SCHEMA("gather_rows", pMnDtype, oGather, "y[r] = x[idx[r]], rows of n elements."),
     SCHEMA("scatter_rows", pMnDtype, oScatter, "x[idx[r]] = v[r], rows of n elements."),
     SCHEMA("quant_act_fp8", pQuant, oQuantFp8,
@@ -1316,6 +1339,10 @@ static const RadConstraint cMlaAttnPaged[] = {
 };
 
 static const RadConstraint cEmbed[] = { C_IN("dtype", "bf16"), C_DIV("n_embd", 2) };
+/* An IQR table: the gather decodes the rows it is asked for, so n_embd is whole 128-blocks. */
+static const RadConstraint cEmbedIqr[] = { C_IN("dtype", "bf16"), C_DIV("n_embd", 128) };
+/* The vocabulary-weighted IQR head: its classes and the activation quantiser assume whole 256. */
+static const RadConstraint cLogitsVocabIqr[] = { C_IN("dtype", "bf16"), C_DIV("n_embd", 256) };
 
 /* The gather's and scatter's dtype, and a row wide enough for a lane to own a pair. */
 static const RadConstraint cGatherBf16[]   = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
@@ -1348,9 +1375,10 @@ static const RadConstraint cHadQuantFp8[] = { C_IN("dtype", "bf16"), C_EQ("group
 static const RadConstraint cGatedHadQuantFp8[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
                                                    C_EQ("n", 128) };
 static const RadConstraint cQuantCols[] = { C_IN("dtype", "bf16"), C_DIV("n", 8) };
-static const RadConstraint cHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128), C_EQ("n", 128) };
+static const RadConstraint cHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
+                                              C_DIV("n", 128) };
 static const RadConstraint cGatedHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
-                                                   C_EQ("n", 128) };
+                                                   C_DIV("n", 128) };
 static const RadConstraint cRmsQuantI8[] = { C_IN("dtype", "bf16"), C_DIV("n", 16) };
 /* Not `C_IN("act", "silu sigmoid")`: `act` is optional on the op (a graph may carry libref's
  * integer `mode` instead, and libref defaults to silu), so a band with neither would match no row.
@@ -1495,6 +1523,10 @@ static const RadConstraint cGemmQW8A8M16[]  = { C_IN("dtype", "w8a8"),
 static const RadConstraint cGemmQIqrM16[]   = { C_IN("dtype", "i8a8h"), C_EQ("group", 128),
                                                 C_GE("M", 1), C_LE("M", 16), C_DIV("K", 128),
                                                 C_DIV("N", 16) };
+/* The same weight at any M: declare resolves the architecture at its widest bucket, so a row for
+ * M > 16 must exist even before the tiled kernel does. */
+static const RadConstraint cGemmQIqrTiled[] = { C_IN("dtype", "i8a8h"), C_EQ("group", 128),
+                                                C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16) };
 
 /* The w8a8 wave-matrix arm at prefill heights. 17 <= M <= 127 complements cGemmQW8A8M16's
  * M <= 16, so the two rows never compete for a band. K % 128 is the scale group. */
@@ -1854,6 +1886,30 @@ static const RadKernelInfo kKernels[] = {
   ROW(cEmbed), NOTUNE,
   nullptr, nullptr, r3d_rad_embed_lookup, nullptr, nullptr, nullptr, r3d_shape_embed_lookup },
 
+{ "embed_lookup_iqr", "embed_lookup", "gemm",
+  "embed_lookup over an IQR table (r3d_iqr.h's embed_off): each requested vocabulary row is "
+  "decoded from its codes, the rotated table's 128-wide Hadamard undone in f32, and scaled",
+  "n_embd a multiple of 128; a block a (token, 128-block) pair, 128 threads; a trellis run of 256 "
+  "rows",
+  "i32 tokens, an IQR table, bf16 x; ids outside the shard yield a zero row",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cEmbedIqr), NOTUNE,
+  nullptr, nullptr, r3d_rad_embed_lookup_iqr,
+  nullptr, r3d_rad_layout_iqr_embed, r3d_rad_relayout_iqr_embed,
+  r3d_shape_embed_lookup, nullptr },
+
+{ "logits_gemm_vocab_iqr", "logits_gemm_vocab", "vocab",
+  "the vocabulary-weighted IQR head: each class's computed-trellis codes decoded to int8 and "
+  "multiplied against the rotated, int8-quantised activation; the class's ids scatter the logits",
+  "any M; n_embd a multiple of 256; each class a multiple of 256 rows; runs of 256 rows",
+  "bf16 x rotated by fwht128 and quantised per (token, 128) into the call's scratch; classes of "
+  "tcq_code=mad codes under one f32 scale a row; F32 logits out",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
+  ROW(cLogitsVocabIqr), NOTUNE,
+  nullptr, nullptr, r3d_rad_logits_gemm_vocab_iqr, nullptr,
+  r3d_rad_layout_iqr_vocab, r3d_rad_relayout_iqr_vocab,
+  nullptr, r3d_rad_unrelayout_iqr_vocab },
+
 { "gather_rows_bf16", "gather_rows", "elem", "y[r] = x[idx[r]]",
   "any n; a workgroup a row", "bf16 rows, i32 indices",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
@@ -1996,8 +2052,8 @@ static const RadKernelInfo kKernels[] = {
 
 { "had_quant_act_i8g_bf16", "had_quant_act_i8g", "quant",
   "a 128-wide block Hadamard, then per-group int8: the rotated form for the int8 trunk GEMMs",
-  "n == group == 128 (single-group form, the FWHT runs once per wave so its DPP stages stay out of "
-  "a loop); the codes row-major for the i8a8 dot2 GEMM, the scale carrying the 1/sqrt(128)",
+  "n a multiple of 128, group 128 (one wave a (token, 128-group): the FWHT's DPP stages stay out "
+  "of a loop); the codes row-major for the i8a8 dot2 GEMM, the scale carrying the 1/sqrt(128)",
   "bf16 in, int8 codes (row-major), f32 scale per group",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cHadQuantI8g), NOTUNE,
@@ -2006,8 +2062,8 @@ static const RadKernelInfo kKernels[] = {
 
 { "gated_had_quant_i8g_bf16", "gated_had_quant_i8g", "quant",
   "a gated product (silu or sigmoid), a 128-wide block Hadamard, then per-group int8",
-  "n == group == 128 (single-group form, the FWHT runs once per wave so its DPP stages stay out of "
-  "a loop); the gated product in fp32, the codes row-major for the i8a8 dot2 GEMM, the scale "
+  "n a multiple of 128, group 128 (one wave a (token, 128-group): the FWHT's DPP stages stay out "
+  "of a loop); the gated product in fp32, the codes row-major for the i8a8 dot2 GEMM, the scale "
   "carrying the 1/sqrt(128)",
   "bf16 gate_up [M,2n], int8 codes (row-major), f32 scale per group, optional bf16 product",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
@@ -2651,6 +2707,20 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_M16,
   ROW(cGemmQIqrM16), NOTUNE,
   nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_m16,
+  nullptr, r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
+  r3d_shape_gemm_nt_q, r3d_rad_unrelayout_iqr },
+
+{ "gemm_iqr_tiled", "gemm_nt_q", "gemm",
+  "gemm_nt_q over an IQR weight above the decode band: W4's tiled kernel, and today a chunked "
+  "launch of gemm_iqr_nt_m64 (correct; every 16-row chunk re-reads the weight, so prefill waits "
+  "for the resident tile)",
+  "M >= 1, K a multiple of 128 and N of 16, a trellis run dividing N; same forms as the decode "
+  "band",
+  "I8 a row-major with an f32 scale per (row, 128 of K), W an IQR form's codes, bf16 y; per group "
+  "an exact i32 sub-sum and the reference's two f32 factors",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_TILED,
+  ROW(cGemmQIqrTiled), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_tiled,
   nullptr, r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
   r3d_shape_gemm_nt_q, r3d_rad_unrelayout_iqr },
 

@@ -8,9 +8,9 @@
  * quant_act_i8 (step-ordered) or had_quant_act_i8 (step-ordered), so a swapped graph would run as
  * a different model. The normalisation (1/sqrt(128)) is folded into the scale.
  *
- * gfx1102: the FWHT's cross-lane stages are DPP, and a DPP exchange in a loop body miscompiles here
- * (a non-first wave drops out). This serves the single-group form, n == group == 128: one wave runs
- * the whole FWHT with no group loop. A wider n is declined.
+ * One wave a (token, 128-column group): the wave runs the group's whole FWHT with no group loop,
+ * which is the form gfx1102 needs (a DPP exchange in a loop body miscompiles there) and lets a
+ * 5120- or 17408-wide activation run its 40 or 136 groups across the card.
  */
 #include "r3d.h"
 #include "r3d_args.h"
@@ -21,8 +21,7 @@
 
 namespace {
 
-constexpr uint32_t kThreads = 256;
-constexpr uint32_t kWaves = kThreads / kWave;
+constexpr uint32_t kThreads = 32;
 constexpr float kTopI8 = 127.0f;
 
 __device__ __forceinline__ float ld_bf(const uint16_t* p, uint32_t i) {
@@ -49,43 +48,29 @@ __device__ __forceinline__ float wave_max_f(float v) {
     return v;
 }
 
-__global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void had_quant_act_i8g_kernel(
+__global__ __launch_bounds__(kThreads) void had_quant_act_i8g_kernel(
     const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n) {
     constexpr int HAD = 128, VPL = HAD / 32;
-    __shared__ float lds[128];
-    __shared__ float red[kWaves];
-    const uint32_t row = blockIdx.x;
-    const uint16_t* a = x + (size_t)row * n;
-    uint8_t* qr = q + (size_t)row * n;
-    const uint32_t lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    static_assert(VPL == 4, "one wave's 32 lanes hold the group's 128 columns as four each");
+    const uint32_t row = blockIdx.x, kg = blockIdx.y;
+    const uint32_t nkb = n / 128u;
+    const uint32_t lane = threadIdx.x & 31;
+    const uint16_t* a = x + (size_t)row * n + (size_t)kg * HAD;
+    uint8_t* qr = q + (size_t)row * n + (size_t)kg * HAD;
 
+    const int base = lane * VPL;
+    float v[VPL];
+#pragma unroll
+    for (int j = 0; j < VPL; ++j) v[j] = ld_bf(a, base + j);
+    r3d_fwht_wave<HAD>(v, lane);
     float m = 0.0f;
-    if (wave == 0) {   // one wave does the whole single-group FWHT (no group loop, gfx1102)
-        const int base = lane * VPL;
-        float v[VPL];
 #pragma unroll
-        for (int j = 0; j < VPL; ++j) v[j] = (base + j < (int)n) ? ld_bf(a, base + j) : 0.0f;
-        r3d_fwht_wave<HAD>(v, lane);
-#pragma unroll
-        for (int j = 0; j < VPL; ++j) { lds[base + j] = v[j]; m = fmaxf(m, fabsf(v[j])); }
-    }
+    for (int j = 0; j < VPL; ++j) m = fmaxf(m, fabsf(v[j]));
     m = wave_max_f(m);
-    if (lane == 0) red[wave] = m;
-    __syncthreads();
-    m = red[0];
-#pragma unroll
-    for (uint32_t w = 1; w < kWaves; ++w) m = fmaxf(m, red[w]);
     m = m > 0.0f ? m : 1e-8f;
     const float inv = kTopI8 / m;
-    if (threadIdx.x == 0) s[row] = m * (1.0f / sqrtf((float)HAD)) / kTopI8;
-
-    if (wave == 0)
-        for (uint32_t c = lane * 4; c < n; c += kWave * 4) {
-            float v[4];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) v[j] = lds[c + (uint32_t)j];
-            *(uint32_t*)(qr + c) = i8_codes4(v, inv);   // row-major (the i8a8 GEMM's layout)
-        }
+    if (lane == 0) s[(size_t)row * nkb + kg] = m * (1.0f / sqrtf((float)HAD)) / kTopI8;
+    *(uint32_t*)(qr + (uint32_t)base) = i8_codes4(v, inv);   // row-major (the i8a8 GEMM's layout)
 }
 
 }  // namespace
@@ -103,12 +88,12 @@ int r3d_rad_had_quant_act_i8g(const RadArgs* a, RadStream s)
 
     long long M = 0, K = 0;
     if (r3d_rows_of(x, &M, &K) != 0) return R3D_NO(RAD_E_INVAL);
-    if (K <= 0 || K % 4) return R3D_NO(RAD_E_SHAPE);
+    if (K <= 0 || K % 128) return R3D_NO(RAD_E_SHAPE);
     const long long grp = r3d_geti_or(a, "group", 128);
-    if (grp != 128 || K != 128) return R3D_NO(RAD_E_SHAPE);   // single-group form (gfx1102)
-    if (r3d_numel(q) < M * K || r3d_numel(sc) < M) return R3D_NO(RAD_E_SHAPE);
+    if (grp != 128) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(q) < M * K || r3d_numel(sc) < M * (K / 128)) return R3D_NO(RAD_E_SHAPE);
 
-    dim3 grid((unsigned)M), blk(kThreads);
+    dim3 grid((unsigned)M, (unsigned)(K / 128)), blk(kThreads);
     R3D_KLAUNCH(had_quant_act_i8g_kernel, grid, blk, (hipStream_t)s, (const uint16_t*)r3d_p(x),
                 (uint8_t*)r3d_wp(q), (float*)r3d_wp(sc), (uint32_t)K);
     return (int)hipGetLastError();

@@ -344,8 +344,18 @@ private:
     std::string             scope_;
 };
 
-/* Returns the first negative status from a declare step. */
-#define RAD_ARCH_TRY(expr)  do { int _s = (expr); if (_s < 0) return _s; } while (0)
+/* Returns the first negative status from a declare step. RAD_ARCH_TRACE names the step that failed
+ * (file, line and expression): an architecture that refuses a container otherwise reports only the
+ * caller's error. */
+#define RAD_ARCH_TRY(expr)                                                                        \
+    do {                                                                                          \
+        int _s = (expr);                                                                          \
+        if (_s < 0) {                                                                             \
+            if (std::getenv("RAD_ARCH_TRACE"))                                                    \
+                std::fprintf(stderr, "[arch] %s:%d %s -> %d\n", __FILE__, __LINE__, #expr, _s);    \
+            return _s;                                                                            \
+        }                                                                                         \
+    } while (0)
 
 /* ================================================================== C++-side decl helpers */
 /* C++ forms of rad_group_layer() and friends, which are C compound literals (a GNU extension in

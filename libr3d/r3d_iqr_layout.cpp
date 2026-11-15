@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -624,6 +625,22 @@ int scale_unrelayout(const Form& f, const Geom& g, const Planes& v, const uint8_
     return RAD_OK;
 }
 
+/* Under RAD_R3D_TRACE, a refused query leaves a record: which operand, the code, the encoding and
+ * the selected roles. A refused layout otherwise reports only through the caller's error. */
+void trace_refused(const char* what, int operand, int rc, const RadEncoding* enc, const int* sel,
+                   int n) {
+    const char* e = std::getenv("RAD_R3D_TRACE");
+    if (!e || !*e || *e == '0') return;
+    std::fprintf(stderr, "[r3d] iqr %s refused operand=%d rc=%d scheme='%s' transform='%s' planes=%d",
+                 what, operand, rc, enc ? enc->scheme : "", enc ? enc->transform : "",
+                 enc ? enc->n_planes : 0);
+    for (int i = 0; i < n; ++i) {
+        const int p = sel ? sel[i] : -1;
+        std::fprintf(stderr, " %s", p >= 0 && enc && p < enc->n_planes ? enc->plane[p].role : "?");
+    }
+    std::fprintf(stderr, "\n");
+}
+
 }  /* namespace */
 
 /* ==================================================================== the hooks */
@@ -637,13 +654,19 @@ extern "C" int r3d_rad_layout_iqr(const RadParam* p, int n_p, int operand, const
     if (operand == IL_B) {
         int64_t entries = 0;
         const int rc = weight_view(p, n_p, enc, sel, pl, n, &g, &f, &entries, &v);
-        if (rc != RAD_OK) return rc;
+        if (rc != RAD_OK) {
+            trace_refused("layout", operand, rc, enc, sel, n);
+            return rc;
+        }
         lfill(out, "r3d.iqr.w", R3D_DT_IQR_W | word(f), g.N, g.K, weight_bytes(f, g.N, g.K));
         return RAD_OK;
     }
     if (operand == IL_BSCALE) {
         const int rc = scale_view(p, n_p, enc, sel, pl, n, &g, &f, &v);
-        if (rc != RAD_OK) return rc;
+        if (rc != RAD_OK) {
+            trace_refused("layout", operand, rc, enc, sel, n);
+            return rc;
+        }
         lfill(out, "r3d.iqr.s", R3D_DT_IQR_S | word(f), g.N, g.nkb, scale_bytes(f, g.N, g.K));
         return RAD_OK;
     }
