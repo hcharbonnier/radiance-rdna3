@@ -153,6 +153,8 @@ int r3d_rad_qsa_block_key(const RadArgs* a, RadStream s)
     if (k->rank != 2 || out->rank < 2 || out->shape[0] < 1) return R3D_NO(RAD_E_SHAPE);
     const long long M = has_page ? r3d_numel(pg) : out->shape[0];
     if (M < 1) return R3D_NO(RAD_E_SHAPE);
+    /* The shape comparison below forms M*ratio; keep it inside int64. */
+    if (M > 0x7fffffffLL || ratio > 0x7fffffffLL) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(out) / out->shape[0] != n) return R3D_NO(RAD_E_SHAPE);
     if (k->shape[0] != M * ratio || k->shape[1] != n) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(w) < n) return R3D_NO(RAD_E_SHAPE);
@@ -199,6 +201,11 @@ int r3d_rad_qsa_block_key(const RadArgs* a, RadStream s)
         for (int i = 0; i < n_sec; ++i) total += sec[i];
         if (total != rot / 2) return R3D_NO(RAD_E_SHAPE);
     }
+    /* The kernel compares i < 3*s, i < n/2; clamping a section to n keeps that truth and keeps
+     * the int arithmetic away from overflow. A mrope total above has already refused a section
+     * larger than n/2. */
+    for (int i = 0; i < n_sec; ++i)
+        if (sec[i] > n) sec[i] = n;
 
     const float eps = (float)r3d_getf(a, "eps", 1e-6);
     const float wadd = (float)r3d_getf(a, "wadd", 1.0);

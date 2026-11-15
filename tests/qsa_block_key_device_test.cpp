@@ -394,6 +394,9 @@ TEST(qsa_block_key_matches_libref) {
           "16 8 8", false, 0, 0, 0, 0, -1, false },
         { "imrope_sections", 5, 128, 4, 64, -1, true, true, 3, 5, 0, 0, 4, false, "imrope",
           "11 11 10", false, 0, 0, 0, 0, -1, false },
+        /* A section past the head: imrope's i < 3*s test is unchanged by clamping s to n. */
+        { "imrope_huge_section", 4, 128, 4, 64, -1, true, true, 3, 4, 0, 0, 4, false, "imrope",
+          "10000000000 2 2", false, 0, 0, 0, 0, -1, false },
         /* YaRN off (the coefficients are present and ignored) and on, alone and with mrope. */
         { "yarn_inactive", 5, 128, 4, 64, 40, false, false, 1, 5, 0, 0, 0, false, nullptr, nullptr,
           true, 0, -5, -9, 2, -1, false },

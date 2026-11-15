@@ -466,6 +466,7 @@ int r3d_shape_qsa_block_key(const RadParam* p, int n_p, int operand, RadOpdDesc*
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const int64_t r = gi(p, n_p, "ratio", 4);
     if (M <= 0 || n <= 0 || r <= 0) return RAD_E_UNSUPPORTED;
+    if (M > 0x7fffffffffffffffLL / r) return RAD_E_UNSUPPORTED;
     const RadOpdDesc list[] = { opd(D, M * r, n), opd((uint32_t)RAD_F32, n),
                                 opd_idx(M, M), opd_idx(M, M * r), opd(D, M, n) };
     R3D_PICK(list);
