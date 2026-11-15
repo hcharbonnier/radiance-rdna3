@@ -196,3 +196,41 @@ passe.
 
 **Blocages** : aucun ; carte occupée par W6.
 
+## 2026-11-15 — J1 (suite) : revue et fusion W8/W9 (HC, PLE)
+
+**Lot** : W8, W9.
+
+Le sous-agent a livré `05fd026` (11 rows, 2728 lignes, tests hôte et device) sur
+`rdna3-w8-w9-hc-ple`. Revue faite : rows append-only, schémas copiés slot pour
+slot (75 opérations déclarées par plus d'un plugin, 0 désaccord selon
+`rad-schemas`), aucune modification de row existante, `ar_*` limité à
+`world_size=1` et refusé au-delà.
+
+Validation device après correction d'un **bug du test** (`ngram_hint` passait
+`eos=-1`, que libref et le shim refusent ; `eos=1000` désormais) :
+
+- `hc_layout_test` : 26 vérifications, vert.
+- `ple_hc_device_test` : 8 cas / 48 vérifications, verts — `ple_conv`,
+  `ple_gate`, `embed_lookup_q` E4M3, `hc_read` bf16, `hc_write`/`enter`/`project`,
+  `ar_hc_write` et `ar_gather_hc_write` à un rang, `ngram_hint`.
+- `ngram_hint` a d'abord renvoyé `RAD_E_SHAPE` sur `eos=-1` : comportement
+  conforme à libref (`ref_ngram.cpp:122`), c'était le test qui était faux.
+
+**Fusion** : `merge W8/W9` dans `rdna3-iqr`, puis commit de la correction du
+test et de l'enregistrement CTest `ple_hc_device_test_card` (label gpu,
+`RUN_SERIAL`). Build et tests refaits depuis l'arbre fusionné : verts.
+
+**Décisions**
+
+- Le tag de layout `r4d.hc.e4m3.*` est conservé dans libr3d : c'est le même
+  format stocké, et le réutiliser évite un re-layout des conteneurs produits
+  pour RDNA4. ADR-2 ne couvre que les tags de dtype IQR.
+- Les hooks `opd_shape` et les entrées `data/kbench_rows` de HC/PLE sont
+  repoussés à W11 : ils ne bloquent ni M1 ni M2.
+
+**Reste** : performance HC/PLE non mesurée (aucun benchmark pendant la passe) ;
+le double `exp` de `ple_gate` est à profiler ; variantes `q/rq` int8 non
+couvertes par un test device.
+
+**Blocages** : aucun.
+

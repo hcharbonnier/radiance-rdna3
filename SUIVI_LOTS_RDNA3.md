@@ -14,8 +14,8 @@
 | W5 — MoE IQR | à faire | 4 sem | run map, formes mixtes, experts bf16 |
 | W6 — attention h256/GQA/KV i8 | en cours (sous-agent) | 3,5 sem | branche `rdna3-w6-attn-h256` |
 | W7 — QSA | à faire | 2,5 sem | après W6 |
-| W8 — HC | en cours (sous-agent) | 3,5 sem | branche `rdna3-w8-w9-hc-ple` |
-| W9 — PLE | en cours (sous-agent) | 1,5 sem | même branche, avant HC |
+| W8 — HC | **terminé (revu, device vert)** | 3,5 sem | 6 rows ; perf à mesurer en W12 |
+| W9 — PLE | **terminé (revu, device vert)** | 1,5 sem | 4 rows ; `opd_shape` en W11 |
 | W10 — vision | à faire | 3 sem | conteneur sans média autorisé (ADR-5) |
 | W11 — intégration | à faire | 1,5 sem | |
 | W12 — optimisation | à faire | 3–4 sem | |
