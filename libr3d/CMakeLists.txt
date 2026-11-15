@@ -189,6 +189,10 @@ set(R3D_UNITS
   # The grouped E4M3 x E4M3 GEMM (moe_gemm_q): both operands fp8, staged compact and upcast to f16
   # in registers (the FeatherOps bit trick), the f16 wave-matrix, a per-(row, g-of-K) scale fold.
   "r3d_moe_gemm_q|"
+  # The grouped IQR GEMM (moe_gemm_iqr): each expert's computed-trellis weight decoded where it is
+  # read, a block walking the sorted rows' expert runs in the decode band and a run map above it so
+  # a decoded 16x128 unit serves four token tiles.
+  "r3d_moe_iqr|"
   # The grouped GEMM with unquantised bf16 experts: the same run-walk / gather as moe_gemm_q, the
   # bf16 operands loaded straight into the bf16 wave-matrix fragments (f32 accumulate), no decode.
   "r3d_moe_gemm_bf16|"

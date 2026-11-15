@@ -179,10 +179,12 @@ endif()
 # hc_layout_test is host arithmetic over the same plugin, so it needs no card.
 if(TARGET libr3d AND RAD_HIP_FOUND)
   set(RAD_TESTS_WITH_R3D_DEVICE iqr_device_test ple_hc_device_test qsa_block_key_device_test
-                                qsa_score_device_test qsa_select_device_test qsa_work_device_test)
+                                qsa_score_device_test qsa_select_device_test qsa_work_device_test
+                                moe_iqr_device_test)
   set(RAD_TESTS_WITH_R3D_HOST hc_layout_test)
 else()
   list(FILTER RAD_TESTS EXCLUDE REGEX "/iqr_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/moe_iqr_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/ple_hc_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_block_key_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_score_device_test\\.cpp$")
@@ -242,6 +244,10 @@ foreach(t ${RAD_TESTS})
     target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr3d)
     target_compile_definitions(${n} PRIVATE RAD_R3D_SO="$<TARGET_FILE:libr3d>")
     add_dependencies(${n} libr3d)
+    # The MoE IQR host reference must round its two scale multiplies separately, as the kernel does.
+    if(n STREQUAL moe_iqr_device_test)
+      target_compile_options(${n} PRIVATE -ffp-contract=off)
+    endif()
     # The PLE/HC ladder compares against libref's row-by-row oracle.
     if(TARGET libref)
       target_compile_definitions(${n} PRIVATE RAD_LIBREF_SO="$<TARGET_FILE:libref>")
@@ -367,10 +373,10 @@ if(RAD_HIP_FOUND)
       TIMEOUT ${RAD_TEST_TIMEOUT}
       ENVIRONMENT "${RAD_TEST_CARD_ENV}")
   endforeach()
-  # The IQR GEMM, the PLE/HC ladder and the QSA rows against their host references, on the card
-  # the library was built for.
+  # The IQR GEMM, the PLE/HC ladder, the QSA rows and the routed IQR GEMM against their host
+  # references, on the card the library was built for.
   foreach(n iqr_device_test ple_hc_device_test qsa_block_key_device_test qsa_score_device_test
-            qsa_select_device_test qsa_work_device_test)
+            qsa_select_device_test qsa_work_device_test moe_iqr_device_test)
     if(TARGET ${n})
       add_test(NAME ${n}_card COMMAND ${n})
       set_tests_properties(${n}_card PROPERTIES

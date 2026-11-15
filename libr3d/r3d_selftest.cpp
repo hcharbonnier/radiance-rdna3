@@ -177,6 +177,7 @@ static void check_table() {
          * own and whose inverse is part of the port's contract (ADR-1), and HC's E4M3 mix, which
          * keeps libr4d's `r4d.hc.e4m3` tag so a container laid out for RDNA4 is read in place. */
         const bool iqr = !std::strncmp(k->name, "gemm_iqr", 8) ||
+                         !std::strncmp(k->name, "moe_gemm_iqr", 12) ||
                          !std::strncmp(k->name, "embed_lookup_iqr", 16) ||
                          !std::strncmp(k->name, "logits_gemm_vocab_iqr", 21);
         const bool hc = !std::strncmp(k->name, "hc_read", 7);

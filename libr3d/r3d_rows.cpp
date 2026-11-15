@@ -1481,6 +1481,22 @@ static int64_t attn_h256_scratch(const RadArgs* a) {
  * otherwise. Declared here because the plugin's own header is not the ABI. */
 extern "C" int64_t r3d_rad_gemm_nt_q_iqr_m16_scratch(const RadArgs* a);
 
+/* The routed IQR GEMM (r3d_moe_iqr.hip), its run-map scratch hook and the IQR storage hooks at the
+ * MoE classes' geometry (r3d_iqr_layout.cpp). Declared here because the plugin's own header is
+ * not the ABI. */
+extern "C" int r3d_rad_moe_gemm_iqr(const RadArgs* a, RadStream s);
+extern "C" int64_t r3d_rad_moe_gemm_iqr_scratch(const RadArgs* a);
+extern "C" int r3d_rad_layout_moe_iqr(const RadParam* p, int n_p, int operand,
+                                      const RadEncoding* enc, const int* sel,
+                                      const RadTensor* pl, int n, RadLayout* out);
+extern "C" int r3d_rad_relayout_moe_iqr(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel,
+                                        const RadTensor* pl, int n, void* dst,
+                                        int64_t dst_bytes);
+extern "C" int r3d_rad_unrelayout_moe_iqr(const RadParam* p, int n_p, int operand,
+                                          const RadEncoding* enc, const int* sel, const void* src,
+                                          int64_t src_bytes, const RadTensor* pl, int n);
+
 /* A split's partials are f32 over the output, plus one arrival counter per split. Sized at the
  * band's bounds and the axis's widest split, because a scratch hook runs at declare, where the
  * range may still be open: the buffer must hold any point the tuner can pick. */
@@ -1743,6 +1759,11 @@ static const RadConstraint cRouterSigmoidGroup[] = { C_GE("M", 1),        C_LE("
                                                      C_IN("dtype", "f32") };
 static const RadConstraint cMoeGemmBf16[] = { C_IN("dtype", "bf16"), C_GE("n_expert", 1),
                                               C_GE("top_k", 1) };
+/* The routed IQR GEMM: the model's `i8a8h` experts (a computed trellis under one f32 scale a row,
+ * the FFN form arch/common/rad_block_moe_fp8.h selects), with the activation's 128-K scale block. */
+static const RadConstraint cMoeGemmIqr[] = { C_IN("dtype", "i8a8h"), C_GE("n_expert", 1),
+                                             C_LE("n_expert", 512), C_GE("top_k", 1),
+                                             C_EQ("group", 128) };
 /* The vocabulary projection has no `dtype` constraint because its band carries no `dtype` key: the
  * head's dtype is a property of the weight (libref checks it with a `check_dtypes` hook). A
  * constraint on a key the band lacks does not hold, which would leave only the host kernel and the
@@ -2869,6 +2890,34 @@ static const RadKernelInfo kKernels[] = {
    nullptr, nullptr, r3d_rad_moe_gemm_mxfp4a8,
    nullptr, nullptr, nullptr,
    nullptr, nullptr },
+
+  /* ------------------------------------------------------------------ r3d_moe_iqr.hip
+   *
+   * The grouped IQR GEMM: each expert's weight is a computed-trellis IQR plane at its codes' width,
+   * decoded where it is read. A block owns 16 sorted rows and four 16-column weight tiles; the
+   * decode band walks the runs in its tile, above it a run map in the row's scratch gives a block
+   * one run of up to 64 rows so a decoded weight tile serves four token tiles. The arithmetic is
+   * the dense IQR row's: an exact i32 group sub-sum, then (sub * a_scale) * fold in f32.
+   */
+  { "moe_gemm_iqr", "moe_gemm_q", "moe",
+    "The grouped GEMM over experts stored as IQR weights: y[i] = a[sorted_tok[i]/top_k] @ w_e^T, "
+    "e the expert of sorted row i, each 128-K group's exact int8 sub-sum folded by the activation's "
+    "scale and the weight row's block factor",
+    "16 sorted rows and four 16-column weight tiles a block, a wave a tile; the decode band (M * "
+    "top_k <= 1.5 * n_expert) walks the expert runs in its tile; above it a run map in the row's "
+    "scratch gives a block one run of up to 64 rows and a decoded 16x128 unit is reused over four "
+    "token tiles, the dense resident tile's residency; a 128-K scale block's factor and a row's own "
+    "f32 scale are folded in the dense row's order; equal classes (N_odd = N, K_odd = K), N % 64, "
+    "K % 128, the trellis run divides N, parts divides N in 16-row tiles",
+    "I8 a with an f32 scale per (row, 128 or 256 of K), IQR weight tables (computed trellis, L = 16, "
+    "one f32 scale a row, no tcq_rb, 2..7 code bits) and their scale tables, bf16 y in sorted order; "
+    "token or sorted a; zero-row experts and dropped slots handled",
+    RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+    ROW(cMoeGemmIqr), NOTUNE,
+    nullptr, nullptr, r3d_rad_moe_gemm_iqr,
+    r3d_rad_moe_gemm_iqr_scratch, r3d_rad_layout_moe_iqr, r3d_rad_relayout_moe_iqr,
+    nullptr, r3d_rad_unrelayout_moe_iqr,
+    nullptr, 0 },
 
   /* ------------------------------------------------------------------ r3d_moe_gemm_w4a8.hip
    *
