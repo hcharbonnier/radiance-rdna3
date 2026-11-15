@@ -613,7 +613,7 @@ TEST(ngram_hint_matches_the_documented_hash) {
     up(dtail, tail.data(), dtail.bytes);
 
     auto p = std::vector<RadParam>{ pi("M", N), pi("heads", heads), pi("ngram", ngram),
-                                    pi("eos", -1), pi("hist", 1) };
+                                    pi("eos", 1000), pi("hist", 1) };
     std::vector<RadTensor> t = {
         ten(dtok.p, RAD_I32, { 2 }), ten(dpos.p, RAD_I32, { 2 }), ten(dcu.p, RAD_I32, { 3 }),
         ten(dmult.p, RAD_I64, { ngram }), ten(dvsz.p, RAD_I64, { heads }),

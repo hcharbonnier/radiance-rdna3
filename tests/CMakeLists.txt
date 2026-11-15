@@ -362,16 +362,19 @@ if(RAD_HIP_FOUND)
       TIMEOUT ${RAD_TEST_TIMEOUT}
       ENVIRONMENT "${RAD_TEST_CARD_ENV}")
   endforeach()
-  # The IQR GEMM against its host reference, on the card the library was built for.
-  if(TARGET iqr_device_test)
-    add_test(NAME iqr_device_test_card COMMAND iqr_device_test)
-    set_tests_properties(iqr_device_test_card PROPERTIES
-      LABELS gpu
-      RUN_SERIAL TRUE
-      SKIP_RETURN_CODE 77
-      TIMEOUT ${RAD_TEST_TIMEOUT}
-      ENVIRONMENT "${RAD_TEST_CARD_ENV}")
-  endif()
+  # The IQR GEMM and the PLE/HC ladder against their host references, on the card the library was
+  # built for.
+  foreach(n iqr_device_test ple_hc_device_test)
+    if(TARGET ${n})
+      add_test(NAME ${n}_card COMMAND ${n})
+      set_tests_properties(${n}_card PROPERTIES
+        LABELS gpu
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT ${RAD_TEST_TIMEOUT}
+        ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+    endif()
+  endforeach()
 endif()
 
 # plugin_test's libr4d cases run against the shipped RDNA4 library. Only a build whose GPU
