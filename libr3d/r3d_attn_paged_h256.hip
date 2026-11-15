@@ -49,6 +49,15 @@
  * key order) with a cache whose K row is the same for every key, and checks a random cache at one
  * bf16 code. `exp` is the h128 row's polynomial, within one f32 ulp of (float)std::exp(double).
  *
+ * libref keeps each visible key's score from the max pass and reuses it in the value pass; this
+ * row does too whenever the workgroup's key range fits the score cache in LDS (`kScores` floats,
+ * one per (row slot, key)). The pass two stage then skips the K stores and the pass two walk reads
+ * the score instead of recomputing the dot, which removes half the QK arithmetic. The scores are
+ * bit-for-bit the pass one values, so nothing about the reference's order changes. When the range
+ * does not fit (a long prefill with no split, or a decode slice past ~106 keys) the row walks the
+ * reference's two-pass form: the dot is recomputed with the same operands in the same order.
+ * `nkeys * kRows <= kScores` is a workgroup-uniform decision, so both paths compute the same bytes.
+ *
  * Split-KV (decode only) stores four-lane partial rows of 260 floats (256 accumulators, sum,
  * max) and a second kernel rescales them. splits = 1 is the reference's key order; splits > 1
  * changes the softmax's parentheses and is the documented last-ulp departure. The shim lowers
@@ -84,6 +93,11 @@ enum : int {
     kRowsWave   = kLanesWave / kLanesRow,
     kPartStride = kHeadDim + 4,
     kSplitMax   = 64,
+    kScores     = 5120,        /* f32 score slots: one per (row, key) when the walk fits them */
+    /* A staged slot's row pitch in LDS. 272 bytes (68 dwords, still 16-byte aligned for the b128
+     * reads) puts successive key slots four banks apart: a 64-byte row pitch would put all sixteen
+     * row slots of a wave on the same eight banks. It changes no value, only the address. */
+    kPitch      = kHeadDim + 16,
 };
 
 __device__ __forceinline__ long long ld_ix(const int* p, size_t i) { return p[i]; }
@@ -185,9 +199,10 @@ typedef __attribute__((address_space(3))) uint32_t r3d_lds_u32;
 typedef __attribute__((address_space(3))) float    r3d_lds_f32;
 
 /* One 4-byte word of a staged page, routed by its flat word index: a slot is 129 words (64 K
- * codes, 64 V codes, then the two f16 scales packed in one dword). `STAGE_V` is false in the max
- * pass, which reads only K and K's scale, so the V stores are skipped there. */
-template <bool STAGE_V>
+ * codes, 64 V codes, then the two f16 scales packed in one dword). `STAGE_K` and `STAGE_V` select
+ * the planes a pass consumes: the max pass reads K and K's scale only, and the cached value pass
+ * reads V and V's scale only, so neither stores the other plane. */
+template <bool STAGE_K, bool STAGE_V>
 __device__ __forceinline__ void put_slot_word(int slot, int r, uint32_t v,
                                               r3d_lds_i8* __restrict__ sK,
                                               r3d_lds_i8* __restrict__ sV,
@@ -195,11 +210,11 @@ __device__ __forceinline__ void put_slot_word(int slot, int r, uint32_t v,
                                               r3d_lds_f32* __restrict__ svs)
 {
     if (r < kHeadDim / 4) {
-        *((r3d_lds_u32*)(sK + slot * kHeadDim) + r) = v;
+        if (STAGE_K) *((r3d_lds_u32*)(sK + slot * kPitch) + r) = v;
     } else if (r < kHeadDim / 2) {
-        if (STAGE_V) *((r3d_lds_u32*)(sV + slot * kHeadDim) + (r - kHeadDim / 4)) = v;
+        if (STAGE_V) *((r3d_lds_u32*)(sV + slot * kPitch) + (r - kHeadDim / 4)) = v;
     } else {
-        sks[slot] = f16_to_f32((uint16_t)(v & 0xffffu));
+        if (STAGE_K) sks[slot] = f16_to_f32((uint16_t)(v & 0xffffu));
         if (STAGE_V) svs[slot] = f16_to_f32((uint16_t)(v >> 16));
     }
 }
@@ -212,8 +227,13 @@ __device__ __forceinline__ void put_slot_word(int slot, int r, uint32_t v,
  * staged slots are then read as one flat run of 16-byte chunks and each of the four words is
  * routed to its K, V or scale home: every global load is a 16-byte vector load inside the page.
  * The 4-byte loop is the general path, because the shim only promises 4-byte alignment. Both paths
- * move the same bytes to the same LDS words, so no arithmetic changes. */
-template <int NTH, bool STAGE_V>
+ * move the same bytes to the same LDS words, so no arithmetic changes.
+ *
+ * A slot's K and V homes are `kPitch` (272) bytes apart while the row itself is 256 bytes: the 16
+ * extra bytes skew successive slots across the LDS banks, so a wave's sixteen row slots no longer
+ * all read the same eight banks on every dot/value step. Only addresses move; the staged bytes and
+ * the arithmetic are unchanged. */
+template <int NTH, bool STAGE_K, bool STAGE_V>
 __device__ __forceinline__ void stage_i8(const Args& A, int blk, int kh, int nu, int tid,
                                          r3d_lds_i8* __restrict__ sK, r3d_lds_i8* __restrict__ sV,
                                          r3d_lds_f32* __restrict__ sks,
@@ -231,28 +251,28 @@ __device__ __forceinline__ void stage_i8(const Args& A, int blk, int kh, int nu,
                                     (const void*)(src + (long long)c * 16);
             int slot = (c << 2) / kWordsSlot;
             int r = (c << 2) - slot * kWordsSlot;
-            put_slot_word<STAGE_V>(slot, r, v[0], sK, sV, sks, svs);
+            put_slot_word<STAGE_K, STAGE_V>(slot, r, v[0], sK, sV, sks, svs);
             if (++r == kWordsSlot) { r = 0; ++slot; }
-            put_slot_word<STAGE_V>(slot, r, v[1], sK, sV, sks, svs);
+            put_slot_word<STAGE_K, STAGE_V>(slot, r, v[1], sK, sV, sks, svs);
             if (++r == kWordsSlot) { r = 0; ++slot; }
-            put_slot_word<STAGE_V>(slot, r, v[2], sK, sV, sks, svs);
+            put_slot_word<STAGE_K, STAGE_V>(slot, r, v[2], sK, sV, sks, svs);
             if (++r == kWordsSlot) { r = 0; ++slot; }
-            put_slot_word<STAGE_V>(slot, r, v[3], sK, sV, sks, svs);
+            put_slot_word<STAGE_K, STAGE_V>(slot, r, v[3], sK, sV, sks, svs);
         }
 #pragma unroll 1
         for (int idx = (nc << 2) + tid; idx < nw; idx += NTH) {
             const int slot = idx / kWordsSlot;
             const int r = idx - slot * kWordsSlot;
-            put_slot_word<STAGE_V>(slot, r, ldg_u32((const uint32_t*)(src + (long long)idx * 4)),
-                                   sK, sV, sks, svs);
+            put_slot_word<STAGE_K, STAGE_V>(slot, r, ldg_u32((const uint32_t*)(src + (long long)idx * 4)),
+                                            sK, sV, sks, svs);
         }
     } else {
 #pragma unroll 1
         for (int idx = tid; idx < nw; idx += NTH) {
             const int slot = idx / kWordsSlot;
             const int r = idx - slot * kWordsSlot;
-            put_slot_word<STAGE_V>(slot, r, ldg_u32((const uint32_t*)(src + (long long)idx * 4)),
-                                   sK, sV, sks, svs);
+            put_slot_word<STAGE_K, STAGE_V>(slot, r, ldg_u32((const uint32_t*)(src + (long long)idx * 4)),
+                                            sK, sV, sks, svs);
         }
     }
 }
@@ -277,6 +297,31 @@ __device__ __forceinline__ float dot_group(const float* __restrict__ qf,
     return dot;
 }
 
+/* Two keys' scores in one pass. Each key's chain is exactly `dot_group`'s (its 64 dims ascending,
+ * then the four d-block partials in order); the two chains are independent, so the compiler can
+ * interleave them and hide the 64-add latency. Nothing is reassociated: key 0 and key 1 keep their
+ * own partial sums and their own order. */
+__device__ __forceinline__ void dot_group2(const float* __restrict__ qf,
+                                           const r3d_lds_i8* __restrict__ k0,
+                                           const r3d_lds_i8* __restrict__ k1,
+                                           float ks0, float ks1, int gbase,
+                                           float& o0, float& o1)
+{
+    float p0 = 0.0f, p1 = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kDimsLane; ++i) {
+        p0 = p0 + qf[i] * ((float)(int8_t)k0[i] * ks0);
+        p1 = p1 + qf[i] * ((float)(int8_t)k1[i] * ks1);
+    }
+    o0 = __shfl(p0, gbase, kLanesWave);
+    o1 = __shfl(p1, gbase, kLanesWave);
+#pragma unroll
+    for (int b = 1; b < kLanesRow; ++b) {
+        o0 = o0 + __shfl(p0, gbase + b, kLanesWave);
+        o1 = o1 + __shfl(p1, gbase + b, kLanesWave);
+    }
+}
+
 __device__ __forceinline__ bool visible(int j, int pos, int causal, long long window)
 {
     if (causal && j > pos) return false;
@@ -296,9 +341,13 @@ void attn_kernel(const Args A)
     constexpr int TPT   = kRows / GQA;       /* tokens a tile carries */
     constexpr int NTH   = WAVES * kLanesWave;
 
-    __shared__ __align__(16) int8_t sK[BLOCK * kHeadDim];
-    __shared__ __align__(16) int8_t sV[BLOCK * kHeadDim];
+    __shared__ __align__(16) int8_t sK[BLOCK * kPitch];
+    __shared__ __align__(16) int8_t sV[BLOCK * kPitch];
     __shared__ float sks[BLOCK], svs[BLOCK];
+    /* The max pass's scores, one per (row slot, key), when the workgroup's key range fits. A score
+     * is bit-for-bit the value pass two would recompute, so the cached and the recompute paths
+     * agree; `nkeys * kRows <= kScores` is a uniform decision. */
+    __shared__ float sScore[kScores];
 
     const int tid  = (int)threadIdx.x;
     const int lane = tid & (kLanesWave - 1);
@@ -381,24 +430,56 @@ void attn_kernel(const Args A)
         if (b1 > s1) b1 = s1;
     }
 
+    /* The key range the workgroup walks, in flat key indices: blocks b0..b1-1, the last one cut at
+     * `jend_all`. libref keeps a score a key; so does this row when `nkeys * kRows` fits the LDS
+     * score cache. The decision and the index (`j - key_base`) are uniform across the workgroup. */
+    const int key_base = b0 * BLOCK;
+    const int key_end  = jend_all < b1 * BLOCK ? jend_all : b1 * BLOCK;
+    const int nkeys    = key_end > key_base ? key_end - key_base : 0;
+    const bool cache   = (long long)nkeys * kRows <= kScores;
+    r3d_lds_f32* const srow = (r3d_lds_f32*)sScore + (size_t)rr * (size_t)nkeys;
+
     float mx = -INFINITY;
     /* Pass one: the maximum over visible scores. Ascending key order, same arithmetic as pass two,
      * so the score a key gets here is the score it gets there. This pass reads K and K's scale
-     * only, so it stages no V (pass two stages the block's V rows anyway). */
+     * only, so it stages no V (pass two stages the block's V rows anyway). When the scores fit,
+     * lane 0 of each row group keeps each visible key's score for pass two. */
     for (int b = b0; b < b1; ++b) {
         const int blk = ld_ix(A.bt, (size_t)M.s * A.bt_rs + (size_t)b * A.bt_cs);
         const int j0 = b * BLOCK;
         const int nu = jend_all - j0 < BLOCK ? jend_all - j0 : BLOCK;
         group_barrier();
-        if (blk >= 0) stage_i8<NTH, false>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+        if (blk >= 0) stage_i8<NTH, true, false>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
         group_barrier();
         if (blk < 0) continue;
-        for (int u = 0; u < nu; ++u) {
-            const float dot = dot_group(qf, (const r3d_lds_i8*)(sK + u * kHeadDim + d0), ((const r3d_lds_f32*)sks)[u], gbase);
+        int u = 0;
+        for (; u + 1 < nu; u += 2) {
+            float dot0, dot1;
+            dot_group2(qf, (const r3d_lds_i8*)(sK + u * kPitch + d0),
+                       (const r3d_lds_i8*)(sK + (u + 1) * kPitch + d0),
+                       ((const r3d_lds_f32*)sks)[u], ((const r3d_lds_f32*)sks)[u + 1],
+                       gbase, dot0, dot1);
+            const int j = j0 + u;
+            const bool vis0 = active && visible(j, pos, CAUSAL, A.window);
+            if (vis0) {
+                const float sc = dot0 * A.scale;
+                if (cache && db == 0) srow[j - key_base] = sc;
+                if (sc > mx) mx = sc;
+            }
+            const bool vis1 = active && visible(j + 1, pos, CAUSAL, A.window);
+            if (vis1) {
+                const float sc = dot1 * A.scale;
+                if (cache && db == 0) srow[j + 1 - key_base] = sc;
+                if (sc > mx) mx = sc;
+            }
+        }
+        if (u < nu) {
+            const float dot = dot_group(qf, (const r3d_lds_i8*)(sK + u * kPitch + d0), ((const r3d_lds_f32*)sks)[u], gbase);
             const int j = j0 + u;
             const bool vis = active && visible(j, pos, CAUSAL, A.window);
             if (vis) {
                 const float sc = dot * A.scale;
+                if (cache && db == 0) srow[j - key_base] = sc;
                 if (sc > mx) mx = sc;
             }
         }
@@ -414,24 +495,35 @@ void attn_kernel(const Args A)
     for (int i = 0; i < kDimsLane; ++i) acc[i] = 0.0f;
     float sum = 0.0f;
 
-    /* Pass two: exponentiate and accumulate in ascending key order. */
+    /* Pass two: exponentiate and accumulate in ascending key order. With the scores cached it
+     * stages V only and reads the max pass's score; otherwise it restages K too and recomputes
+     * the dot with the same operands and the same order. */
     for (int b = b0; b < b1; ++b) {
         const int blk = ld_ix(A.bt, (size_t)M.s * A.bt_rs + (size_t)b * A.bt_cs);
         const int j0 = b * BLOCK;
         const int nu = jend_all - j0 < BLOCK ? jend_all - j0 : BLOCK;
         group_barrier();
-        if (blk >= 0) stage_i8<NTH, true>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+        if (blk >= 0) {
+            if (cache) stage_i8<NTH, false, true>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+            else       stage_i8<NTH, true,  true>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+        }
         group_barrier();
         if (blk < 0) continue;
         for (int u = 0; u < nu; ++u) {
-            const float dot = dot_group(qf, (const r3d_lds_i8*)(sK + u * kHeadDim + d0), ((const r3d_lds_f32*)sks)[u], gbase);
             const int j = j0 + u;
             const bool vis = active && visible(j, pos, CAUSAL, A.window);
             if (vis) {
-                const float w = exp_ref(dot * A.scale - mx);
+                float sc;
+                if (cache) {
+                    sc = srow[j - key_base];
+                } else {
+                    const float dot = dot_group(qf, (const r3d_lds_i8*)(sK + u * kPitch + d0), ((const r3d_lds_f32*)sks)[u], gbase);
+                    sc = dot * A.scale;
+                }
+                const float w = exp_ref(sc - mx);
                 sum += w;
                 const float vm = ((const r3d_lds_f32*)svs)[u];
-                const r3d_lds_i8* vrow = (const r3d_lds_i8*)(sV + u * kHeadDim + d0);
+                const r3d_lds_i8* vrow = (const r3d_lds_i8*)(sV + u * kPitch + d0);
 #pragma unroll
                 for (int i = 0; i < kDimsLane; ++i)
                     acc[i] = acc[i] + w * ((float)(int8_t)vrow[i] * vm);
