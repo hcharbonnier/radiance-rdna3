@@ -32,6 +32,8 @@
  * activation tile the A fragment, and the eight 16x16x16 steps of a group chain one exact i32
  * sub-sum. The group fold and the epilogue are the resident tile's, in the same order, so the
  * output is bit-identical too; only the issue width changes. Small M keeps the v_dot4 tile.
+ * W13 measured the wave matrix 25-30 % slower than the v_dot4 tile at every prefill shape, so
+ * kIqrWmmaMinM sits above any M: the path stays built and covered, switched off, for W14.
  *
  * K and N must be multiples of 128 and 16 and the trellis run must divide N; the shim refuses
  * everything else.
@@ -276,8 +278,14 @@ gemm_iqr_resident_kernel(const int8_t* __restrict__ a, const float* __restrict__
  * drop the store.
  */
 constexpr int kIqrWmmaWaves = 4;    /* 16-token slices a workgroup: 64 tokens a weight tile */
-constexpr int kIqrWmmaMinM = 64;    /* at or above this the wave matrix runs; raise past M to
-                                     * force the v_dot4 tile (the switch, there is no other) */
+/* The W13 wave-matrix tile is kept but switched off: measured on the W7900 it is 25-30% slower
+ * than the v_dot4 resident tile at every tiled shape (12288x2560 M=512 2796 us against 2120,
+ * M=4096 23013 against 17499, 5120x17408 M=512 7375 against 5732, M=4096 66038 against 49617),
+ * which also cost the 27B 25% of its prefill. Raise the threshold past a launch's M to force the
+ * v_dot4 tile; the 64-token crossover was never demonstrated. Marked for W14: the issue and the
+ * staging, not the residency, are what the measurement rejects. */
+constexpr int kIqrWmmaMinM = 1 << 30;    /* at or above this the wave matrix runs; raise past M to
+                                          * force the v_dot4 tile (the switch, there is no other) */
 
 template <class F, int W>
 __global__ void __launch_bounds__(W * kIqrWave) R3D_WAVES(4)

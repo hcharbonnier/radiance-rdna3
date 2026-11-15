@@ -779,11 +779,11 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
         { "mad u4 L16 bf16, 5 tokens", 4, 16, 0, kBf16, 256, 256, 5 },
         { "mad u4 L16 bf16, 16 tokens", 4, 16, 0, kBf16, 256, 512, 16 },
         { "mad u4 L16 one-f32-row, 33 tokens (tiled v_dot4)", 4, 16, 0, kRowF32, 512, 384, 33 },
-        { "mad u4 L16 one-f32-row, 64 tokens (WMMA threshold)", 4, 16, 0, kRowF32, 256, 384, 64 },
-        { "mad u4 L16 one-f32-row, 160 tokens (WMMA)", 4, 16, 0, kRowF32, 256, 384, 160 },
-        { "mad u4 L16 bf16, 512 tokens (WMMA)", 4, 16, 0, kBf16, 256, 384, 512 },
-        { "mad u4 L16 one-f32-row, 512 tokens (WMMA)", 4, 16, 0, kRowF32, 512, 384, 512 },
-        { "mad u4 L16 bf16, 4096 tokens (WMMA)", 4, 16, 0, kBf16, 256, 384, 4096 },
+        { "mad u4 L16 one-f32-row, 64 tokens (resident)", 4, 16, 0, kRowF32, 256, 384, 64 },
+        { "mad u4 L16 one-f32-row, 160 tokens (resident)", 4, 16, 0, kRowF32, 256, 384, 160 },
+        { "mad u4 L16 bf16, 512 tokens (resident)", 4, 16, 0, kBf16, 256, 384, 512 },
+        { "mad u4 L16 one-f32-row, 512 tokens (resident)", 4, 16, 0, kRowF32, 512, 384, 512 },
+        { "mad u4 L16 bf16, 4096 tokens (resident)", 4, 16, 0, kBf16, 256, 384, 4096 },
         /* The 27B's down vector (N = 5120, K = 17408, u4, one f32 scale a row, M = 1): the shape
          * the W0 table measures at 51.5 %. It takes the split band, so the comparison is in bf16
          * ulps (2). Every other case above stays bit-identical: it either passes no scratch (the
@@ -1319,7 +1319,8 @@ TEST(iqr_gemm_bench_on_the_27b_shapes_when_asked) {    if (!std::getenv("RAD_IQR
     bench_one(12288, 2560, 16, 5, 100);
     bench_one(5120, 17408, 1, 4, 50);
     bench_one(5120, 17408, 16, 4, 50);
-    /* The tiled row: v_dot4 below 64 tokens, the int8 WMMA tile above, same shapes. */
+    /* The tiled row on the v_dot4 resident tile (the W13 wave matrix is off by default, measured
+     * 25-30 % slower), same shapes. */
     bench_one(12288, 2560, 512, 5, 20, true);
     bench_one(12288, 2560, 4096, 5, 8, true);
     bench_one(5120, 17408, 512, 4, 20, true);
