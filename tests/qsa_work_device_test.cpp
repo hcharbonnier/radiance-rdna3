@@ -156,6 +156,9 @@ bool same_i32(const std::vector<int32_t>& a, const std::vector<int32_t>& b, cons
 struct Inputs {
     int T = 0, n = 0, ratio = 0, ring = 0, seqs = 0, slots = 0, work = 0;
     int sidx_cols = 1, bt_cols = 8;
+    /* 0 means the row is exactly n wide; the engine hands a column slice of the projection, read
+     * at a wider row pitch. */
+    int k_pitch = 0;
     /* 0: rank 1 without rope, [work,3] with it. A positive value forces the engine's no-plane
      * form: shape [work,1] at that row pitch, so only component 0 is written. */
     int bpos_stride = 0;
@@ -171,7 +174,8 @@ struct Outputs {
 /* Builds one launch's operands, runs `kd` and `kr` on equal inputs and equal output sentinels,
  * and returns both output sets. */
 bool run_case(const Inputs& in, Outputs* dev, Outputs* ref, const char* what) {
-    const size_t k_elems = (size_t)in.T * in.n;
+    const int k_pitch = in.k_pitch > in.n ? in.k_pitch : in.n;
+    const size_t k_elems = (size_t)in.T * k_pitch;
     const size_t state_elems = (size_t)in.slots * in.ring * in.n;
     const size_t stage_elems = (size_t)in.work * in.ratio * in.n;
     const size_t page_elems = (size_t)in.work;
@@ -215,7 +219,11 @@ bool run_case(const Inputs& in, Outputs* dev, Outputs* ref, const char* what) {
 
     auto tensors = [&](Dev& stage, Dev& page, Dev& bpos, Dev& nc) {
         std::vector<RadTensor> t;
-        t.push_back(ten(dk.p, RAD_BF16, { in.T, in.n }));
+        {
+            RadTensor kt = ten(dk.p, RAD_BF16, { in.T, in.n });
+            if (k_pitch > in.n) kt.stride[0] = k_pitch;
+            t.push_back(kt);
+        }
         t.push_back(ten(dpos.p, RAD_I32, { in.T }));
         t.push_back(ten(dcu.p, RAD_I32, { in.seqs + 1 }));
         t.push_back(ten(dstate.p, RAD_BF16, { in.slots, 1, in.ring, in.n }));
@@ -288,6 +296,15 @@ void fill_keys(std::vector<uint16_t>& k, int T, int n, int base) {
             k[(size_t)t * n + d] = bfv((float)(base + t) + 0.01f * (float)d);
 }
 
+/* A column slice of a wider projection: only n columns are live, the rest of each row is padding
+ * the kernel must skip. */
+void fill_keys_pitch(std::vector<uint16_t>& k, int T, int n, int pitch, int base) {
+    for (int t = 0; t < T; ++t)
+        for (int d = 0; d < pitch; ++d)
+            k[(size_t)t * pitch + d] =
+                d < n ? bfv((float)(base + t) + 0.01f * (float)d) : (uint16_t)0xdead;
+}
+
 /* ================================================================== cases */
 
 /* A whole prefill chunk: every block completes from this step's keys, and the slot past the real
@@ -323,6 +340,36 @@ TEST(qsa_work_prefill_matches_libref) {
     for (int t = 0; t < in.T; ++t)
         for (int x = 0; x < in.n; ++x)
             CHECK_EQ(d.stage[(size_t)t * in.n + x], in.k[(size_t)t * in.n + x]);
+}
+
+/* The engine hands k as a column slice of the [T, (heads+1)*head_dim] projection: the row pitch is
+ * wider than n, and the padding must not reach stage. */
+TEST(qsa_work_k_pitch_matches_libref) {
+    if (!ready()) return;
+    Inputs in;
+    in.T = 8; in.n = 8; in.ratio = 4; in.ring = 8; in.seqs = 1; in.slots = 1;
+    in.work = in.T / in.ratio + in.seqs;   /* 3 */
+    in.k_pitch = 13;
+    in.pos = { 0, 1, 2, 3, 4, 5, 6, 7 };
+    in.cu = { 0, in.T };
+    in.sidx = { 0 };
+    in.bt.assign((size_t)in.bt_cols, 0);
+    for (int b = 0; b < in.bt_cols; ++b) in.bt[(size_t)b] = 600 + b;
+    in.k.resize((size_t)in.T * in.k_pitch);
+    in.state.assign((size_t)in.slots * in.ring * in.n, 0);
+    fill_keys_pitch(in.k, in.T, in.n, in.k_pitch, 300);
+    fill_tail(in.state, in.slots, in.ring, in.n);
+
+    Outputs d, r;
+    CHECK(run_case(in, &d, &r, "k pitch"));
+    if (d.nc.size() != (size_t)in.seqs) return;
+    CHECK_EQ(d.nc[0], 2);
+    CHECK_EQ(d.page[0], 600);
+    CHECK_EQ(d.page[1], 601);
+    CHECK_EQ(d.page[2], -1);
+    for (int t = 0; t < in.T; ++t)
+        for (int x = 0; x < in.n; ++x)
+            CHECK_EQ(d.stage[(size_t)t * in.n + x], in.k[(size_t)t * in.k_pitch + x]);
 }
 
 /* The engine's M-RoPE model on a pass with no rotary planes hands bpos as [work, 1] at the
@@ -393,7 +440,7 @@ TEST(qsa_work_tail_straddle_and_ring_wrap_match_libref) {
 }
 
 /* Two sequences in one launch, sequence 0 with two completing blocks and sequence 1 with one and
- * no tail slot; the state row has a pitch wider than one column. */
+ * no tail slot; the state-index row has a pitch wider than one column. */
 TEST(qsa_work_multiple_sequences_match_libref) {
     if (!ready()) return;
     Inputs in;
