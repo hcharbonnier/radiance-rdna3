@@ -6,7 +6,8 @@
  * reference's order: per 128-K group an exact i32 sub-sum, then (sub * a_scale) * w_scale, groups
  * ascending, the row's own factor last. The stored form is produced by the library's own layout
  * hooks, so the test also covers them end to end (their byte order is held to libr4d's by
- * iqr_parity_test).
+ * iqr_parity_test). Above 64 rows the tiled row runs the int8 wave matrix, whose eight 16x16x16
+ * steps of a group are one exact i32 sub-sum too, so those cases compare bit for bit as well.
  *
  * The library is dlopened, as the engine loads it: the test links only the ABI and the HIP
  * runtime.
@@ -674,9 +675,12 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
         { "mad u4 L16 one-f32-row, 2 tokens", 4, 16, 0, kRowF32, 256, 512, 2 },
         { "mad u4 L16 bf16, 5 tokens", 4, 16, 0, kBf16, 256, 256, 5 },
         { "mad u4 L16 bf16, 16 tokens", 4, 16, 0, kBf16, 256, 512, 16 },
-        { "mad u4 L16 one-f32-row, 33 tokens (tiled)", 4, 16, 0, kRowF32, 512, 384, 33 },
-        { "mad u4 L16 one-f32-row, 160 tokens (resident)", 4, 16, 0, kRowF32, 256, 384, 160 },
-        { "mad u4 L16 bf16, 512 tokens (resident)", 4, 16, 0, kBf16, 256, 384, 512 },
+        { "mad u4 L16 one-f32-row, 33 tokens (tiled v_dot4)", 4, 16, 0, kRowF32, 512, 384, 33 },
+        { "mad u4 L16 one-f32-row, 64 tokens (WMMA threshold)", 4, 16, 0, kRowF32, 256, 384, 64 },
+        { "mad u4 L16 one-f32-row, 160 tokens (WMMA)", 4, 16, 0, kRowF32, 256, 384, 160 },
+        { "mad u4 L16 bf16, 512 tokens (WMMA)", 4, 16, 0, kBf16, 256, 384, 512 },
+        { "mad u4 L16 one-f32-row, 512 tokens (WMMA)", 4, 16, 0, kRowF32, 512, 384, 512 },
+        { "mad u4 L16 bf16, 4096 tokens (WMMA)", 4, 16, 0, kBf16, 256, 384, 4096 },
     };
     for (const Case& c : cases) CHECK(run_case(c));
 }
@@ -904,7 +908,7 @@ bool run_vocab(int64_t M) {
  * Run by hand (RAD_IQR_BENCH=1), on the 27B's shapes, for the W0 real/ideal table: the weight is
  * read once a launch, so GEMV's ceiling is VRAM bandwidth; M = 16 adds the ALU term.
  */
-void bench_one(int64_t N, int64_t K, int M, int B, int reps) {
+void bench_one(int64_t N, int64_t K, int M, int B, int reps, bool tiled = false) {
     const Case c{ "bench", (uint32_t)B, 16, 0, kRowF32, N, K, M };
     W w;
     rad_enc_clear(&w.enc);
@@ -984,7 +988,9 @@ void bench_one(int64_t N, int64_t K, int M, int B, int reps) {
                                 pstr("dtype", "i8a8h") };
     RadArgs args{};
     args.t = ops; args.n_t = 7; args.p = params; args.n_p = 5; args.kv_used_max_h = -1;
-    for (int i = 0; i < 5; ++i) lib().gemm(&args, (RadStream)0);
+    const LaunchFn run = (tiled && lib().tiled) ? lib().tiled : lib().gemm;
+    const char* row = (tiled && lib().tiled) ? "tiled" : "m16";
+    for (int i = 0; i < 5; ++i) run(&args, (RadStream)0);
     hipDeviceSynchronize();
     hipEvent_t e0, e1;
     hipEventCreate(&e0);
@@ -992,7 +998,7 @@ void bench_one(int64_t N, int64_t K, int M, int B, int reps) {
     std::vector<double> us;
     for (int b = 0; b < 5; ++b) {
         hipEventRecord(e0, 0);
-        for (int i = 0; i < reps; ++i) lib().gemm(&args, (RadStream)0);
+        for (int i = 0; i < reps; ++i) run(&args, (RadStream)0);
         hipEventRecord(e1, 0);
         hipEventSynchronize(e1);
         float ms = 0;
@@ -1002,8 +1008,8 @@ void bench_one(int64_t N, int64_t K, int M, int B, int reps) {
     std::sort(us.begin(), us.end());
     const double med = us[us.size() / 2];
     const double bytes = (double)weight_bytes(form(L.dtype), N, K);
-    std::printf("N=%lld K=%lld M=%d: %.2f us, %.1f GB/s of weight, %.1f TFLOP/s\n",
-                (long long)N, (long long)K, M, med, bytes / med / 1e3,
+    std::printf("%s N=%lld K=%lld M=%d: %.2f us, %.1f GB/s of weight, %.1f TFLOP/s\n",
+                row, (long long)N, (long long)K, M, med, bytes / med / 1e3,
                 2.0 * M * N * K / med / 1e6);
     hipEventDestroy(e0);
     hipEventDestroy(e1);
@@ -1026,6 +1032,11 @@ TEST(iqr_gemm_bench_on_the_27b_shapes_when_asked) {    if (!std::getenv("RAD_IQR
     bench_one(12288, 2560, 16, 5, 100);
     bench_one(5120, 17408, 1, 4, 50);
     bench_one(5120, 17408, 16, 4, 50);
+    /* The tiled row: v_dot4 below 64 tokens, the int8 WMMA tile above, same shapes. */
+    bench_one(12288, 2560, 512, 5, 20, true);
+    bench_one(12288, 2560, 4096, 5, 8, true);
+    bench_one(5120, 17408, 512, 4, 20, true);
+    bench_one(5120, 17408, 4096, 4, 8, true);
 }
 
 RAD_TEST_MAIN()

@@ -27,6 +27,12 @@
  * block into LDS while all four waves consume it (gemm_iqr_resident_kernel, below). The
  * arithmetic per (token, row) is this kernel's, so the two are bit-identical.
  *
+ * Above kIqrWmmaMinM rows the tiled row runs the same residency on the int8 wave matrix
+ * (gemm_iqr_wmma_kernel, below): the decoded 16x128 unit is the B fragment, a 16-token
+ * activation tile the A fragment, and the eight 16x16x16 steps of a group chain one exact i32
+ * sub-sum. The group fold and the epilogue are the resident tile's, in the same order, so the
+ * output is bit-identical too; only the issue width changes. Small M keeps the v_dot4 tile.
+ *
  * K and N must be multiples of 128 and 16 and the trellis run must divide N; the shim refuses
  * everything else.
  */
@@ -239,6 +245,116 @@ gemm_iqr_resident_kernel(const int8_t* __restrict__ a, const float* __restrict__
     }
 }
 
+/* ---- the wave-matrix prefill tile ----------------------------------------------------------------
+ *
+ * Above kIqrWmmaMinM rows the tiled row keeps the resident tile's residency and changes only the
+ * issue: each group's 128-K sub-sum is eight V_WMMA_I32_16X16X16_IU8 steps over the same exact
+ * integer grid. Per 128 products |a * w| <= 127 * 127 and their sum is 2,064,512, far inside i32,
+ * so the eight steps chain an exact sub with no rounding; the group then folds in f32 exactly as
+ * the resident tile does, in ascending group order, and the row scale is the epilogue's. The
+ * output is therefore bit-identical to the v_dot4 tile, not merely within tolerance.
+ *
+ *   - a workgroup is W waves and serves one 16-row weight tile; wave w owns tokens
+ *     [m0 + 16w, m0 + 16w + 16);
+ *   - wave 0 decodes the 16x128 unit into LDS once per K block, pitched to 33 dwords, and every
+ *     wave reads it as the B fragment (lane l holds weight row l & 15, the step's 16 k);
+ *   - each wave stages its own 16 x 128 activation tile into LDS with the A fragment's lane map
+ *     (lane l holds token row l & 15), then issues the eight steps;
+ *   - the D fragment's lane l element e is row 2e + (l >> 4) of the token tile and column l & 15,
+ *     so the scales are: a_scale of the D row, the weight row's fold factor, the row scale last.
+ *
+ * The activation stage reads dwords, so the shim's 4-byte alignment contract is enough; the
+ * fragment read then uses the decoded tile's own pitch. Tail rows re-read the last real row and
+ * drop the store.
+ */
+constexpr int kIqrWmmaWaves = 4;    /* 16-token slices a workgroup: 64 tokens a weight tile */
+constexpr int kIqrWmmaMinM = 64;    /* at or above this the wave matrix runs; raise past M to
+                                     * force the v_dot4 tile (the switch, there is no other) */
+
+template <class F, int W>
+__global__ void __launch_bounds__(W * kIqrWave) R3D_WAVES(4)
+gemm_iqr_wmma_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
+                     const uint8_t* __restrict__ b, const uint8_t* __restrict__ bs,
+                     uint16_t* __restrict__ y, int M, int N, int K, int a_ld, int y_ld,
+                     uint32_t run_tiles) {
+    const uint32_t lane = threadIdx.x & (kIqrWave - 1);
+    const uint32_t wave = threadIdx.x / kIqrWave;
+    const uint32_t nkb = (uint32_t)(K / 128);
+    const uint32_t nm = ((uint32_t)M + 16u * W - 1u) / (16u * W);
+    const uint32_t rt = (uint32_t)blockIdx.x / nm;
+    const uint32_t m0 = ((uint32_t)blockIdx.x % nm) * (16u * W) + wave * 16u;
+    Ctx c;
+    c.W = b;
+    c.S = bs;
+    c.N = (uint32_t)N;
+    c.nkb = nkb;
+    c.run_tiles = run_tiles;
+    c.tab = nullptr;
+
+    /* The decoded 16x128 weight unit (the B fragment), and each wave's 16x128 activation tile. */
+    __shared__ uint32_t sW[16 * kIqrSWPitch];
+    __shared__ uint32_t sA[W][16 * kIqrSWPitch];
+    const int row0 = (int)rt * 16;
+
+    /* The A fragment's row is lane & 15; the D fragment's rows are 2e + (lane >> 4). */
+    const uint32_t q = lane & 15u;
+    const uint32_t half = lane >> 4;
+    uint32_t dm[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const uint32_t mu = m0 + (uint32_t)(2 * e) + half;
+        dm[e] = mu < (uint32_t)M ? mu : (uint32_t)(M - 1);
+    }
+
+    v8float acc = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+
+    for (uint32_t kb = 0; kb < nkb; ++kb) {
+        if (wave == 0) {
+            const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
+            uint32_t w[16];
+            Dec<F>::rows(r, c, 1.0f, w);
+            Dec<F>::unzero(c, rt, kb, w);
+#pragma unroll
+            for (int qq = 0; qq < 16; ++qq) sW[qq * kIqrSWPitch + lane] = w[qq];
+        }
+        /* Dwords, so the shim's 4-byte alignment is enough; lane l reads dword l of each row. */
+        for (int i = (int)lane; i < 16 * (128 / 4); i += kIqrWave) {
+            const int row = i / (128 / 4), d = i % (128 / 4);
+            const uint32_t rr = m0 + (uint32_t)row < (uint32_t)M ? m0 + (uint32_t)row
+                                                                : (uint32_t)(M - 1);
+            sA[wave][row * kIqrSWPitch + d] =
+                *(const uint32_t*)(a + (size_t)rr * a_ld + (size_t)kb * 128 + 4u * (uint32_t)d);
+        }
+        __syncthreads();
+
+        const uint32_t* ap = sA[wave] + (size_t)q * kIqrSWPitch;
+        const uint32_t* wp = sW + (size_t)q * kIqrSWPitch;
+        v8int sub = v8int{ 0, 0, 0, 0, 0, 0, 0, 0 };
+#pragma unroll
+        for (int k = 0; k < 128; k += 16) {
+            const r3d_u32x4 aq = *(const r3d_u32x4*)(ap + k / 4);
+            const r3d_u32x4 bq = *(const r3d_u32x4*)(wp + k / 4);
+            sub = wmma_i8(v4int{ (int)aq.x, (int)aq.y, (int)aq.z, (int)aq.w },
+                          v4int{ (int)bq.x, (int)bq.y, (int)bq.z, (int)bq.w }, sub);
+        }
+        const float sb = fold_f32<F>(c, row0 + q, kb);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float t = (float)sub[e] * as[(size_t)dm[e] * nkb + kb];
+            acc[e] += t * sb;
+        }
+        __syncthreads();
+    }
+
+    const float rowsc = row_scale<F>(c, row0 + q);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        const uint32_t mu = m0 + (uint32_t)(2 * e) + half;
+        if (mu >= (uint32_t)M) continue;
+        y[(size_t)mu * y_ld + row0 + q] = f32_to_bf16(acc[e] * rowsc);
+    }
+}
+
 int mt_for(int M) {
     int mt = 1;
     while (mt < M && mt < kMTMax) mt *= 2;
@@ -296,6 +412,23 @@ static int launch_resident(const uint8_t* b, const uint8_t* bs, long a, long as,
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+/* The wave-matrix tile's launch: the same (weight tile, 64-token block) geometry, the group on
+ * the int8 WMMA. */
+template <class F>
+static int launch_wmma(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
+                       int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream) {
+    constexpr int W = kIqrWmmaWaves;
+    const long long nt = N / 16;
+    const long long nm = ((long long)M + 16 * W - 1) / (16 * W);
+    const long long blocks = nt * nm;
+    if (blocks > 0x7FFFFFFFll) return -2;   /* no launch geometry this large */
+    const dim3 grid((unsigned)blocks), block(W * kIqrWave);
+    R3D_KLAUNCH(R3D_KNAME((gemm_iqr_wmma_kernel<F, W>)), grid, block, (hipStream_t)stream,
+                (const int8_t*)a, (const float*)as, b, bs, (uint16_t*)y, M, N, K, a_ld, y_ld,
+                run_tiles);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M, int N, int K,
                                 int a_ld, int y_ld, uint32_t word, long stream) {
     const Form f = form(word);
@@ -336,10 +469,11 @@ extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M,
 #undef R3D_IQR_MT_CASE
 }
 
-/* The tiled row's launch: the resident tile (gemm_iqr_resident_kernel). A workgroup decodes a
- * 16x128 weight unit once per K block and reuses it across its four 16-token slices, so the weight
- * is read once per 64 tokens instead of once per 16. The arithmetic per (token, row) is the decode
- * band's, so the result is bit-identical to the chunked launch this replaces. */
+/* The tiled row's launch: above kIqrWmmaMinM rows the int8 wave matrix
+ * (gemm_iqr_wmma_kernel), below it the v_dot4 resident tile (gemm_iqr_resident_kernel). Both decode
+ * a 16x128 weight unit once per K block and reuse it across their four 16-token slices; their
+ * arithmetic per (token, row) is the decode band's, so either is bit-identical to the chunked
+ * launch this replaces. */
 extern "C" int r3d_gemm_iqr_tiled(long a, long as, long b, long bs, long y, int M, int N, int K,
                                   int a_ld, int y_ld, uint32_t word, long stream) {
     const Form f = form(word);
@@ -361,6 +495,8 @@ extern "C" int r3d_gemm_iqr_tiled(long a, long as, long b, long bs, long y, int 
 #define R3D_IQR_RES_CASE(B, SC)                                                                   \
     do {                                                                                          \
         using F = FormT<kTrellisMad, B, 0, 16, 0, SC>;                                             \
+        if (M >= kIqrWmmaMinM)                                                                    \
+            return launch_wmma<F>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run, stream);             \
         return launch_resident<F>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run, stream);             \
     } while (0)
 #define R3D_IQR_RES_SC(B)                                                                         \
