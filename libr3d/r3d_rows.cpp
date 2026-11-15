@@ -2970,9 +2970,10 @@ static const RadKernelInfo kKernels[] = {
   r3d_shape_gemm_nt_q, r3d_rad_unrelayout_iqr },
 
 { "gemm_iqr_tiled", "gemm_nt_q", "gemm",
-  "gemm_nt_q over an IQR weight above the decode band: W4's tiled kernel, and today a chunked "
-  "launch of gemm_iqr_nt_m64 (correct; every 16-row chunk re-reads the weight, so prefill waits "
-  "for the resident tile)",
+  "gemm_nt_q over an IQR weight above the decode band, resident: one workgroup owns a 16-row "
+  "weight tile and four 16-token slices, decodes the 16x128 unit once per 128-K block into LDS "
+  "and reuses it across all four waves, so the weight is read once per 64 tokens instead of once "
+  "per 16 (the chunked gemm_iqr_nt_m64 launch it replaces)",
   "M >= 1, K a multiple of 128 and N of 16, a trellis run dividing N; same forms as the decode "
   "band",
   "I8 a row-major with an f32 scale per (row, 128 of K), W an IQR form's codes, bf16 y; per group "

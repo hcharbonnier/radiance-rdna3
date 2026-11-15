@@ -429,6 +429,8 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
         { "mad u4 L16 bf16, 5 tokens", 4, 16, 0, kBf16, 256, 256, 5 },
         { "mad u4 L16 bf16, 16 tokens", 4, 16, 0, kBf16, 256, 512, 16 },
         { "mad u4 L16 one-f32-row, 33 tokens (tiled)", 4, 16, 0, kRowF32, 512, 384, 33 },
+        { "mad u4 L16 one-f32-row, 160 tokens (resident)", 4, 16, 0, kRowF32, 256, 384, 160 },
+        { "mad u4 L16 bf16, 512 tokens (resident)", 4, 16, 0, kBf16, 256, 384, 512 },
     };
     for (const Case& c : cases) CHECK(run_case(c));
 }
