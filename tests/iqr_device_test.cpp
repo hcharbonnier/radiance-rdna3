@@ -165,6 +165,34 @@ uint32_t canonical_state(const W& w, uint32_t B, uint32_t L, int64_t run, int64_
     return acc;
 }
 
+/* The unnormalised 128-wide Hadamard, in the order r3d_fwht.h's wave transform applies it: the
+ * same stride sequence 1, 2, 4 .. 64 over natural indices. */
+void fwht128_host(float* v) {
+    for (int h = 1; h < 128; h <<= 1)
+        for (int i = 0; i < 128; ++i)
+            if ((i & h) == 0) {
+                const float a = v[i], b = v[i + h];
+                v[i] = a + b;
+                v[i + h] = a - b;
+            }
+}
+
+/* A class's decoded int8 weight (no tcq_rb rescale: the head's classes are off that grid). */
+std::vector<int8_t> decode_class(const W& w, uint32_t B, uint32_t L, int64_t N, int64_t K) {
+    const uint32_t A = ((const uint32_t*)w.data[(size_t)w.find("trellis.mad")].data())[0];
+    const uint32_t Bc = ((const uint32_t*)w.data[(size_t)w.find("trellis.mad")].data())[1];
+    std::vector<int8_t> dec((size_t)(N * K));
+    const int64_t run = 256;
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; ++k) {
+            const uint32_t st = canonical_state(w, B, L, run, n, k);
+            dec[(size_t)(n * K + k)] = (int8_t)mad_value(st, A, Bc);
+        }
+    return dec;
+}
+
+/* The high-precision head reference lives below, beside the class fixture it reads. */
+
 struct Case {
     const char* what;
     uint32_t B, L, RB;
@@ -668,10 +696,11 @@ TEST(iqr_gated_fold_is_bit_identical_to_the_unfused_pair) {
 
 /* ------------------------------------------------------------------ the vocabulary head
  *
- * logits_gemm_vocab_iqr: four IQR classes of the head, the rotated int8 activation (quantised by
- * the row), and the ids scatter. The reference reads the quantiser's own codes and scales back off
- * the scratch, so this holds the GEMM and the scatter; the quantiser is the same had_quant form
- * libr3d already serves.
+ * logits_gemm_vocab_iqr: four IQR classes of the head, the rotated sixteen-bit activation
+ * (q = 128 hi + lo, one f32 scale a group), and the ids scatter. The reference rotates the bf16
+ * input in f32, decodes the class weights and accumulates the block sums in double, so it holds
+ * the head's exact-integer accumulation, its f32 fold and the scatter; the only rounding it does
+ * not model is the sixteen-bit activation quantiser, which the tolerance below covers.
  */
 struct Cls {
     W w;
@@ -735,23 +764,56 @@ bool make_class(Cls& c, int64_t rows, int64_t K, int32_t id0, uint64_t seed) {
                           c.s.data(), c.LS.bytes) == RAD_OK;
 }
 
-bool run_vocab() {
-    const int64_t rows = 256, K = 512, n_vocab = 1024, M = 2;
+/* The high-precision head reference: the activation rotated in f32 from its bf16 values (no
+ * sixteen-bit quantisation), the decoded int8 weight, a double block sum, the f32 block factor,
+ * and the row's own factor once at the end. Nothing is rounded to bf16. */
+void reference16(const Cls& cl, const std::vector<float>& xr, int64_t M, int64_t K, int32_t voff,
+                 int64_t n_vocab, float* want) {
+    const int64_t rows = cl.rows, nkb = K / 128;
+    const std::vector<int8_t> dec = decode_class(cl.w, 4, 16, rows, K);
+    const float* rs = (const float*)cl.w.data[(size_t)cl.w.find("scale")].data();
+    const float* cf = (const float*)cl.w.data[(size_t)cl.w.find("scale.col")].data();
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < rows; ++n) {
+            const int64_t rel = (int64_t)cl.ids[(size_t)n] - voff;
+            if (rel < 0 || rel >= n_vocab) continue;
+            double acc = 0.0;
+            for (int64_t kb = 0; kb < nkb; ++kb) {
+                double sub = 0.0;
+                for (int64_t k = 0; k < 128; ++k)
+                    sub += (double)xr[(size_t)(m * K + kb * 128 + k)] *
+                           (double)dec[(size_t)(n * K + kb * 128 + k)];
+                acc += sub * (double)cf[kb];
+            }
+            want[(size_t)(m * n_vocab + rel)] = (float)(acc * (double)rs[n]);
+        }
+}
+
+/* The activation is held at sixteen bits (|q| <= 127 * 128), so the kernel and this f32 reference
+ * differ by the quantiser's rounding alone: at most half a step (amax / 16256) a value, spread over
+ * the 128-K dot and folded by the row's scale (0.001 .. 0.0019 here). The measured worst case over
+ * M = 1 and 7 and four classes is 3.2e-3 absolute with wanted logits up to ~22 (1.5e-4 relative);
+ * 5e-3 + 2e-4 * |want| leaves >1.5x headroom. That is far below bf16's rounding at these
+ * magnitudes (ulp 0.125 at 22), which is the point of the sixteen-bit activation. */
+constexpr float kLogitAtol = 5e-3f, kLogitRtol = 2e-4f;
+
+bool run_vocab(int64_t M) {
+    const int64_t rows = 256, K = 512, n_vocab = 768, voff = 128;
     Cls cls[4];
     for (int i = 0; i < 4; ++i)
         if (!make_class(cls[i], rows, K, (int32_t)(i * rows), 0x9E3779B97F4A7C15ull * (i + 3)))
             return false;
     const int64_t nkb = K / 128;
-    std::vector<int8_t> xb((size_t)(M * K * 2));
-    for (size_t i = 0; i < xb.size(); i += 2) {
-        xb[i] = (int8_t)(rnd() & 0xFF);
-        xb[i + 1] = (int8_t)(i % 6 ? 0x3C : 0x3D);
+    std::vector<uint16_t> xb((size_t)(M * K));
+    for (auto& v : xb) {
+        const float f = (float)((int)(rnd() % 4096) - 2048) / 1024.0f;
+        v = f32_to_bf16(f);
     }
     std::vector<float> logits((size_t)(M * n_vocab), 0.0f);
 
     void *dx = nullptr, *dl = nullptr, *db[4] = {}, *ds[4] = {}, *di[4] = {};
-    hipMalloc(&dx, xb.size());
-    hipMemcpy(dx, xb.data(), xb.size(), hipMemcpyHostToDevice);
+    hipMalloc(&dx, xb.size() * 2);
+    hipMemcpy(dx, xb.data(), xb.size() * 2, hipMemcpyHostToDevice);
     hipMalloc(&dl, logits.size() * 4);
     hipMemset(dl, 0, logits.size() * 4);
     for (int i = 0; i < 4; ++i) {
@@ -778,9 +840,9 @@ bool run_vocab() {
     RadTensor ops[15] = { ta, tw[0], ts[0], ti[0], tw[1], ts[1], ti[1], tw[2], ts[2], ti[2],
                           tw[3], ts[3], ti[3], tv, tl };
     const RadParam params[] = { pint("M", M), pint("n_vocab", n_vocab), pint("n_embd", K),
-                                pstr("dtype", "bf16"), pint("vocab_offset", 0),
-                                pint("rows0", rows), pint("rows1", 0), pint("rows2", 0),
-                                pint("rows3", 0) };
+                                pstr("dtype", "bf16"), pint("vocab_offset", voff),
+                                pint("rows0", rows), pint("rows1", rows), pint("rows2", rows),
+                                pint("rows3", rows) };
     RadArgs args{};
     args.t = ops; args.n_t = 15; args.p = params; args.n_p = 9; args.kv_used_max_h = -1;
     const int64_t need = lib().logits_scratch(&args);
@@ -790,47 +852,45 @@ bool run_vocab() {
     args.scratch_bytes = need;
     const int rc = lib().logits(&args, (RadStream)0);
     if (rc != RAD_OK || hipDeviceSynchronize() != hipSuccess) {
-        std::fprintf(stderr, "vocab launch rc=%d\n", rc);
+        std::fprintf(stderr, "vocab M=%lld launch rc=%d\n", (long long)M, rc);
         return false;
     }
-    std::vector<uint8_t> q((size_t)(M * K));
-    std::vector<float> as((size_t)(M * nkb));
-    const int64_t qbytes = (M * K + 255) & ~255ll;
-    hipMemcpy(q.data(), dscratch, q.size(), hipMemcpyDeviceToHost);
-    hipMemcpy(as.data(), (uint8_t*)dscratch + qbytes, as.size() * 4, hipMemcpyDeviceToHost);
     hipMemcpy(logits.data(), dl, logits.size() * 4, hipMemcpyDeviceToHost);
-    /* The validated GEMM reference (the same function the m16 test checks) on the head's exact
-     * codes, scales and relaid class weight. The head's own scatter and class selection are the
-     * only things this adds. */
+
+    /* The f32 reference's rotated activation comes from the same bf16 values the kernel reads. */
+    std::vector<float> xr((size_t)(M * K));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t kg = 0; kg < nkb; ++kg) {
+            float v[128];
+            for (int j = 0; j < 128; ++j)
+                v[j] = bf16_to_f32(xb[(size_t)(m * K + kg * 128 + j)]);
+            fwht128_host(v);
+            std::memcpy(&xr[(size_t)(m * K + kg * 128)], v, sizeof v);
+        }
     std::vector<float> want((size_t)(M * n_vocab), 0.0f);
-    std::vector<float> per[4];
-    for (auto& p : per) p.assign((size_t)(M * n_vocab), 0.0f);
-    {
-        const Case rc{ "head", 4, 16, 0, kRowF32, rows, K, M };
-        std::vector<int8_t> qi(q.size());
-        for (size_t i = 0; i < q.size(); ++i) qi[i] = (int8_t)q[i];
-        const std::vector<uint16_t> wr =
-            reference(cls[0].w, rc, qi, as, cls[0].s.data(), (int64_t)cls[0].s.size());
-        for (int m = 0; m < M; ++m)
-            for (int64_t r = 0; r < rows; ++r) {
-                const int32_t id = cls[0].ids[(size_t)r];
-                if (id < 0 || id >= n_vocab) continue;
-                const float v = bf16_to_f32(wr[(size_t)(m * rows + r)]);
-                want[(size_t)(m * n_vocab + id)] = v;
-                per[0][(size_t)(m * n_vocab + id)] = v;
-            }
-    }
+    for (int i = 0; i < 4; ++i)
+        reference16(cls[i], xr, M, K, (int32_t)voff, n_vocab, want.data());
+
     size_t bad = 0, first = want.size();
-    for (size_t i = 0; i < want.size(); ++i)
-        if (memcmp(&logits[i], &want[i], 4) != 0) {
+    double worst_abs = 0.0, worst_rel = 0.0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        const double d = std::fabs((double)logits[i] - (double)want[i]);
+        const double tol = (double)kLogitAtol + (double)kLogitRtol * std::fabs((double)want[i]);
+        worst_abs = d > worst_abs ? d : worst_abs;
+        if (want[i] != 0.0f) {
+            const double r = d / std::fabs((double)want[i]);
+            worst_rel = r > worst_rel ? r : worst_rel;
+        }
+        if (d > tol) {
             ++bad;
             if (first == want.size()) first = i;
         }
+    }
     if (bad)
-        std::fprintf(stderr, "vocab: %zu of %zu logits differ; first %zu got %.6f want %.6f "
-                             "(classes %.6f %.6f %.6f %.6f)\n",
-                     bad, want.size(), first, logits[first], want[first], per[0][first],
-                     per[1][first], per[2][first], per[3][first]);
+        std::fprintf(stderr, "vocab M=%lld: %zu of %zu logits outside tol; first %zu got %.7g "
+                             "want %.7g; worst |d| %.3g, worst rel %.3g\n",
+                     (long long)M, bad, want.size(), first, logits[first], want[first], worst_abs,
+                     worst_rel);
     for (int i = 0; i < 4; ++i) {
         hipFree(db[i]); hipFree(ds[i]); hipFree(di[i]);
     }
@@ -954,7 +1014,8 @@ TEST(iqr_vocab_head_matches_its_reference) {
     if (!lib().ok() || !lib().logits || !lib().logits_scratch) return;
     int nd = 0;
     if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) return;
-    CHECK(run_vocab());
+    CHECK(run_vocab(1));
+    CHECK(run_vocab(7));
 }
 
 TEST(iqr_gemm_bench_on_the_27b_shapes_when_asked) {    if (!std::getenv("RAD_IQR_BENCH") || !lib().ok()) return;

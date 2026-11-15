@@ -1,20 +1,25 @@
 /* r3d_iqr_logits.hip -- logits_gemm_vocab over an IQR head, on gfx11.
  *
- * The head is up to four width classes of the vocabulary (r3d_iqr.h's lm form): each class is an
- * IQR weight of rows<i> rows and its ids, the global vocabulary id of each row. The activation is
- * rotated by the same 128-wide Hadamard the head's codes were trained against, quantised to int8
- * with one f32 a (token, 128), and each class's GEMM writes bf16, which the scatter widens to the
- * op's f32 logits at the ids in range.
+ * The head is up to four width classes of the vocabulary: each class is an IQR weight of rows<i>
+ * rows and its ids, the global vocabulary id of each row. The activation is rotated by the same
+ * 128-wide Hadamard the head's codes were trained against and held at sixteen bits: one f32 scale
+ * a (token, 128) over integers q = 128 hi + lo, |q| <= 127 * 128, hi and lo int8. Each 128-K
+ * block's dot is then two exact int8 sums over the same decoded weight tile, the first scaled by
+ * 128 in the integer accumulator: an exact integer per (row, token, block), folded once into f32,
+ * and the row's own factor taken in the epilogue. The class's ids scatter the f32 logits; ids
+ * outside this rank's share are dropped. Nothing on the path is bf16.
  *
- * W4 fallback: one quantise, class GEMMs and scatters, the class logits narrowed to bf16 between
- * the GEMM and the f32 logits. W11 replaces the class path with the head's own 16-bit wave matrix
- * so the accumulation stays f32; until then this is the row that lets a container serve.
+ * W12: this replaces the per-class int8 GEMM and bf16 logits plane. The int8 grid cost the head
+ * 2e-5 KL on its own (libr4d/r4d_logits_vocab.hip); sixteen bits are below bf16's rounding, and the
+ * accumulation stays exact until the fold. One launch decodes a class, as the row's contract
+ * allows; the classes are independent and write disjoint ids.
  */
 #include "r3d_args.h"
 #include "r3d_codecs.h"
 #include "r3d_common.h"
 #include "r3d_fwht.h"
 #include "r3d_iqr.h"
+#include "r3d_iqr_dec.h"
 #include "r3d_launch.h"
 
 #include <cmath>
@@ -23,31 +28,14 @@
 namespace {
 
 using namespace r3d_iqr;
-
-/* r3d_gemm_iqr_m16.hip: the chunked m16 launch the class GEMMs use until W11's head kernel. */
-extern "C" int r3d_gemm_iqr_tiled(long a, long as, long b, long bs, long y, int M, int N, int K,
-                                  int a_ld, int y_ld, uint32_t word, long stream);
-/* The validated decode-row shim (r3d_plugin.h): the class GEMMs take this path so the head cannot
- * drift from the row the dense fixtures and the host-reference test cover. */
-extern "C" int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* a, RadStream s);
+using namespace r3d_iqr_dev;
 
 constexpr uint32_t kThreads = 32;
-constexpr float kTopI8 = 127.0f;
+/* |q| <= 127 * 128: hi = floor((q + 64) / 128) stays in int8, lo = q - 128 hi in [-64, 63]. */
+constexpr float kQMax = 127.0f * 128.0f;
 
 __device__ __forceinline__ float ld_bf(const uint16_t* p, uint32_t i) {
     return bf16_to_f32((uint16_t)ldg_u16(p + i));
-}
-__device__ __forceinline__ float clamp_top(float c, float top) {
-    if (c > top) c = top;
-    if (c < -top) c = -top;
-    return c;
-}
-__device__ __forceinline__ uint32_t i8_codes4(const float* v, float inv) {
-    const uint32_t b0 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[0] * inv, kTopI8));
-    const uint32_t b1 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[1] * inv, kTopI8));
-    const uint32_t b2 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[2] * inv, kTopI8));
-    const uint32_t b3 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[3] * inv, kTopI8));
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
 }
 __device__ __forceinline__ float wave_max_f(float v) {
     v = fmaxf(v, r3d_xor_lane<16>(v));
@@ -59,17 +47,18 @@ __device__ __forceinline__ float wave_max_f(float v) {
 }
 
 /* The head's activation: one wave a (token, 128-group), the FWHT of the rotated weights' input,
- * then int8 with the group's scale. */
+ * then q = 128 hi + lo at sixteen bits under the group's scale. An all-zero group is scale 1. */
 __global__ __launch_bounds__(kThreads) void logits_quant_kernel(
-    const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n,
-    uint32_t x_ld) {
+    const uint16_t* __restrict__ x, int8_t* __restrict__ qh, int8_t* __restrict__ ql,
+    float* __restrict__ s, uint32_t n, uint32_t x_ld) {
     constexpr int HAD = 128, VPL = HAD / 32;
     static_assert(VPL == 4, "one wave's 32 lanes hold the group's 128 columns as four each");
     const uint32_t row = blockIdx.x, kg = blockIdx.y;
     const uint32_t nkb = n / 128u;
     const uint32_t lane = threadIdx.x & 31;
     const uint16_t* a = x + (size_t)row * x_ld + (size_t)kg * HAD;
-    uint8_t* qr = q + (size_t)row * n + (size_t)kg * HAD;
+    int8_t* qhr = qh + (size_t)row * n + (size_t)kg * HAD;
+    int8_t* qlr = ql + (size_t)row * n + (size_t)kg * HAD;
     const int base = lane * VPL;
     float v[VPL];
 #pragma unroll
@@ -79,22 +68,182 @@ __global__ __launch_bounds__(kThreads) void logits_quant_kernel(
 #pragma unroll
     for (int j = 0; j < VPL; ++j) m = fmaxf(m, fabsf(v[j]));
     m = wave_max_f(m);
-    const float sc = m > 0.0f ? m / kTopI8 : 1.0f;
+    const float sc = m > 0.0f ? m / kQMax : 1.0f;
     const float inv = 1.0f / sc;
+    uint32_t hp = 0, lp = 0;
+#pragma unroll
+    for (int j = 0; j < VPL; ++j) {
+        const int q = (int)rintf(fminf(fmaxf(v[j] * inv, -kQMax), kQMax));
+        const int hi = (q + 64) >> 7, lo = q - hi * 128;
+        hp |= ((uint32_t)hi & 0xFFu) << (8u * (uint32_t)j);
+        lp |= ((uint32_t)lo & 0xFFu) << (8u * (uint32_t)j);
+    }
     if (lane == 0) s[(size_t)row * nkb + kg] = sc;
-    *(uint32_t*)(qr + (uint32_t)base) = i8_codes4(v, inv);
+    *(uint32_t*)(qhr + (uint32_t)base) = hp;
+    *(uint32_t*)(qlr + (uint32_t)base) = lp;
 }
 
-/* A class's ids scatter its bf16 rows to the f32 logits; ids outside this rank's vocabulary are
- * dropped (the head is sharded by `vocab_offset`). */
-__global__ __launch_bounds__(128) void logits_scatter_kernel(
-    const uint16_t* __restrict__ y, const int32_t* __restrict__ ids, float* __restrict__ logits,
-    uint32_t n_vocab, uint32_t rows, int32_t voff, uint32_t y_ld, uint32_t ld) {
-    const uint32_t m = blockIdx.x, r = blockIdx.y * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    const int64_t id = (int64_t)ids[r] - voff;
-    if (id < 0 || id >= (int64_t)n_vocab) return;
-    logits[(size_t)m * ld + id] = bf16_to_f32((uint16_t)ldg_u16(y + (size_t)m * y_ld + r));
+/* i32 sub of four signed int8 pairs, exact (r3d_gemm_iqr_m16.hip): gfx11's dot4 is signed x
+ * unsigned, so both operands are negated, which is the signed product. */
+__device__ __forceinline__ int dot4_i8(uint32_t a4, uint32_t w4, int acc) {
+    return __builtin_amdgcn_sudot4(true, (int)w4, true, (int)a4, acc, false);
+}
+
+/* One wave a 16-row tile of one class, MT tokens a block. Each /128-K block decodes the lane's
+ * four columns of all 16 rows once, stages the 16 x 128 int8 tile in LDS, then every (token, row)
+ * pair is a full 128-K dot of 32 v_dot4 per plane: hi scaled by 128 in the integer, lo added, the
+ * block folded once into f32 and the row's factor taken after the K loop. */
+template <class F, int MT>
+__global__ void __launch_bounds__(kThreads) R3D_WAVES(4) logits16_kernel(
+    const int8_t* __restrict__ xh, const int8_t* __restrict__ xl,
+    const float* __restrict__ xs, const uint8_t* __restrict__ b,
+    const uint8_t* __restrict__ bs, const int32_t* __restrict__ ids, float* __restrict__ logits,
+    int M, int N, int K, int ld, int voff, int n_vocab, uint32_t run_tiles) {
+    const uint32_t lane = threadIdx.x & (kThreads - 1);
+    const uint32_t rt = blockIdx.x;
+    const int tok0 = (int)blockIdx.y * MT;
+    if (tok0 >= M) return;
+    const uint32_t nkb = (uint32_t)(K / 128);
+    Ctx c;
+    c.W = b;
+    c.S = bs;
+    c.N = (uint32_t)N;
+    c.nkb = nkb;
+    c.run_tiles = run_tiles;
+    c.tab = nullptr;   /* the head's classes are the computed trellis */
+
+    __shared__ uint8_t sW[16 * 128];
+
+    const int row0 = (int)rt * 16;
+    constexpr int NP = (MT * 16 + (int)kThreads - 1) / (int)kThreads;
+    float acc[NP];
+#pragma unroll
+    for (int i = 0; i < NP; ++i) acc[i] = 0.0f;
+
+    for (uint32_t kb = 0; kb < nkb; ++kb) {
+        const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
+        uint32_t w[16];
+        Dec<F>::rows(r, c, 1.0f, w);
+        Dec<F>::unzero(c, rt, kb, w);
+#pragma unroll
+        for (int q = 0; q < 16; ++q) *(uint32_t*)(sW + q * 128 + 4u * lane) = w[q];
+        __syncthreads();
+
+#pragma unroll
+        for (int i = 0; i < NP; ++i) {
+            const int p = (int)lane + (int)kThreads * i;
+            if constexpr (MT * 16 < (int)kThreads) {
+                if (p >= MT * 16) continue;
+            }
+            const int m = p / 16, q = p % 16;
+            const int tok = tok0 + m;
+            if (tok >= M) continue;
+            const int8_t* h = xh + (long long)tok * K + (long long)kb * 128;
+            const int8_t* l = xl + (long long)tok * K + (long long)kb * 128;
+            const uint32_t* wp = (const uint32_t*)(sW + q * 128);
+            int sh = 0, sl = 0;
+#pragma unroll
+            for (int c4 = 0; c4 < 32; ++c4) {
+                const uint32_t ww = wp[c4];
+                sh = dot4_i8(*(const uint32_t*)(h + 4 * c4), ww, sh);
+                sl = dot4_i8(*(const uint32_t*)(l + 4 * c4), ww, sl);
+            }
+            /* q = 128 hi + lo: the exact integer this block adds before any f32 rounding */
+            const int total = sh * 128 + sl;
+            const float sa = xs[(size_t)tok * nkb + kb];
+            const float sb = fold_f32<F>(c, (uint32_t)(row0 + q), kb);
+            acc[i] += (float)total * sa * sb;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < NP; ++i) {
+        const int p = (int)lane + (int)kThreads * i;
+        if constexpr (MT * 16 < (int)kThreads) {
+            if (p >= MT * 16) continue;
+        }
+        const int m = p / 16, q = p % 16;
+        const int tok = tok0 + m;
+        if (tok >= M) continue;
+        const int32_t id = ids[row0 + q];
+        const long long rel = (long long)id - voff;
+        if (rel < 0 || rel >= n_vocab) continue;
+        logits[(size_t)tok * ld + rel] = acc[i] * row_scale<F>(c, (uint32_t)(row0 + q));
+    }
+}
+
+int mt_for(int M) {
+    int mt = 1;
+    while (mt < M && mt < 16) mt *= 2;
+    return mt;
+}
+
+int form_supported(const Form& f) {
+    /* The forms the head's layout hook stores: the computed trellis, L = 16, one f32 a row under
+     * a factor a 128-K block, or a bf16 scale a (row, 128). */
+    return f.kind == kTrellisMad && f.L == 16 && f.lrb == 0 &&
+           (f.scale == kRowF32 || f.scale == kBf16) && f.bits >= 2 && f.bits <= 7;
+}
+
+/* The launcher, on addresses, so the templates stay in this unit. */
+template <class F, int MT>
+static int launch_mt(const int8_t* xh, const int8_t* xl, const float* xs, const uint8_t* b,
+                     const uint8_t* bs, const int32_t* ids, float* y, int M, int N, int K, int ld,
+                     int voff, int n_vocab, uint32_t run_tiles, long stream) {
+    const dim3 grid((unsigned)(N / 16), (unsigned)((M + MT - 1) / MT));
+    R3D_KLAUNCH(R3D_KNAME((logits16_kernel<F, MT>)), grid, dim3(kThreads), (hipStream_t)stream,
+                xh, xl, xs, b, bs, ids, y, M, N, K, ld, voff, n_vocab, run_tiles);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+#define R3D_LOGITS_MT_CASE(B, SC)                                                                 \
+    do {                                                                                          \
+        using F = FormT<kTrellisMad, B, 0, 16, 0, SC>;                                             \
+        switch (mt) {                                                                             \
+            case 1:  return launch_mt<F, 1>(xh, xl, xs, B_, S_, ids, y, M, N, K, ld, voff,         \
+                                            n_vocab, run, stream);                                 \
+            case 2:  return launch_mt<F, 2>(xh, xl, xs, B_, S_, ids, y, M, N, K, ld, voff,         \
+                                            n_vocab, run, stream);                                 \
+            case 4:  return launch_mt<F, 4>(xh, xl, xs, B_, S_, ids, y, M, N, K, ld, voff,         \
+                                            n_vocab, run, stream);                                 \
+            case 8:  return launch_mt<F, 8>(xh, xl, xs, B_, S_, ids, y, M, N, K, ld, voff,         \
+                                            n_vocab, run, stream);                                 \
+            default: return launch_mt<F, 16>(xh, xl, xs, B_, S_, ids, y, M, N, K, ld, voff,        \
+                                             n_vocab, run, stream);                                \
+        }                                                                                         \
+    } while (0)
+
+int launch_class(const int8_t* xh, const int8_t* xl, const float* xs, const RadTensor* w,
+                 const RadTensor* sc, const RadTensor* id, float* y, int M, int N, int K, int ld,
+                 int voff, int n_vocab, long stream) {
+    const Form f = form(w->dtype);
+    if (!form_supported(f)) return -6;
+    const unsigned lrun = (unsigned)((w->dtype >> 22) & 15u);
+    if (lrun < 4 || N % (int)(1u << lrun)) return -2;
+    const int mt = mt_for(M);
+    const uint8_t* B_ = (const uint8_t*)r3d_p(w);
+    const uint8_t* S_ = (const uint8_t*)r3d_p(sc);
+    const int32_t* ids = (const int32_t*)r3d_p(id);
+    const uint32_t run = (1u << lrun) / 16u;
+
+#define R3D_LOGITS_SC_CASE(B)                                                                     \
+    do {                                                                                          \
+        if (f.scale == kRowF32) { R3D_LOGITS_MT_CASE(B, kRowF32); }                               \
+        R3D_LOGITS_MT_CASE(B, kBf16);                                                             \
+    } while (0)
+
+    switch (f.bits) {
+        case 2: R3D_LOGITS_SC_CASE(2);
+        case 3: R3D_LOGITS_SC_CASE(3);
+        case 4: R3D_LOGITS_SC_CASE(4);
+        case 5: R3D_LOGITS_SC_CASE(5);
+        case 6: R3D_LOGITS_SC_CASE(6);
+        case 7: R3D_LOGITS_SC_CASE(7);
+        default: return -6;
+    }
+#undef R3D_LOGITS_SC_CASE
+#undef R3D_LOGITS_MT_CASE
 }
 
 int64_t align256(int64_t v) { return (v + 255) & ~255ll; }
@@ -103,7 +252,7 @@ int64_t align256(int64_t v) { return (v + 255) & ~255ll; }
 
 extern "C" {
 
-/* A's int8 codes, its scales, then the class logits' bf16 plane. */
+/* The two int8 activation planes, then the group scales. */
 int64_t r3d_logits_gemm_vocab_iqr_scratch(const RadArgs* a) {
     if (!a) return 0;
     const RadTensor* x = r3d_opt(a, 0);
@@ -117,14 +266,11 @@ int64_t r3d_logits_gemm_vocab_iqr_scratch(const RadArgs* a) {
     }
     if (M <= 0 || n_embd <= 0 || rows <= 0) return 0;
     if (n_embd % 128) return 0;
-    return align256(M * n_embd) + align256(M * (n_embd / 128) * 4) + align256(M * rows * 2) + 256;
+    return align256(M * n_embd) + align256(M * n_embd) +
+           align256(M * (n_embd / 128) * 4) + 256;
 }
 
 int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream stream) {
-    /* The class GEMM goes through the validated decode-row shim, and the head's own test now
-     * compares against that same validated reference: the earlier "device 10.56 vs 462" was the
-     * test's hand-written reference reading the scale tail at the wrong offset, not this row. */
-#if 1
     if (!a || a->n_t < 15 || !a->scratch) return R3D_NO(RAD_E_INVAL);
     const RadTensor* x = r3d_opt(a, 0);
     const RadTensor* lg = r3d_opt(a, 14);
@@ -143,6 +289,7 @@ int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream stream) {
     long long lrows = 0;
     const long long ld = r3d_rows_pitch(lg, n_vocab, &lrows);
     if (ld < n_vocab || lrows < M) return R3D_NO(RAD_E_SHAPE);
+    if (((uintptr_t)r3d_wp(lg) & 3u)) return R3D_NO(RAD_E_ALIGN);
 
     long long rows[4] = { 0, 0, 0, 0 };
     long long maxrows = 0;
@@ -162,47 +309,40 @@ int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream stream) {
         if (!is_weight_dtype(w[i]->dtype) || !is_scale_dtype(sc[i]->dtype)) return R3D_NO(RAD_E_DTYPE);
         if (id[i]->dtype != RAD_I32 || r3d_numel(id[i]) < rows[i]) return R3D_NO(RAD_E_SHAPE);
         if (kernel_word(w[i]->dtype) != kernel_word(sc[i]->dtype)) return R3D_NO(RAD_E_DTYPE);
+        const Form f = form(w[i]->dtype);
+        if (!form_supported(f)) return R3D_NO(RAD_E_UNSUPPORTED);
+        if (r3d_numel(w[i]) != rows[i] * n_embd || r3d_numel(sc[i]) < 1)
+            return R3D_NO(RAD_E_SHAPE);
+        if (((uintptr_t)r3d_p(w[i]) & 15u) || ((uintptr_t)r3d_p(sc[i]) & 15u))
+            return R3D_NO(RAD_E_ALIGN);
+        const unsigned lrun = (unsigned)((w[i]->dtype >> 22) & 15u);
+        if (lrun < 4 || rows[i] % (long long)(1u << lrun)) return R3D_NO(RAD_E_SHAPE);
     }
 
     const int64_t need = r3d_logits_gemm_vocab_iqr_scratch(a);
     if (need <= 0 || a->scratch_bytes < need) return R3D_NO(RAD_E_SCRATCH);
-    uint8_t* q = (uint8_t*)a->scratch;
-    float* s = (float*)(q + align256(M * n_embd));
-    uint16_t* y = (uint16_t*)((uint8_t*)s + align256(M * (n_embd / 128) * 4));
+    int8_t* qh = (int8_t*)a->scratch;
+    int8_t* ql = qh + align256(M * n_embd);
+    float* s = (float*)((uint8_t*)ql + align256(M * n_embd));
 
     const dim3 qgrid((uint32_t)M, (uint32_t)(n_embd / 128));
     R3D_KLAUNCH(R3D_KNAME(logits_quant_kernel), qgrid, dim3(kThreads), (hipStream_t)stream,
-                (const uint16_t*)r3d_p(x), q, s, (uint32_t)n_embd, (uint32_t)x_ld);
+                (const uint16_t*)r3d_p(x), qh, ql, s, (uint32_t)n_embd, (uint32_t)x_ld);
 
     for (int i = 0; i < 4; ++i) {
         if (!w[i]) continue;
-        RadTensor qa{}, qs{}, qy{};
-        qa.data = q; qa.dtype = RAD_I8; qa.rank = 2; qa.shape[0] = M; qa.shape[1] = n_embd;
-        qs.data = s; qs.dtype = RAD_F32; qs.rank = 2; qs.shape[0] = M;
-        qs.shape[1] = n_embd / 128;
-        qy.data = y; qy.dtype = RAD_BF16; qy.rank = 2; qy.shape[0] = M; qy.shape[1] = rows[i];
-        for (RadTensor* t : { &qa, &qs, &qy }) rad_tensor_pack(t);
-        RadParam gp[5] = {};
-        gp[0].key = "M"; gp[0].kind = RAD_P_INT; gp[0].ival = M;
-        gp[1].key = "N"; gp[1].kind = RAD_P_INT; gp[1].ival = rows[i];
-        gp[2].key = "K"; gp[2].kind = RAD_P_INT; gp[2].ival = n_embd;
-        gp[3].key = "group"; gp[3].kind = RAD_P_INT; gp[3].ival = 128;
-        gp[4].key = "dtype"; gp[4].kind = RAD_P_STR; gp[4].sval = "i8a8h";
-        RadTensor gt[7] = { qa, qs, *w[i], *sc[i], qy, RadTensor{}, RadTensor{} };
-        RadArgs ga{};
-        ga.t = gt;
-        ga.n_t = 7;
-        ga.p = gp;
-        ga.n_p = 5;
-        ga.kv_used_max_h = -1;
-        if (r3d_rad_gemm_nt_q_iqr_m16(&ga, stream) != RAD_OK) return R3D_NO(RAD_E_DEVICE);
-        const dim3 sgrid((uint32_t)M, (uint32_t)((rows[i] + 127) / 128));
-        R3D_KLAUNCH(R3D_KNAME(logits_scatter_kernel), sgrid, dim3(128), (hipStream_t)stream, y,
-                    (const int32_t*)r3d_p(id[i]), (float*)r3d_wp(lg), (uint32_t)n_vocab,
-                    (uint32_t)rows[i], (int32_t)voff, (uint32_t)rows[i], (uint32_t)ld);
+        const int rc = launch_class(qh, ql, s, w[i], sc[i], id[i], (float*)r3d_wp(lg), (int)M,
+                                    (int)rows[i], (int)n_embd, (int)ld, (int)voff, (int)n_vocab,
+                                    (long)stream);
+        if (rc == -1) return R3D_NO(RAD_E_INVAL);
+        if (rc == -2) return R3D_NO(RAD_E_SHAPE);
+        if (rc == -3) return R3D_NO(RAD_E_STRIDE);
+        if (rc == -5) return R3D_NO(RAD_E_ALIGN);
+        if (rc == -6) return R3D_NO(RAD_E_UNSUPPORTED);
+        if (rc == -4) return R3D_NO(RAD_E_DEVICE);
+        if (rc) return R3D_NO(RAD_E_DEVICE);
     }
     return hipGetLastError() == hipSuccess ? RAD_OK : R3D_NO(RAD_E_DEVICE);
-#endif
 }
 
 }  // extern "C"
