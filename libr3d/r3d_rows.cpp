@@ -235,6 +235,20 @@ static const RadOperandSpec oQsaTailStore[] = { { "k", RAD_OPD_IN, 0 },
                                                 { "cu", RAD_OPD_IN, 0 },
                                                 { "state", RAD_OPD_INOUT, 0 },
                                                 { "sidx", RAD_OPD_IN, 0 } };
+/* The QSA indexer's compressed key, libr4d's schema exactly: `block_size` spells `ratio` for the
+ * block-key store's KV group, and `page`/`pos` are optional. */
+static const RadParamSpec pQsaBlockKey[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
+                                             P_INT("rotary_dim"), P_INTO("pos0"),
+                                             P_INTO("block_size"), P_F64("eps"), P_F64("theta"),
+                                             P_F64O("scale"), P_F64O("wadd"), P_STR("dtype"),
+                                             P_STRO("mode"), P_STRO("sections"),
+                                             P_F64O("yarn_factor"), P_F64O("yarn_low"),
+                                             P_F64O("yarn_high"), P_F64O("yarn_magnitude") };
+static const RadOperandSpec oQsaBlockKey[] = { { "k", RAD_OPD_IN, 0 },
+                                               { "w", RAD_OPD_WEIGHT, 0 },
+                                               { "page", RAD_OPD_IN, 1 },
+                                               { "pos", RAD_OPD_IN, 1 },
+                                               { "out", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pGatedHadQuantI8[] = { P_INT("M"), P_INT("n"), P_INT("group"),
                                                  P_STR("dtype"), P_STRO("act"), P_INTO("mode") };
 static const RadOperandSpec oGatedHadQuantI8[] = { { "a", RAD_OPD_IN, 0 },
@@ -839,6 +853,12 @@ static const RadOpSchema kSchemas[] = {
            "The QSA indexer's tail: the raw index keys of tokens that have not completed a block, "
            "into a per-layer linear KV state. Position p lands at row p % ring; only the last "
            "ring tokens of a sequence's chunk write."),
+    SCHEMA("qsa_block_key", pQsaBlockKey, oQsaBlockKey,
+           "The QSA indexer's compressed key: one vector per `ratio` rows of k. The block's mean "
+           "is accumulated in f32 and rounded to bf16 before the norm; the RMS norm uses gain "
+           "(wadd + w); the key is rotated at the block's first-token position (`pos[b]` under "
+           "mode/sections, or `pos0 + b*ratio`) with YaRN when given. `page[b]` is the output row; "
+           "a negative entry writes nothing."),
     SCHEMA("gated_had_quant_i8", pGatedHadQuantI8, oGatedHadQuantI8,
            "A gated product (mode 0 silu(a)*b, mode 1 sigmoid(a)*b), a block Hadamard along n, "
            "then per-row symmetric int8: the rotation shrinks the row maximum, so int8 beats e4m3."),
@@ -1554,6 +1574,8 @@ static const RadConstraint cHadQuantI8[] = { C_IN("dtype", "bf16"), C_GE("group"
 static const RadConstraint cGeluMulQuantI8[] = { C_IN("dtype", "bf16"), C_DIV("n", 16) };
 static const RadConstraint cKvLenTrim[] = { C_GE("max_seqs", 1), C_LE("max_seqs", 64) };
 static const RadConstraint cQsaTailStore[] = { C_IN("dtype", "bf16"), C_GE("seqs", 1) };
+/* The block key's LDS is one f32 row, so n is bounded by it; the board's index head is 128. */
+static const RadConstraint cQsaBlockKey[] = { C_IN("dtype", "bf16"), C_LE("n", 4096) };
 /* group is the block width: the kernel instantiates 128, 256 and 512 (the shim declines the
  * DIV-legal 384, which no wave form serves). */
 static const RadConstraint cGatedHadQuantI8[] = { C_IN("dtype", "bf16"), C_DIV("group", 128),
@@ -2272,6 +2294,18 @@ static const RadKernelInfo kKernels[] = {
   ROW(cQsaTailStore), NOTUNE,
   nullptr, nullptr, r3d_rad_qsa_tail_store, nullptr, nullptr, nullptr,
   r3d_shape_qsa_tail_store },
+
+{ "qsa_block_key_bf16", "qsa_block_key", "attn",
+  "the QSA indexer's compressed key: mean of `ratio` raw keys, RMS-normed, rotated at the "
+  "block's first position",
+  "one workgroup a block; the mean is rounded to bf16 before the norm (the reference's order); "
+  "`pos` is a per-block list or [M,3] components under mode/sections, `pos0` the contiguous "
+  "tiling; page -1 writes nothing, n <= 4096 (one LDS row)",
+  "bf16 k [M*ratio, n], f32 gain, optional i32 page/pos; bf16 out, a block a row",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cQsaBlockKey), NOTUNE,
+  nullptr, nullptr, r3d_rad_qsa_block_key, nullptr, nullptr, nullptr,
+  r3d_shape_qsa_block_key },
 
 { "gated_had_quant_i8_bf16", "gated_had_quant_i8", "quant",
   "a gated product (silu(a)*b or sigmoid(a)*b), a block Hadamard along n, then per-row int8",

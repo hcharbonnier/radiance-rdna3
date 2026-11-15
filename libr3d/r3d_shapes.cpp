@@ -460,6 +460,17 @@ int r3d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand, RadOpdDesc
     R3D_PICK(list);
 }
 
+/* The QSA compressed key: k [M*ratio, n], w [n] f32, page [M], pos [M], out [M, n]. */
+int r3d_shape_qsa_block_key(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t r = gi(p, n_p, "ratio", 4);
+    if (M <= 0 || n <= 0 || r <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = { opd(D, M * r, n), opd((uint32_t)RAD_F32, n),
+                                opd_idx(M, M), opd_idx(M, M * r), opd(D, M, n) };
+    R3D_PICK(list);
+}
+
 /* The gated Hadamard int8: a [M, n], b [M, n] (optional, fused gate_up when absent), q [M, n] i8,
  * scale [M]. */
 int r3d_shape_gated_had_quant_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

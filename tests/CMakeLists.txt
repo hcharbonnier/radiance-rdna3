@@ -178,11 +178,12 @@ endif()
 # iqr_device_test dlopens the built libr3d, so it exists only where that library is built;
 # hc_layout_test is host arithmetic over the same plugin, so it needs no card.
 if(TARGET libr3d AND RAD_HIP_FOUND)
-  set(RAD_TESTS_WITH_R3D_DEVICE iqr_device_test ple_hc_device_test)
+  set(RAD_TESTS_WITH_R3D_DEVICE iqr_device_test ple_hc_device_test qsa_block_key_device_test)
   set(RAD_TESTS_WITH_R3D_HOST hc_layout_test)
 else()
   list(FILTER RAD_TESTS EXCLUDE REGEX "/iqr_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/ple_hc_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_block_key_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/hc_layout_test\\.cpp$")
 endif()
 foreach(t ${RAD_TESTS})
@@ -362,9 +363,9 @@ if(RAD_HIP_FOUND)
       TIMEOUT ${RAD_TEST_TIMEOUT}
       ENVIRONMENT "${RAD_TEST_CARD_ENV}")
   endforeach()
-  # The IQR GEMM and the PLE/HC ladder against their host references, on the card the library was
-  # built for.
-  foreach(n iqr_device_test ple_hc_device_test)
+  # The IQR GEMM, the PLE/HC ladder and the QSA block key against their host references, on the
+  # card the library was built for.
+  foreach(n iqr_device_test ple_hc_device_test qsa_block_key_device_test)
     if(TARGET ${n})
       add_test(NAME ${n}_card COMMAND ${n})
       set_tests_properties(${n}_card PROPERTIES
