@@ -35,6 +35,9 @@
 namespace {
 
 constexpr int kThreads = 256;
+/* gridDim.y is 16 bits on HIP, so rows past it are split onto z. `rows` is bounded by INT_MAX in
+ * the shim, well inside 65535 * 65535. */
+constexpr unsigned kGridY = 65535;
 
 /* One activation element, widened to f32 exactly. DT is an R3D_DT_* code; q and bk may differ (the
  * indexer's query is the activation dtype, its block-key group is bf16 on this model). */
@@ -57,7 +60,7 @@ __global__ __launch_bounds__(kThreads) void qsa_score_kernel(
     /* Every lane of a workgroup has the same query row, so its sequence and live block count are
      * computed once. A row no sequence holds is skipped, as in the reference. */
     __shared__ int sh_seq, sh_nbs;
-    const int m = (int)blockIdx.y;
+    const int m = (int)((unsigned)blockIdx.y + (unsigned)blockIdx.z * kGridY);
     const int b = (int)blockIdx.x * kThreads + (int)threadIdx.x;
     if (threadIdx.x == 0) {
         int s = -1;
@@ -120,7 +123,9 @@ int qsa_emit(const void* q, const void* bk, const int32_t* bt, const int32_t* cu
              const int32_t* nc, float* out, int n, int heads, int nb, int nseq, int pages,
              int rows, int q_rs, int q_cs, int bk_pg, int bt_rs, int bt_cs, int o_rs, int o_cs,
              float rn, hipStream_t stream) {
-    const dim3 grid((unsigned)((nb + kThreads - 1) / kThreads), (unsigned)rows);
+    const unsigned gy = (unsigned)(rows < (long long)kGridY ? rows : (long long)kGridY);
+    const unsigned gz = (unsigned)((rows + (long long)kGridY - 1) / kGridY);
+    const dim3 grid((unsigned)((nb + kThreads - 1) / kThreads), gy, gz);
     R3D_KLAUNCH(R3D_KNAME(qsa_score_kernel<QDT, KDT>), grid, dim3(kThreads), stream, q, bk, bt, cu,
                 nc, out, n, heads, nb, nseq, pages, q_rs, q_cs, bk_pg, bt_rs, bt_cs, o_rs, o_cs,
                 rn);

@@ -187,6 +187,7 @@ struct Case {
     long long score_pitch = 0;  /* 0 = blocks */
     long long pages = 0;        /* 0 = blocks; bk's page count */
     bool q_slice = false;       /* q a column slice of a (heads+1)*n wide row */
+    bool zero_q = false;        /* q all zeros: every head's dot is +0, so the score is +0 */
     int bk_rank = 2;
     long long bk_ratio = 4;     /* rank-4 store: [pages, 2, ratio, n/(2*ratio)] */
     std::vector<int32_t> cu, nc, bt;
@@ -228,6 +229,7 @@ bool check_case(const Case& c) {
 
     /* Host operands, in the layouts the op describes. */
     std::vector<uint8_t> q = rand_act((size_t)(c.rows * q_pitch), c.dt, c.seed + 1);
+    if (c.zero_q) std::memset(q.data(), 0, q.size());
     std::vector<uint8_t> bk;
     if (c.bk_rank == 4) {
         const long long per_page = c.n;
@@ -476,6 +478,31 @@ TEST(qsa_score_padded_query_row_f32) {
     c.nc = { 70 };
     build_bt(c, 18);
     c.seed = 30;
+    CHECK(check_case(c));
+}
+
+TEST(qsa_score_zero_dot_is_positive_zero_bf16) {
+    if (!ready()) return;
+    Case c;
+    c.what = "q all zeros: every dot and score is +0, not -0, bf16";
+    c.rows = 2; c.n = 128; c.heads = 4; c.blocks = 2; c.seqs = 1; c.dt = c.kdt = RAD_BF16;
+    c.zero_q = true;
+    c.cu = { 0, 2 };
+    c.nc = { 2 };
+    c.bt = { 0, 1 };
+    c.seed = 31;
+    CHECK(check_case(c));
+}
+
+TEST(qsa_score_more_rows_than_grid_y_bf16) {
+    if (!ready()) return;
+    Case c;
+    c.what = "70000 rows: the launch splits rows past gridDim.y's 65535 onto z, bf16";
+    c.rows = 70000; c.n = 1; c.heads = 1; c.blocks = 1; c.seqs = 1; c.dt = c.kdt = RAD_BF16;
+    c.cu = { 0, 70000 };
+    c.nc = { 1 };
+    c.bt = { 0 };
+    c.seed = 32;
     CHECK(check_case(c));
 }
 
