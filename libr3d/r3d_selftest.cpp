@@ -3366,6 +3366,12 @@ void check_kv_store_i8() {
             k[(size_t)t * kvh * hd + j] = f32_to_bf16(a);
             v[(size_t)t * kvh * hd + j] = f32_to_bf16(b);
         }
+    /* One head whose absmax sits only in the d % 64 >= 32 half of the wave. A 64-lane reduction on
+     * wave32 would keep the two halves apart and store the smaller maximum; the 32-lane kernel
+     * must store the full head's 1.0. */
+    for (int d = 0; d < hd; ++d)
+        k[(size_t)3 * kvh * hd + d] = f32_to_bf16(d % 64 < 32 ? 0.01f : 0.02f);
+    k[(size_t)3 * kvh * hd + 32] = f32_to_bf16(1.0f);
     std::vector<int> sm((size_t)M);
     for (int t = 0; t < M; ++t) sm[(size_t)t] = (t * 7 + 3) % slots_n;
     sm[5] = -1;                    /* padding: no write */

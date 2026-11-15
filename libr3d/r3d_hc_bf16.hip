@@ -135,11 +135,14 @@ __global__ __launch_bounds__(kHcThreads) void hc_up_kernel(
     const int row = (int)blockIdx.x;
     if (row >= M) return;
     const int i = (int)blockIdx.y * kHcThreads + (int)threadIdx.x;
-    if (i >= n) return;
+    /* The shared window is loaded by every thread of the block, including the last column tile's
+     * lanes past `n`: they must reach the fill and the barrier before they retire, or the
+     * survivors would dot stale LDS. Only the per-column work is guarded. */
     extern __shared__ float dsh[];
     for (int k = (int)threadIdx.x; k < lr; k += kHcThreads)
         dsh[k] = bf16_to_f32(d[(long long)row * lr + k]);
     __syncthreads();
+    if (i >= n) return;
 
     const float* scr = sc + (long long)row * hc;
     const uint16_t* hr = h + (long long)row * h_ld;

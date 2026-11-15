@@ -771,16 +771,16 @@ __global__ __launch_bounds__(THR) void kv_store_kernel(
  * scales (K's then V's). One wave handles one (token, kv head): the scale is the head's absmax /
  * 127 rounded to f16 (clamped at 515), the codes round(x / scale) to nearest-even against the
  * rounded scale and clamp to +-127; an all-zero head stores scale 0 and codes 0. The reduction is
- * a 64-lane max, then every lane rereads its dimensions to encode them, so the scale is settled
+ * a 32-lane max, then every lane rereads its dimensions to encode them, so the scale is settled
  * before any code is written.
  */
 __device__ __forceinline__ float kv_absmax_wave(float am) {
 #pragma unroll
-    for (int off = 1; off < 64; off <<= 1) am = fmaxf(am, __shfl_xor(am, off, 64));
+    for (int off = 1; off < 32; off <<= 1) am = fmaxf(am, __shfl_xor(am, off, 32));
     return am;
 }
 
-__global__ __launch_bounds__(64) void kv_store_i8_kernel(
+__global__ __launch_bounds__(32) void kv_store_i8_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v, const int32_t* __restrict__ sm,
     uint8_t* __restrict__ kv, uint32_t head_dim, uint32_t block_size, uint32_t k_ld,
     uint32_t v_ld, int64_t sb, int64_t sh, int64_t so, int64_t slot_max) {
@@ -795,7 +795,7 @@ __global__ __launch_bounds__(64) void kv_store_i8_kernel(
     const uint32_t lane = threadIdx.x;
 
     float amk = 0.0f, amv = 0.0f;
-    for (uint32_t d = lane; d < head_dim; d += 64u) {
+    for (uint32_t d = lane; d < head_dim; d += 32u) {
         amk = fmaxf(amk, fabsf(bf16_to_f32(ldg_u16_at(kr, d))));
         amv = fmaxf(amv, fabsf(bf16_to_f32(ldg_u16_at(vr, d))));
     }
@@ -806,7 +806,7 @@ __global__ __launch_bounds__(64) void kv_store_i8_kernel(
     const float sk = f16_to_f32(hk), sv = f16_to_f32(hv);
     int8_t* __restrict__ ck = (int8_t*)row;
     int8_t* __restrict__ cv = (int8_t*)row + head_dim;
-    for (uint32_t d = lane; d < head_dim; d += 64u) {
+    for (uint32_t d = lane; d < head_dim; d += 32u) {
         const float xk = bf16_to_f32(ldg_u16_at(kr, d));
         const float xv = bf16_to_f32(ldg_u16_at(vr, d));
         const float rk = sk > 0.0f ? rintf(xk / sk) : 0.0f;
@@ -1381,7 +1381,7 @@ extern "C" int r3d_kv_store_i8(long k, long v, long sm, long kv, int M, int head
     if (sb < 0 || sh < 0 || so < 0) return -3;
     if (slot_max <= 0)
         slot_max = (long long)((M + block_size - 1) / block_size + 2) * block_size;
-    R3D_KLAUNCH(R3D_KNAME(kv_store_i8_kernel), dim3((uint32_t)M, (uint32_t)n_head_kv), dim3(64),
+    R3D_KLAUNCH(R3D_KNAME(kv_store_i8_kernel), dim3((uint32_t)M, (uint32_t)n_head_kv), dim3(32),
                 (hipStream_t)(uintptr_t)stream, (const uint16_t*)(uintptr_t)k,
                 (const uint16_t*)(uintptr_t)v, (const int32_t*)(uintptr_t)sm,
                 (uint8_t*)(uintptr_t)kv, (uint32_t)head_dim, (uint32_t)block_size,

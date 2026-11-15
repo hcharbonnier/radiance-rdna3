@@ -120,6 +120,9 @@ extern "C" int r3d_rad_embed_lookup_iqr(const RadArgs* a, RadStream stream) {
     const long long n_embd = r3d_geti_or(a, "n_embd", 0), n_vocab = r3d_geti_or(a, "n_vocab", 0);
     const long long voff = r3d_geti_or(a, "vocab_offset", 0);
     if (n_embd <= 0 || n_embd % 128 || n_vocab <= 0 || voff < 0) return R3D_NO(RAD_E_SHAPE);
+    /* The table is a packed IQR plane, but its logical shape is [n_vocab, n_embd] (the GEMM rows
+     * check the same product); a geometry that outgrows it would read codes past the plane. */
+    if (r3d_numel(wte) < n_vocab * n_embd) return R3D_NO(RAD_E_SHAPE);
     long long M = 0;
     const long long x_ld = r3d_rows_pitch(x, n_embd, &M);
     if (x_ld < 0) return R3D_NO(RAD_E_STRIDE);

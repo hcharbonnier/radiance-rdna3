@@ -26,6 +26,7 @@
 #include "r3d.h"
 #include "r3d_args.h"
 #include "r3d_codecs.h"
+#include "r3d_hc_ple_common.h"
 #include "r3d_launch.h"
 
 namespace {
@@ -61,7 +62,7 @@ __global__ __launch_bounds__(kGatherThr) void gather_kernel(
     float gate = 0.0f;
     if (sh) {
         const float v0 = bf16_to_f32(sg[(size_t)t * sg_ld]);
-        gate = sig ? (1.0f / (1.0f + __expf(-v0))) : v0;
+        gate = sig ? r3d_hcple::sigmoid(v0) : v0;
     }
 
     if (!GIVEN) {

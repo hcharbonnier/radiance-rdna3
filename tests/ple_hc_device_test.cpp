@@ -411,7 +411,10 @@ TEST(hc_read_bf16_matches_libref) {
     CHECK(kd && kr && kd->scratch);
     if (!(kd && kr && kd->scratch)) return;
 
-    const int M = 2, n = 64, hc = 2, hn = hc * n, lr = 16, group = 16;
+    /* lr = 128 > n % 256 = 64: the last column tile's lanes 64..127 retire past `n`, so they
+     * must load the shared window and reach the barrier before they go. lr = 16 would not
+     * cover that staging. */
+    const int M = 2, n = 64, hc = 2, hn = hc * n, lr = 128, group = 16;
     const int ngrp = n / group;
     auto hh = rand_bf16((size_t)M * hn, 41), dh = rand_bf16((size_t)lr * hn, 42),
          uh = rand_bf16((size_t)hn * lr, 43), ijh = rand_bf16((size_t)hc * hn, 44);
