@@ -318,6 +318,7 @@ int r3d_shape_gemm_nt_q_mxfp4a8(const RadParam* p, int n_p, int operand, RadOpdD
 /* --- r3d_shapes.cpp: the fused-op, attention and sampler shape hooks --- */
 extern "C" int r3d_shape_silu_mul          (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_attn_paged        (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_attn_paged_i8     (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_gemm_nt_q_gated (const RadParam*, int, int, RadOpdDesc*);
 /* r3d_gemm_nt_q_w2a8.hip: the w2a8 vocab projection's layout hook, one of the library's three
  * (with the fp8 weight's and the logits head's, below). It repacks nothing: it presents the
@@ -369,6 +370,12 @@ int r3d_rad_sample_logprobs    (const RadArgs* a, RadStream s);
  * query tile. */
 int r3d_rad_attn_decode_h128       (const RadArgs* a, RadStream s);
 int r3d_rad_attn_prefill_h128      (const RadArgs* a, RadStream s);
+
+/* --- r3d_attn_paged_h256.hip: the head_dim-256 int8 paged body. Four lanes own one output row
+ * (64 dims each), a workgroup carries whole tokens, and the geometry is (gqa 12, block 4) for
+ * Flash-Next or (gqa 6, block 16) for the 27B. Decode split-KVs; prefill is one pass. */
+int r3d_rad_attn_decode_h256       (const RadArgs* a, RadStream s);
+int r3d_rad_attn_prefill_h256      (const RadArgs* a, RadStream s);
 
 /* --- r3d_gemm_fp8a8_tiled.hip: the quantised GEMM above the decode heights, and the reader for
  * the container's fp8 weight: codes and per-128x128 scale as two planes behind `b_scale`. The row

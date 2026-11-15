@@ -2988,15 +2988,309 @@ static void check_moe_numerics() {
 #endif
 }
 
+/* ================================================================== head_dim-256 int8 attention
+ *
+ * The h256 rows are not describable by an opd_shape (libref refuses an i8 cache for the same
+ * reason: its per-slot f16 scales cannot be drawn at random), so their numerical check builds the
+ * operands here and calls both launches. The exact case makes every key's K row identical: the
+ * softmax is uniform (exp(0) = 1 in both, the query/dot value is irrelevant), so the comparison
+ * pins the page walk, the mask, the per-slot scales, the value chain and its key order, and the
+ * bf16 store bit for bit. A random cache is compared at 2e-2 (the kernel's QK chain is four lane
+ * partials rather than libref's one 256-add chain, and exp is the h128 polynomial). A scratch
+ * arena is passed for the split smoke case; no arena forces splits = 1, the exact path.
+ */
+#ifdef RAD_HAVE_HIP
+namespace {
+
+bool g_split_scratch = false;
+
+const RadKernelInfo* row_by_name(const char* name) {
+    for (int i = 0; i < rows(); ++i) {
+        const RadKernelInfo* k = row_at(i);
+        if (k && k->name && !std::strcmp(k->name, name)) return k;
+    }
+    return nullptr;
+}
+
+/* libref's table, beside this plugin. Its attn_paged row is the reference launch. */
+const RadKernelInfo* libref_attn_row() {
+    static int (*count)(void) = nullptr;
+    static const RadKernelInfo* (*at)(int) = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        const std::string path(g_plugin ? g_plugin : "");
+        const size_t slash = path.find_last_of('/');
+        const std::string dir = slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+        void* h = dlopen((dir + "/libref.so").c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (h) {
+            count = (int (*)(void))dlsym(h, "rad_kernel_count");
+            at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
+            if (!count || !at) { count = nullptr; at = nullptr; }
+        }
+    }
+    if (!at) return nullptr;
+    for (int i = 0; i < count(); ++i) {
+        const RadKernelInfo* k = at(i);
+        if (k && k->op && !std::strcmp(k->op, "attn_paged")) return k;
+    }
+    return nullptr;
+}
+
+RadTensor h256_tensor(void* p, uint32_t dt, int rank, const int64_t* shape) {
+    RadTensor t{};
+    t.data = p;
+    t.dtype = dt;
+    t.rank = (uint32_t)rank;
+    int64_t st = 1;
+    for (int i = rank - 1; i >= 0; --i) { t.shape[i] = shape[i]; t.stride[i] = st; st *= shape[i]; }
+    return t;
+}
+
+void h256_write_f16(uint8_t* p, float v) {
+    const uint16_t h = f32_to_f16(v);
+    std::memcpy(p, &h, sizeof h);
+}
+
+/* One geometry: run libref on the host and the row on the device with the same bytes, compare. */
+void h256_case(const char* what, const RadKernelInfo* ours, const RadKernelInfo* ref,
+               int gqa, int bs, const std::vector<int>& lens, const std::vector<int>& ctxv,
+               bool ragged, int window, bool causal, bool randomize, double tol)
+{
+    const int hd = 256, nseq = (int)lens.size(), kvh = 24 / gqa, qh = 24;
+    int qmax = 0, rows = 0;
+    std::vector<int> cu((size_t)nseq + 1, 0);
+    for (int s = 0; s < nseq; ++s) {
+        qmax = std::max(qmax, lens[(size_t)s]);
+        rows += lens[(size_t)s];
+        cu[(size_t)s + 1] = rows;
+    }
+    int cols = 0;
+    std::vector<int> mb((size_t)nseq);
+    for (int s = 0; s < nseq; ++s) {
+        mb[(size_t)s] = (std::max(ctxv[(size_t)s], lens[(size_t)s]) + bs - 1) / bs;
+        cols = std::max(cols, mb[(size_t)s]);
+    }
+    cols += 1;                                    /* a spare column of -1: never read */
+    const int nblocks = nseq * cols + 3;
+
+    /* A deterministic shuffle of the block ids, so a table is not the identity. */
+    std::vector<int> ids((size_t)nblocks);
+    for (int i = 0; i < nblocks; ++i) ids[(size_t)i] = i;
+    uint32_t rng = 0x9e3779b9u;
+    for (int i = nblocks - 1; i > 0; --i) {
+        rng = rng * 1664525u + 1013904223u;
+        const int j = (int)((rng >> 8) % (uint32_t)(i + 1));
+        std::swap(ids[(size_t)i], ids[(size_t)j]);
+    }
+    std::vector<int> bt((size_t)nseq * cols, -1);
+    int nx = 0;
+    for (int s = 0; s < nseq; ++s)
+        for (int b = 0; b < mb[(size_t)s]; ++b) bt[(size_t)s * cols + b] = ids[(size_t)nx++];
+    /* One unmapped page behind the first sequence, where at least one other block remains. */
+    if (mb[0] >= 2) bt[0] = -1;
+
+    const int slot_bytes = 2 * hd + 4;
+    std::vector<uint8_t> cache((size_t)nblocks * kvh * bs * slot_bytes, 0);
+    for (int blk = 0; blk < nblocks; ++blk) {
+        for (int kh = 0; kh < kvh; ++kh) {
+            for (int slot = 0; slot < bs; ++slot) {
+                uint8_t* row = cache.data() + (((size_t)blk * kvh + kh) * bs + slot) * slot_bytes;
+                const float vsc = randomize ? (0.25f + (float)((blk * 5 + slot * 3) % 8) * 0.5f)
+                                            : (slot % 3 == 0 ? 0.5f : slot % 3 == 1 ? 1.0f : 2.0f);
+                const float ksc = randomize ? (0.0005f + (float)((blk + slot) % 4) * 0.00025f)
+                                            : 0.001f;
+                for (int d = 0; d < hd; ++d) {
+                    if (randomize) {
+                        row[d] = (uint8_t)(int8_t)(((blk * 131 + kh * 17 + slot * 7 + d * 3) % 255) - 127);
+                        row[hd + d] = (uint8_t)(int8_t)(((blk * 29 + kh * 11 + slot * 5 + d * 7) % 255) - 127);
+                    } else {
+                        row[d] = 1;                                    /* every key's K is the same */
+                        row[hd + d] = (uint8_t)(int8_t)(((blk * 7 + kh * 5 + slot * 3 + d * 5) % 9) - 4);
+                    }
+                }
+                h256_write_f16(row + 2 * hd, ksc);
+                h256_write_f16(row + 2 * hd + 2, vsc);
+            }
+        }
+    }
+
+    std::vector<uint16_t> q((size_t)rows * qh * hd);
+    for (int r = 0; r < rows; ++r)
+        for (int d = 0; d < qh * hd; ++d) {
+            const int v = (r * 13 + d * 5) % 7 - 3;
+            q[(size_t)r * qh * hd + d] = randomize
+                ? f32_to_bf16(std::sin(0.01f * (float)(r * 97 + d * 13)))
+                : f32_to_bf16(0.5f * (float)v);
+        }
+    std::vector<int> su((size_t)nseq);
+    for (int s = 0; s < nseq; ++s) su[(size_t)s] = std::max(ctxv[(size_t)s], lens[(size_t)s]);
+    std::vector<uint16_t> want((size_t)rows * qh * hd, 0xffffu);
+    std::vector<uint16_t> got(want.size(), 0xffffu);
+
+    const RadParam pp[] = {
+        { "q_len", RAD_P_INT, qmax, 0, nullptr, 0.0 },
+        { "head_dim", RAD_P_INT, hd, 0, nullptr, 0.0 },
+        { "gqa", RAD_P_INT, gqa, 0, nullptr, 0.0 },
+        { "block_size", RAD_P_INT, bs, 0, nullptr, 0.0 },
+        { "causal", RAD_P_INT, causal ? 1 : 0, 0, nullptr, 0.0 },
+        { "window", RAD_P_INT, window, 0, nullptr, 0.0 },
+        { "q_dtype", RAD_P_STR, 0, 0, "bf16", 0.0 },
+        { "kv_dtype", RAD_P_STR, 0, 0, "i8", 0.0 },
+        { "n_head", RAD_P_INT, qh, 0, nullptr, 0.0 },
+        { "max_ctx", RAD_P_INT, (long long)nblocks * bs, 0, nullptr, 0.0 },
+    };
+    int64_t qdim[3] = { rows, qh, hd }, kvdim[4] = { nblocks, kvh, bs, slot_bytes };
+    int64_t btdim[2] = { nseq, cols }, sudim[1] = { nseq }, cudim[1] = { nseq + 1 };
+    RadTensor th[8] = {
+        h256_tensor(q.data(), RAD_BF16, 3, qdim),
+        h256_tensor(cache.data(), RAD_I8, 4, kvdim),
+        h256_tensor(bt.data(), RAD_I32, 2, btdim),
+        h256_tensor(su.data(), RAD_I32, 1, sudim),
+        RadTensor{}, RadTensor{},
+        ragged ? h256_tensor(cu.data(), RAD_I32, 1, cudim) : RadTensor{},
+        h256_tensor(want.data(), RAD_BF16, 3, qdim),
+    };
+    RadArgs ra{ th, 8, pp, (int)(sizeof(pp) / sizeof(pp[0])), nullptr, 0, nullptr, 0, 1 };
+    const int rc = ref->launch(&ra, nullptr);
+    if (rc != RAD_OK) { fail("%s: libref refused the case (%d)", what, rc); return; }
+
+    /* Device copies of the same operands. split = true gives the shim an arena (auto slices);
+     * split = false gives none, which lowers the auto choice to 1 and keeps the reference order. */
+    RadTensor td[8];
+    std::copy(th, th + 8, td);
+    void* dev[8] = {};
+    bool ok_alloc = true;
+    for (int i : { 0, 1, 2, 3, 6, 7 }) {
+        if (i == 6 && !ragged) continue;
+        size_t bytes = 0;
+        if (i == 0 || i == 7) bytes = q.size() * 2;
+        else if (i == 1) bytes = cache.size();
+        else if (i == 2) bytes = bt.size() * 4;
+        else if (i == 3) bytes = su.size() * 4;
+        else if (i == 6) bytes = cu.size() * 4;
+        if (!bytes) continue;
+        if (hipMalloc(&dev[i], bytes) != hipSuccess) { ok_alloc = false; break; }
+        const void* src = i == 0 || i == 7 ? (const void*)q.data()
+                        : i == 1 ? (const void*)cache.data()
+                        : i == 2 ? (const void*)bt.data()
+                        : i == 3 ? (const void*)su.data() : (const void*)cu.data();
+        if (i == 7) src = got.data();
+        if (hipMemcpy(dev[i], src, bytes, hipMemcpyHostToDevice) != hipSuccess) {
+            ok_alloc = false; break;
+        }
+        td[i].data = dev[i];
+    }
+    if (!ok_alloc) {
+        for (void* p : dev) if (p) (void)hipFree(p);
+        skip("%s: no device buffers", what);
+        return;
+    }
+    void* scratch = nullptr;
+    const int64_t sbytes = (int64_t)rows * qh * 16 * (hd + 4) * 4;
+    if (g_split_scratch && hipMalloc(&scratch, (size_t)sbytes) == hipSuccess)
+        (void)hipMemset(scratch, 0, (size_t)sbytes);
+    RadArgs da{ td, 8, ra.p, ra.n_p, scratch, scratch ? sbytes : 0, nullptr, 0, 1 };
+    const int drc = ours->launch(&da, nullptr);
+    if (drc != RAD_OK) {
+        fail("%s: the row refused the launch (%d)", what, drc);
+        if (scratch) (void)hipFree(scratch);
+        for (void* p : dev) if (p) (void)hipFree(p);
+        return;
+    }
+    if (hipDeviceSynchronize() != hipSuccess) {
+        fail("%s: the launch did not complete", what);
+        if (scratch) (void)hipFree(scratch);
+        for (void* p : dev) if (p) (void)hipFree(p);
+        return;
+    }
+    if (hipMemcpy(got.data(), dev[7], got.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) {
+        fail("%s: the output copy failed", what);
+        if (scratch) (void)hipFree(scratch);
+        for (void* p : dev) if (p) (void)hipFree(p);
+        return;
+    }
+    if (scratch) (void)hipFree(scratch);
+    for (void* p : dev) if (p) (void)hipFree(p);
+
+    size_t first = got.size();
+    for (size_t i = 0; i < got.size(); ++i) if (got[i] != want[i]) { first = i; break; }
+    if (first == got.size()) { ok("%s: %zu bf16 values, identical to libref", what, got.size()); return; }
+    if (tol > 0.0) {
+        double worst = 0.0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            const double a = bf16_to_f32(got[i]), b = bf16_to_f32(want[i]);
+            const double d = std::fabs(a - b);
+            if (d > worst) worst = d;
+        }
+        if (worst <= tol) { ok("%s: %zu values, max |diff| %.3g <= %.3g", what, got.size(), worst, tol); return; }
+        fail("%s: max |diff| %.3g > %.3g", what, worst, tol);
+        return;
+    }
+    const size_t row = first / ((size_t)qh * hd), rem = first % ((size_t)qh * hd);
+    fail("%s: first difference at value %zu (row %zu, head %zu, dim %zu): libr3d %g, libref %g",
+         what, first, row, rem / hd, rem % hd, (double)bf16_to_f32(got[first]),
+         (double)bf16_to_f32(want[first]));
+}
+
+void check_attn_h256() {
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("h256 attn: no device visible"); return; }
+    const RadKernelInfo* ref = libref_attn_row();
+    if (!ref || !ref->launch) { skip("h256 attn: libref.so with attn_paged is not beside the plugin"); return; }
+
+    /* (gqa 12, block 4): Flash-Next's 24/2 geometry. Decode and prefill, causal, a ragged batch,
+     * a two-sided window, and a split-KV smoke. */
+    const RadKernelInfo* dec12 = row_by_name("attn_paged_i8_h256_gqa12_decode");
+    const RadKernelInfo* pre12 = row_by_name("attn_paged_i8_h256_gqa12_prefill");
+    const RadKernelInfo* dec6 = row_by_name("attn_paged_i8_h256_gqa6_decode");
+    const RadKernelInfo* pre6 = row_by_name("attn_paged_i8_h256_gqa6_prefill");
+    if (!dec12 || !pre12 || !dec6 || !pre6) { fail("h256 attn: a row is missing from the table"); return; }
+
+    h256_case("h256 gqa12 decode causal", dec12, ref, 12, 4, { 1 }, { 37 }, false, 0, true, false, 0.0);
+    h256_case("h256 gqa12 decode ragged", dec12, ref, 12, 4, { 5, 6 }, { 53, 41 }, true, 0, true, false, 0.0);
+    h256_case("h256 gqa12 decode windowed", dec12, ref, 12, 4, { 4 }, { 37 }, false, 17, false, false, 0.0);
+    h256_case("h256 gqa12 prefill causal", pre12, ref, 12, 4, { 20 }, { 53 }, false, 0, true, false, 0.0);
+    h256_case("h256 gqa12 prefill ragged", pre12, ref, 12, 4, { 20, 13 }, { 40, 25 }, true, 0, true, false, 0.0);
+    /* No history and page 0 unmapped: the first rows have no visible key (a zero row) and every
+     * later row must step over the -1 entry. */
+    h256_case("h256 gqa12 prefill empty", pre12, ref, 12, 4, { 20 }, { 20 }, false, 0, true, false, 0.0);
+
+    h256_case("h256 gqa6 decode causal", dec6, ref, 6, 16, { 1 }, { 53 }, false, 0, true, false, 0.0);
+    h256_case("h256 gqa6 decode verify", dec6, ref, 6, 16, { 7 }, { 200 }, false, 0, true, false, 0.0);
+    h256_case("h256 gqa6 prefill causal", pre6, ref, 6, 16, { 20 }, { 100 }, false, 0, true, false, 0.0);
+    h256_case("h256 gqa6 prefill ragged", pre6, ref, 6, 16, { 20, 13 }, { 100, 70 }, true, 0, true, false, 0.0);
+    h256_case("h256 gqa6 prefill empty", pre6, ref, 6, 16, { 20 }, { 20 }, false, 0, true, false, 0.0);
+
+    /* The random caches exercise the QK chain and the polynomial exp; 2e-2 is far above the
+     * lane-order/exp rounding and far below a geometry or mask error. */
+    h256_case("h256 gqa12 random", dec12, ref, 12, 4, { 4 }, { 37 }, false, 0, true, true, 2e-2);
+    h256_case("h256 gqa6 random", pre6, ref, 6, 16, { 20 }, { 100 }, false, 0, true, true, 2e-2);
+
+    /* Split-KV's own path: an arena lets the shim pick slices, and the result is still the same
+     * softmax (up to the documented last-ulp parenthesisation), so the same 2e-2 bound. */
+    g_split_scratch = true;
+    h256_case("h256 gqa12 decode split", dec12, ref, 12, 4, { 4 }, { 157 }, false, 0, true, true, 2e-2);
+    h256_case("h256 gqa6 decode split", dec6, ref, 6, 16, { 1 }, { 500 }, false, 0, true, true, 2e-2);
+    g_split_scratch = false;
+}
+
+}  // namespace
+#else
+static void check_attn_h256() { skip("h256 attn: built without the HIP runtime"); }
+#endif
+
 int main(int argc, char** argv) {
     /* Unbuffered stdout, so when a row dies the last line printed is the last thing that worked,
      * even when output goes to a file or pipe. */
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const char* path = nullptr;
+    bool static_only = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--case") && i + 1 < argc) g_case = argv[++i];
+        else if (!std::strcmp(argv[i], "--static")) static_only = true;
         else if (!std::strcmp(argv[i], "--help")) {
-            std::printf("usage: r3d_selftest <path>/libr3d.so [--case <row>]\n");
+            std::printf("usage: r3d_selftest <path>/libr3d.so [--case <row>] [--static]\n");
             return 0;
         } else if (!path) path = argv[i];
     }
@@ -3016,6 +3310,19 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    if (static_only) {
+        /* The host phase only: no HIP allocation, no launch, no device touch. */
+        check_codecs();
+        check_lanes();
+        check_table();
+        check_reference_schemas();
+        check_band_reach();
+        check_shapes();
+        dlclose(h);
+        std::printf("== static checks %s\n", g_fail ? "FAILED" : "passed");
+        return g_fail ? 1 : 0;
+    }
+
     if (!g_case) {
         check_codecs();
         check_lanes();
@@ -3024,6 +3331,7 @@ int main(int argc, char** argv) {
         check_band_reach();
         check_shapes();
         check_moe_numerics();
+        check_attn_h256();
 
         const int n = rows();
         int passed = 0, failed = 0;

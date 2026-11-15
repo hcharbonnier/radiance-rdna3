@@ -90,6 +90,7 @@ set(R3D_UNITS
   # Dense causal latent attention over a paged [latent | rope] cache: a wave a (row, head), the
   # score one wave sum, split history with an f32 partial merge, the optional head gate.
   "r3d_mla_attn_paged|"
+  "r3d_attn_paged_h256|"
   # The sampler's spine: the row's top-R in one scan, and the stages that turn the candidate plane
   # the top-R produces into one token -- argmax, temp, top-k, the draw, and the four narrowings.
   "r3d_sample_f32|"

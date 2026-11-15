@@ -775,6 +775,15 @@ int r3d_shape_mla_attn_paged(const RadParam* p, int n_p, int operand, RadOpdDesc
 }
 
 
+/* The head_dim-256 int8 rows' operand description: not described, for libref's reason. A slot's
+ * two f16 scales cannot be drawn at random (the test builds a cache whose K row is constant and
+ * whose V codes are exact integers), so a kbench case is skipped rather than fabricated; the
+ * device test in r3d_selftest.cpp covers the row. */
+extern "C" int r3d_shape_attn_paged_i8(const RadParam*, int, int, RadOpdDesc*)
+{
+    return RAD_E_UNSUPPORTED;
+}
+
 /* Exact per-row top-R. `pairs` packs an int32 id's bits in the first slot beside its value, in an
  * f32 plane. */
 int r3d_shape_row_topk(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

@@ -1359,6 +1359,21 @@ static int64_t attn_scratch(const RadArgs* a) {
     return want < cap ? want : cap;
 }
 
+/* Split-KV partials for the head_dim-256 int8 decode row: 256 accumulator floats plus the
+ * running max and sum (260 floats) per (query row, head, slice), at the band's widest split (16)
+ * and capped at 16 MiB. Attaching scratch makes the row non-concurrent, as for the h128 decode. */
+static int64_t attn_h256_scratch(const RadArgs* a) {
+    if (!a || a->n_t < 1 || a->t[0].rank == 0) return 0;
+    long long n_head = 0, head_dim = 0;
+    const int64_t nh = rad_args_geti(a, "n_head", &n_head) ? n_head : 0;
+    if (!rad_args_geti(a, "head_dim", &head_dim) || !head_dim || !nh) return 0;
+    const long long rows = rad_tensor_numel(&a->t[0]) / (nh * head_dim);
+    if (rows <= 0) return 0;
+    const long long want = rows * nh * 16 * 260 * (long long)sizeof(float);
+    const long long cap = 16LL << 20;
+    return want < cap ? want : cap;
+}
+
 /* A split's partials are f32 over the output, plus one arrival counter per split. Sized at the
  * band's bounds and the axis's widest split, because a scratch hook runs at declare, where the
  * range may still be open: the buffer must hold any point the tuner can pick. */
@@ -1746,6 +1761,26 @@ static const RadConstraint cAttnFp8Decode[]   = { C_IN("q_dtype", "bf16"),
 static const RadConstraint cAttnFp8Prefill[]  = { C_IN("q_dtype", "bf16"),
                                                   C_IN("kv_dtype", "fp8_e4m3"),
                                                   C_EQ("head_dim", 128), C_GE("q_len", 17) };
+/* head_dim 256's int8 rows. The geometry pairs are the two the docs name: Flash-Next's 24 query
+ * heads over 2 KV heads with 4-token pages, and the 27B's 24 over 4 with 16-token pages. The
+ * block_size constraint is RAD_DERIVED, so the selector skips it while matching and
+ * rad_kv_block_size() reads it back off the resolved row. */
+static const RadConstraint cAttnH256Gqa12Decode[]  = { C_IN("q_dtype", "bf16"),
+                                                       C_IN("kv_dtype", "i8"),
+                                                       C_EQ("head_dim", 256), C_EQ("gqa", 12),
+                                                       C_EQ("block_size", 4), C_LE("q_len", 16) };
+static const RadConstraint cAttnH256Gqa12Prefill[] = { C_IN("q_dtype", "bf16"),
+                                                       C_IN("kv_dtype", "i8"),
+                                                       C_EQ("head_dim", 256), C_EQ("gqa", 12),
+                                                       C_EQ("block_size", 4), C_GE("q_len", 17) };
+static const RadConstraint cAttnH256Gqa6Decode[]   = { C_IN("q_dtype", "bf16"),
+                                                       C_IN("kv_dtype", "i8"),
+                                                       C_EQ("head_dim", 256), C_EQ("gqa", 6),
+                                                       C_EQ("block_size", 16), C_LE("q_len", 16) };
+static const RadConstraint cAttnH256Gqa6Prefill[]  = { C_IN("q_dtype", "bf16"),
+                                                       C_IN("kv_dtype", "i8"),
+                                                       C_EQ("head_dim", 256), C_EQ("gqa", 6),
+                                                       C_EQ("block_size", 16), C_GE("q_len", 17) };
 
 /* `row_topk` is banded on dtype, so it has two rows. The candidate stages are banded on `n_cand`,
  * capped at the kernel's ceiling: five f32 arrays of n_cand in LDS is 20 KiB of the 64 KiB, and the
@@ -3494,6 +3529,63 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cArGatherHc), NOTUNE,
   nullptr, nullptr, r3d_rad_ar_gather_hc_write, nullptr, nullptr, nullptr, nullptr },
+
+
+/* ------------------------------------------------------------------ r3d_attn_paged_h256.hip
+ *
+ * The head_dim-256 int8 body, banded on q_len and paired by geometry. Four lanes own one output
+ * row (64 dims each); a workgroup carries 4 tokens (gqa 12 / decode), 8 (gqa 6 / decode,
+ * gqa 12 / prefill) or 16 (gqa 6 / prefill), so every staged cache block is shared by all of a
+ * tile's rows in one KV head. The decode row split-KVs into 260-float records; the prefill row is
+ * a single pass. Both read the cache's per-slot f16 K/V scales and have no descale planes.
+ */
+{ "attn_paged_i8_h256_gqa12_decode", "attn_paged", "attn",
+  "paged attention over an int8 head_dim-256 cache, 24 query heads over 2 KV heads, 4-token "
+  "pages: split-KV decode",
+  "head_dim 256; gqa 12; block_size 4; q_len <= 16; four lanes an output row (64 dims each) and "
+  "three waves a workgroup (4 tokens a tile); the block walk is the workgroup's token range, and "
+  "the four lane partials are summed in d-block order -- the documented departure from libref's "
+  "single 256-add chain",
+  "bf16 q and out, i8 cache with a slot row of 256 K codes, 256 V codes and the two f16 scales "
+  "(no k_descale / v_descale; a descale is refused), i32 block_table and seqused",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_DECODE,
+  ROW(cAttnH256Gqa12Decode), NOTUNE,
+  nullptr, nullptr, r3d_rad_attn_decode_h256, attn_h256_scratch, nullptr, nullptr,
+  r3d_shape_attn_paged_i8 },
+
+{ "attn_paged_i8_h256_gqa12_prefill", "attn_paged", "attn",
+  "the same int8 head_dim-256 body over a prefill chunk, 24 query heads over 2 KV heads",
+  "head_dim 256; gqa 12; block_size 4; q_len >= 17; six waves a workgroup (8 tokens a tile); no "
+  "split pass",
+  "bf16 q and out, i8 cache with per-slot f16 K/V scales (no descales), i32 block_table and "
+  "seqused",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_PREFILL,
+  ROW(cAttnH256Gqa12Prefill), NOTUNE,
+  nullptr, nullptr, r3d_rad_attn_prefill_h256, nullptr, nullptr, nullptr,
+  r3d_shape_attn_paged_i8 },
+
+{ "attn_paged_i8_h256_gqa6_decode", "attn_paged", "attn",
+  "paged attention over an int8 head_dim-256 cache, the 27B's 24 query heads over 4 KV heads, "
+  "16-token pages: split-KV decode",
+  "head_dim 256; gqa 6; block_size 16; q_len <= 16; four lanes an output row (64 dims each) and "
+  "three waves a workgroup (8 tokens a tile)",
+  "bf16 q and out, i8 cache with per-slot f16 K/V scales (no descales), i32 block_table and "
+  "seqused",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_DECODE,
+  ROW(cAttnH256Gqa6Decode), NOTUNE,
+  nullptr, nullptr, r3d_rad_attn_decode_h256, attn_h256_scratch, nullptr, nullptr,
+  r3d_shape_attn_paged_i8 },
+
+{ "attn_paged_i8_h256_gqa6_prefill", "attn_paged", "attn",
+  "the same int8 head_dim-256 body over a prefill chunk at the 27B geometry",
+  "head_dim 256; gqa 6; block_size 16; q_len >= 17; six waves a workgroup (16 tokens a tile); no "
+  "split pass",
+  "bf16 q and out, i8 cache with per-slot f16 K/V scales (no descales), i32 block_table and "
+  "seqused",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_PREFILL,
+  ROW(cAttnH256Gqa6Prefill), NOTUNE,
+  nullptr, nullptr, r3d_rad_attn_prefill_h256, nullptr, nullptr, nullptr,
+  r3d_shape_attn_paged_i8 },
 
 
 };
