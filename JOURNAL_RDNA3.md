@@ -234,3 +234,20 @@ couvertes par un test device.
 
 **Blocages** : aucun.
 
+## 2026-11-15 — J1 (suite) : tête vocabulaire, garde-fou
+
+Le kernel `logits_gemm_vocab_iqr` est écrit (quantisation FWHT/int8 par groupe,
+un GEMM IQR par classe, scatter des ids) avec son scratch, mais il **échoue la
+référence** : à q/s et poids identiques, la ligne device rend `0.0449` là où la
+référence calcule `-0.279` (forme tête 27B u4 L16 kRowF32, N=256, K=512, M=2).
+Le `m16` et le lancement par tranches donnent la même valeur, donc le GEMM est
+cohérent avec lui-même ; l'écart est dans la chaîne q/s/poids ou dans la
+référence du test, pas dans le chunking. Le scratch et le scatter sont corrects
+(la valeur device est bien écrite à l'id attendu).
+
+Décision : la row **refuse** (`RAD_E_UNSUPPORTED`) tant que le test
+`RAD_IQR_VOCAB=1` n'est pas vert, pour qu'un conteneur déclare puis échoue
+franchement au premier pas au lieu d'émettre des logits faux. À reprendre en
+W11, avec le kernel de tête dédié (accumulation f32).
+
+
