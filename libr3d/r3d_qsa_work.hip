@@ -198,7 +198,10 @@ int r3d_rad_qsa_work(const RadArgs* a, RadStream s)
     const long long k_ld = k->stride[0];
     const long long g_ld = stg->stride[0];
     const long long s_row = tl->stride[2];
-    if (k_ld < n || g_ld < n || s_row < n) return R3D_NO(RAD_E_STRIDE);
+    /* The kernel scales these by an unsigned row index; a negative pitch would wrap it. */
+    if (k_ld < n || g_ld < n || s_row < n || tl->stride[0] < 0 || sx->stride[0] < 0 ||
+        bt->stride[0] < 0 || bstep < 0)
+        return R3D_NO(RAD_E_STRIDE);
     if (k->dtype != RAD_BF16 || tl->dtype != RAD_BF16 || stg->dtype != RAD_BF16)
         return R3D_NO(RAD_E_DTYPE);
 
