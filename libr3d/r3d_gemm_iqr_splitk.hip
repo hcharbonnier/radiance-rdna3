@@ -16,8 +16,8 @@
  * `(float)sub * sa * sb`, groups ascending, so the int32 sums are the reference's. The reducer then
  * forms ((p0 + p1) + p2) + ... in split order and multiplies by row_scale once. That is not the
  * unsplit chain's single ascending sum over all groups: the slice sums bracket the group terms
- * differently, a reassociation of the same f32 additions. The difference is a few f32 ulps, which
- * the device test's one-ulp bf16 bound covers (tests/iqr_device_test.cpp). A split is a whole number
+ * differently, a reassociation of the same f32 additions. The difference is a few f32 ulps, far
+ * below the device test's two-ulp bf16 bound (tests/iqr_device_test.cpp). A split is a whole number
  * of 128-K groups, so no scale group straddles two slices.
  *
  * ---- the split rule ------------------------------------------------------------------------------
@@ -133,7 +133,8 @@ using namespace r3d_iqr_dev;
 /* The split rule, shared by the row's scratch hook (r3d_rows.cpp), the shim
  * (r3d_gemm_iqr_m16.hip) and the launcher below. 1 means the unsplit path. */
 extern "C" int r3d_iqr_split_slices(long long N, long long K) {
-    if (N < 1 || N > kIqrSplitMaxN || K < 128) return 1;
+    /* The row's shape contract: N a multiple of 16, K of 128. Anything else is not this path. */
+    if (N < 16 || N > kIqrSplitMaxN || (N & 15) || K < 128 || (K & 127)) return 1;
     const long long nkb = K / 128;
     if (nkb < 2) return 1;
     if (nkb % kIqrSplitMax == 0) return kIqrSplitMax;
@@ -146,6 +147,9 @@ extern "C" int r3d_iqr_split_slices(long long N, long long K) {
 extern "C" int r3d_gemm_iqr_splitk(long a, long as, long b, long bs, long y, int N, int K,
                                    uint32_t word, int splits, long scratch, long stream) {
     if (!a || !as || !b || !bs || !y || !scratch || splits < 2) return -1;
+    /* Every K byte must be read exactly once: GEMV's shape contract, and whole slices. */
+    if (N < 16 || (N & 15) || K < 128 || (K & 127)) return -2;
+    if ((K / 128) % splits) return -2;
     const Form f = form(word);
     const uint32_t lrun = (uint32_t)((word >> 22) & 15u);
     const uint32_t run_tiles = (1u << lrun) / 16u;
