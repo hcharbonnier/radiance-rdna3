@@ -281,5 +281,37 @@ fusionnée 24/4 alors que le 27B appelle q seul (24, n_kv 0) puis k seul (4, n_k
 restante de M1 ; puis correction de la tête vocabulaire et premier lancement du
 27B.
 
+## 2026-11-15 — J1 (suite) : W10 fusionné, premier lancement du 27B
+
+**W10-lite** : branche fusionnée (merge `9ca90f7`) puis son suivi `efa1361`
+(hc_up, absmax kv_store, borne embed, gate fusionnée). Le worktree local avait
+été ramené à l'état pré-W10 par un checkout inattendu ; restauré depuis HEAD,
+puis fusion du suivi. Build depuis l'arbre fusionné et `r3d_selftest` avec
+libref : **142 rows, 0 échec**, 13 skips de shims. HEAD `1892845`.
+
+**27B** : déclare sans aucune bande device, chargement **3,0 s**, 21,16 GiB sur
+la carte, écoute sur 8100, `/v1/models` répond. La première complétion échoue
+au premier pas :
+
+```
+E kernel rmsnorm_quant_fp8_bf16 (libr3d) refused op 'rmsnorm_quant_fp8' at M=5
+  ... {n=5120 eps=1e-06 group=128 dtype=bf16 wadd=1 M=512}: invalid argument
+```
+
+Cause : le trunk du 27B est int8 ; l'architecture demande
+`rmsnorm_had_quant_i8g`, que libr3d ne déclare pas, et retombe sur
+`rmsnorm_quant_fp8` (E4M3), dont le shim refuse un q int8. C'est le seul
+bloqueur M1 observé.
+
+**Tentative** : composite `rmsnorm_had_quant_i8g` (norme fp8 puis
+`had_quant_act_i8g`) avec schéma/row/scratch. Le startup échoue alors avec
+« called in the wrong phase » (`RAD_E_STATE`, plan de buffers), sans trace de
+builder ni d'arch. Changements annulés ; l'arbre est revenu à l'état vérifié
+`1892845`.
+
+**Prochaine étape** : implémenter proprement `rmsnorm_had_quant_i8g` (noyau
+fusionné, ou composite via la row fp8 existante avec dispatch sur le dtype de
+q), puis relancer le 27B et vérifier la tête vocabulaire.
+
 
 

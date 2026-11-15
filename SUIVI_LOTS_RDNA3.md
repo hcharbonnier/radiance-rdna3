@@ -16,11 +16,11 @@
 | W7 — QSA | à faire | 2,5 sem | après W6 |
 | W8 — HC | **terminé (revu, device vert)** | 3,5 sem | 6 rows ; perf à mesurer en W12 |
 | W9 — PLE | **terminé (revu, device vert)** | 1,5 sem | 4 rows ; `opd_shape` en W11 |
-| W10 — vision | en cours (W10-lite) | 3 sem | reste `attn_dense` hd72 et `rope` axial |
-| W11 — intégration | à faire | 1,5 sem | tête vocabulaire IQR à corriger |
+| W10 — vision | **terminé (revu, 142 rows vertes)** | 3 sem | coût attn_dense à optimiser en W12 |
+| W11 — intégration | en cours | 1,5 sem | **`rmsnorm_had_quant_i8g` manquant** (bloque M1) ; tête vocabulaire IQR |
 | W12 — optimisation | à faire | 3–4 sem | |
 | M0 — Go/No-Go | **GO (2026-11-15)** | fin S3 | `MEMO_M0_RDNA3.md` |
-| M1 — dense IQR | bloqué par la vision uniquement | fin S8 | texte : toutes bandes résolvent |
+| M1 — dense IQR | **chargé et à l'écoute, premier pas bloqué** | fin S8 | norme int8 `rmsnorm_had_quant_i8g` |
 
 ## Risques ouverts
 
@@ -30,5 +30,8 @@
 - **R3** — Relayout hôte scalaire : le chargement du 27B peut être long ;
   mesurer, puis vectoriser si nécessaire.
 - **R4** — Aucune fixture MoE : référence hôte à produire en W5.
-- **R5** — La seule dépendance restante de M1 est la tour vision (`attn_dense`
-  hd72, `rope` axial). W10-lite la couvre ; ADR-5 reste le repli.
+- **R5** — *résolu* : la vision est fusionnée et verte (142 rows).
+- **R6** — La norme int8 du trunk 27B (`rmsnorm_had_quant_i8g`) manque à
+  libr3d ; l'architecture retombe sur la norme E4M3, qui refuse un q int8.
+  Bloque M1. Une première tentative de composite a été annulée (`RAD_E_STATE`
+  au plan de buffers) ; voir le journal.
