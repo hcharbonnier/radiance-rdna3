@@ -144,12 +144,3 @@ extern "C" int r3d_rad_embed_lookup_iqr(const RadArgs* a, RadStream stream) {
 #undef R3D_IQR_EGO
     return rc == RAD_OK && hipGetLastError() == hipSuccess ? RAD_OK : R3D_NO(RAD_E_DEVICE);
 }
-
-/* W4/W11: the vocabulary-weighted head's kernel. The row exists so the architecture declares (its
- * classes' layout, the op's schema, and the weights are all resolved), and refuses at run time
- * until the kernel lands. */
-extern "C" int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream s) {
-    (void)a;
-    (void)s;
-    return R3D_NO(RAD_E_UNSUPPORTED);
-}

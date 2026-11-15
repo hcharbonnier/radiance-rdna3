@@ -404,6 +404,7 @@ int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_iqr_tiled(const RadArgs* a, RadStream s);
 int r3d_rad_embed_lookup_iqr(const RadArgs* a, RadStream s);
 int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream s);
+int64_t r3d_logits_gemm_vocab_iqr_scratch(const RadArgs* a);
 int r3d_rad_layout_iqr_embed(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                              const int* sel, const RadTensor* pl, int n, RadLayout* out);
 int r3d_rad_relayout_iqr_embed(const RadParam* p, int n_p, int operand, const RadEncoding* enc,

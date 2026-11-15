@@ -2052,7 +2052,7 @@ static const RadKernelInfo kKernels[] = {
   "tcq_code=mad codes under one f32 scale a row; F32 logits out",
   RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
   ROW(cLogitsVocabIqr), NOTUNE,
-  nullptr, nullptr, r3d_rad_logits_gemm_vocab_iqr, nullptr,
+  nullptr, nullptr, r3d_rad_logits_gemm_vocab_iqr, r3d_logits_gemm_vocab_iqr_scratch,
   r3d_rad_layout_iqr_vocab, r3d_rad_relayout_iqr_vocab,
   nullptr, r3d_rad_unrelayout_iqr_vocab },
 
