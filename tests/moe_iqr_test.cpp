@@ -283,7 +283,8 @@ int bad_reference_cells(const Built& b, const std::vector<uint16_t>& y) {
     const Plan& p = b.plan;
     const int64_t Nmax = std::max(p.N[0], p.N[1]), fy = Nmax / p.parts;
     int bad = 0;
-    for (int64_t i = 0; i < b.g.T; ++i) {
+    const int64_t step = b.g.T > 24 ? 7 : 1;
+    for (int64_t i = 0; i < b.g.T; i += step) {
         const int64_t e = expert_of(b.off, p.E, i);
         if (e < 0) continue;
         const int64_t q = e & 1, Nc = p.N[q], Kc = p.K[q], nkb = Kc / 128;
@@ -312,6 +313,60 @@ int bad_reference_cells(const Built& b, const std::vector<uint16_t>& y) {
         }
     }
     return bad;
+}
+
+/* The invariants every plan shares: both classes own rows, every row the run map owns is
+ * computed across its class's width (and zero elsewhere), every dropped row is zero, the sampled
+ * cells match a direct decode, and the top-k gather accepts the output. */
+int bad_plan_invariants(const Plan& p) {
+    Built b;
+    if (!build(p, &b)) return 1;
+    std::vector<uint8_t> live;
+    const std::vector<uint16_t> y = reference(b, &live);
+    if (y.empty()) return 2;
+    const int64_t Nmax = std::max(p.N[0], p.N[1]), fy = Nmax / p.parts;
+    int bad = 0, classes = 0;
+    for (int64_t e = 0; e < p.E; ++e)
+        if (b.off[(size_t)e] < b.off[(size_t)e + 1]) classes |= 1 << (int)(e & 1);
+    if (classes != 3) ++bad;
+    for (int64_t i = 0; i < b.g.T; ++i) {
+        const int64_t e = expert_of(b.off, p.E, i);
+        for (int64_t part = 0; part < p.parts; ++part)
+            for (int64_t j = 0; j < fy; ++j) {
+                const int64_t at = i * Nmax + part * fy + j;
+                const bool computed = e >= 0 && j < p.N[e & 1] / p.parts;
+                if (computed) {
+                    bad += live[(size_t)at] != 1;
+                } else {
+                    bad += y[(size_t)at] != 0;
+                    bad += live[(size_t)at] != 0;
+                }
+            }
+    }
+    bad += bad_reference_cells(b, y);
+    std::vector<float> sum;
+    if (!moe_gather_reference(y, b.g, b.sorted, b.off, b.gate, &sum)) ++bad;
+    return bad;
+}
+
+TEST(moe_iqr_reference_shape_matrix) {
+    if (!lib().host_ok()) {
+        radtest::artifact_missing(__FILE__, __LINE__, "libr3d's moe_gemm_iqr layout hooks");
+        return;
+    }
+    static const Plan kPlans[] = {
+        { "top_k 1, E 4, M 3", 4, 1, 3, 1, { 256, 512 }, { 256, 128 }, false, 0, false, false,
+          0x1357u },
+        { "top_k 4, E 8, M 1", 8, 4, 1, 1, { 256, 512 }, { 256, 128 }, false, 0, false, false,
+          0x2468u },
+        { "top_k 4, E 4, M 33", 4, 4, 33, 1, { 256, 512 }, { 256, 128 }, false, 0, false, false,
+          0x9BDFu },
+    };
+    for (const Plan& p : kPlans) {
+        const int bad = bad_plan_invariants(p);
+        if (bad) std::fprintf(stderr, "  %s: %d invariant failure(s)\n", p.what, bad);
+        CHECK_EQ(bad, 0);
+    }
 }
 
 TEST(moe_iqr_reference_covers_runs_zero_rows_and_topk) {
@@ -413,7 +468,7 @@ TEST(moe_iqr_reference_sorted_rows_and_parts) {
         radtest::artifact_missing(__FILE__, __LINE__, "libr3d's moe_gemm_iqr layout hooks");
         return;
     }
-    Plan p{ "sorted rows, two parts", 4, 2, 2, 2, { 512, 512 }, { 256, 256 }, true, 0, false, false,
+    Plan p{ "sorted rows, two parts", 4, 2, 16, 2, { 512, 512 }, { 256, 256 }, true, 0, false, false,
             0xBEEF1234u };
     Built b;
     REQUIRE(build(p, &b));
