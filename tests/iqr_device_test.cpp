@@ -910,13 +910,26 @@ void reference16(const Cls& cl, const std::vector<float>& xr, int64_t M, int64_t
  * these magnitudes (ulp 0.125 at 22), which is the point of the sixteen-bit activation. */
 constexpr float kLogitAtol = 5e-3f, kLogitRtol = 2e-4f;
 
-bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bits = nullptr) {
-    const int64_t rows = 256, K = 512, n_vocab = 768, voff = 128;
-    Cls cls[4];
+/* `row_counts` defaults to four equal classes; a class's ids keep their own contiguous range, and
+ * the output window drops `voff` ids at each end, so the caller can also give the classes unequal
+ * row counts (the one launch's empty-block path). */
+bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bits = nullptr,
+               const int64_t* row_counts = nullptr) {
+    const int64_t K = 512, voff = 128;
+    int64_t rows[4] = { 256, 256, 256, 256 };
     for (int i = 0; i < 4; ++i)
-        if (!make_class(cls[i], rows, K, (int32_t)(i * rows), 0x9E3779B97F4A7C15ull * (i + 3),
+        if (row_counts) rows[i] = row_counts[i];
+    int64_t total = 0;
+    for (int i = 0; i < 4; ++i) total += rows[i];
+    const int64_t n_vocab = total - 2 * voff;
+    Cls cls[4];
+    int64_t id0 = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (!make_class(cls[i], rows[i], K, (int32_t)id0, 0x9E3779B97F4A7C15ull * (i + 3),
                         bits ? bits[i] : 4u))
             return false;
+        id0 += rows[i];
+    }
     const int64_t nkb = K / 128;
     std::vector<uint16_t> xb((size_t)(M * K));
     for (auto& v : xb) {
@@ -943,10 +956,10 @@ bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bit
     tl.data = dl; tl.dtype = RAD_F32; tl.rank = 2; tl.shape[0] = M; tl.shape[1] = n_vocab;
     for (int i = 0; i < 4; ++i) {
         tw[i].data = db[i]; tw[i].dtype = cls[i].L.dtype; tw[i].rank = 2;
-        tw[i].shape[0] = rows; tw[i].shape[1] = K;
+        tw[i].shape[0] = rows[i]; tw[i].shape[1] = K;
         ts[i].data = ds[i]; ts[i].dtype = cls[i].LS.dtype; ts[i].rank = 2;
-        ts[i].shape[0] = rows; ts[i].shape[1] = nkb;
-        ti[i].data = di[i]; ti[i].dtype = RAD_I32; ti[i].rank = 1; ti[i].shape[0] = rows;
+        ts[i].shape[0] = rows[i]; ts[i].shape[1] = nkb;
+        ti[i].data = di[i]; ti[i].dtype = RAD_I32; ti[i].rank = 1; ti[i].shape[0] = rows[i];
     }
     for (RadTensor* p : { &ta, &tl, &tw[0], &ts[0], &ti[0], &tw[1], &ts[1], &ti[1], &tw[2],
                           &ts[2], &ti[2], &tw[3], &ts[3], &ti[3] })
@@ -955,8 +968,8 @@ bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bit
                           tw[3], ts[3], ti[3], tv, tl };
     const RadParam params[] = { pint("M", M), pint("n_vocab", n_vocab), pint("n_embd", K),
                                 pstr("dtype", "bf16"), pint("vocab_offset", voff),
-                                pint("rows0", rows), pint("rows1", rows), pint("rows2", rows),
-                                pint("rows3", rows) };
+                                pint("rows0", rows[0]), pint("rows1", rows[1]),
+                                pint("rows2", rows[2]), pint("rows3", rows[3]) };
     RadArgs args{};
     args.t = ops; args.n_t = 15; args.p = params; args.n_p = 9; args.kv_used_max_h = -1;
     const int64_t need = lib().logits_scratch(&args);
@@ -1149,6 +1162,10 @@ TEST(iqr_vocab_head_matches_its_reference) {
      * per-class pointers. */
     const uint32_t mixed[4] = { 2, 3, 5, 7 };
     CHECK(run_vocab(2, nullptr, mixed));
+    /* Classes of unequal row counts: grid.x is the widest class's tile count, and the narrower
+     * classes' blocks past their rows must return without touching the tile or the logits. */
+    const int64_t uneven[4] = { 256, 512, 768, 256 };
+    CHECK(run_vocab(2, nullptr, nullptr, uneven));
 }
 
 /* The head's two tilings: M = 1 selects MT = 1 (the hi/lo wave split), M = 2 selects MT = 2. The
