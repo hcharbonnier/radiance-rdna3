@@ -1,7 +1,8 @@
 # Suivi des lots — RDNA3
 
 État au 2026-11-15. Les estimations sont celles du plan ; « reste » est mis à jour
-à chaque session. Ne pas réécrire `PLAN_IMPLEMENTATION_RDNA3.md`.
+à chaque session. Le suivi détaillé des tâches restantes est dans
+`CHECKLIST_RDNA3.md`. Ne pas réécrire `PLAN_IMPLEMENTATION_RDNA3.md`.
 
 | Lot | État | Estimation | Reste à faire |
 |---|---|---|---|

@@ -133,6 +133,9 @@ split) et `./build/bin/rad-kbench -m <27b.rad> --home <home> --bench --report`.
 
 ## 6. À optimiser plus tard (W14+) — noyaux conservés
 
+Le suivi complet des tâches restantes (MoE, QSA, Flash-Next, mesures, rapport)
+est tenu dans `CHECKLIST_RDNA3.md`.
+
 1. **Tuile WMMA du préfill** : éteinte, 25–32 % plus lente ; reprendre
    l'émission et le staging (décodage par une seule wave, fragments 16 octets)
    avant de la rallumer. Le `v_dot4` résident reste le chemin par défaut.
@@ -146,7 +149,6 @@ split) et `./build/bin/rad-kbench -m <27b.rad> --home <home> --bench --report`.
 6. **E4M3/rotated** : aucun modèle non-IQR sur l'hôte.
 
 ## 7. Non ajouté volontairement
-
 `API_DISTANTE.md`, `HANDOVER_RDNA3.md`, `PLAN_IMPLEMENTATION_RDNA3.md`,
 `RAPPORT_RDNA3.md` et `external-docs/` restent hors dépôt (déjà untracked avant
 W12 ; PDF ISA AMD sous copyright).
