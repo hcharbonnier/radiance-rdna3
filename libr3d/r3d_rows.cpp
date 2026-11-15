@@ -2160,7 +2160,7 @@ static const RadKernelInfo kKernels[] = {
   "the vocabulary-weighted IQR head: each class's computed-trellis codes decoded once a 128-K "
   "block and dotted against the rotated, sixteen-bit activation in exact int8 sums; the class's "
   "ids scatter the f32 logits",
-  "any M; n_embd a multiple of 128; each class a multiple of 256 rows; runs of 256 rows",
+  "any M; n_embd a multiple of 256; each class a multiple of 256 rows; runs of 256 rows",
   "bf16 x rotated by fwht128 and quantised per (token, 128) to q = 128 hi + lo in the call's "
   "scratch; classes of tcq_code=mad codes under one f32 scale a row; F32 logits out",
   RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,

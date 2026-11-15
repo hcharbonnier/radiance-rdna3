@@ -40,9 +40,8 @@ constexpr int kHalfUnits = 8;
 constexpr int kMTMax = 16;
 constexpr int kGroup = 128;
 constexpr float kTopI8 = 127.0f;
-/* One unit's 16x128 int8 tile, and the GEMV's i32 partials (a stride of 33 words avoids a 16-way
- * bank conflict when the 16 row owners read one lane column). */
-constexpr int kStageBytes = 16 * 128;
+/* One unit's 16x128 int8 tile (a stride of 33 words avoids a 16-way bank conflict when the 16 row
+ * owners read one lane column), which also holds the GEMV's i32 partials. */
 constexpr int kPartBytes = 16 * 33 * 4;
 
 /* i32 sub of four signed int8 pairs, exact: gfx11's dot4 is signed x unsigned, so both operands
@@ -104,7 +103,7 @@ void gemm_iqr_gated_kernel(const int8_t* __restrict__ a, const float* __restrict
     /* One unit's staging, and the token tile's bf16 gate and up values (gate columns 0..127, up
      * 128..255). MT == 1 uses the staging as the GEMV's partials. */
     __shared__ __align__(16) uint8_t s_stage[(size_t)kUnits * kPartBytes];
-    __shared__ uint16_t s_val[kMTMax][2 * kGroup];
+    __shared__ uint16_t s_val[MT][2 * kGroup];
 
     if constexpr (MT == 1) {
         int* const sP = (int*)(s_stage + (size_t)u * kPartBytes);
@@ -133,7 +132,7 @@ void gemm_iqr_gated_kernel(const int8_t* __restrict__ a, const float* __restrict
             s_val[0][half * kGroup + tile * 16u + lane] = f32_to_bf16(v);
         }
     } else {
-        uint8_t* const sW = s_stage + (size_t)u * kStageBytes;
+        uint32_t* const sW = (uint32_t*)(s_stage + (size_t)u * kPartBytes);
         constexpr int NP = (MT * 16 + kWave - 1) / kWave;   /* (token, row) pairs a lane */
         float acc[NP];
 #pragma unroll
@@ -145,20 +144,17 @@ void gemm_iqr_gated_kernel(const int8_t* __restrict__ a, const float* __restrict
             Dec<F>::rows(r, c, 1.0f, w);
             Dec<F>::unzero(c, rt, kb, w);
 #pragma unroll
-            for (int qi = 0; qi < 16; ++qi) *(uint32_t*)(sW + qi * 128 + 4u * lane) = w[qi];
+            for (int qi = 0; qi < 16; ++qi) sW[qi * 33 + lane] = w[qi];
             __syncwarp();
 
 #pragma unroll
             for (int i = 0; i < NP; ++i) {
                 const int p = (int)lane + kWave * i;
-                if constexpr (MT * 16 < kWave) {
-                    if (p >= MT * 16) continue;
-                }
                 const int m = p / 16, qi = p % 16;
                 if (m >= M) continue;
                 int sub = 0;
                 const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
-                const uint32_t* wp = (const uint32_t*)(sW + qi * 128);
+                const uint32_t* wp = sW + qi * 33;
 #pragma unroll
                 for (int c4 = 0; c4 < 32; ++c4)
                     sub = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub);
@@ -172,9 +168,6 @@ void gemm_iqr_gated_kernel(const int8_t* __restrict__ a, const float* __restrict
 #pragma unroll
         for (int i = 0; i < NP; ++i) {
             const int p = (int)lane + kWave * i;
-            if constexpr (MT * 16 < kWave) {
-                if (p >= MT * 16) continue;
-            }
             const int m = p / 16, qi = p % 16;
             if (m >= M) continue;
             s_val[m][half * kGroup + tile * 16u + qi] =
@@ -304,11 +297,9 @@ int r3d_rad_gemm_nt_q_iqr_gated(const RadArgs* a, RadStream s) {
     if (!r3d_contig(Q)) return R3D_NO(RAD_E_STRIDE);
 
     /* The same forms, private planes, extents and alignment the m16 row serves. */
-    const Form fw = form(B->dtype), fs = form(BS->dtype);
+    const Form fw = form(B->dtype);
     if (kernel_word(B->dtype) != kernel_word(BS->dtype)) return R3D_NO(RAD_E_DTYPE);
     if (!form_supported(fw)) return R3D_NO(RAD_E_UNSUPPORTED);
-    (void)fs;
-    if (N % 16) return R3D_NO(RAD_E_SHAPE);
     const unsigned lrun = (unsigned)((B->dtype >> 22) & 15u);
     if (lrun < 4 || (N % (long long)(1u << lrun))) return R3D_NO(RAD_E_SHAPE);
 

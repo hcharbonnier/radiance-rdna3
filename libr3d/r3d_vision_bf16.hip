@@ -286,10 +286,11 @@ __global__ __launch_bounds__(kThr) R3D_WAVES(4) void attn_dense_h72_kernel(
 }  // namespace
 
 extern "C" int r3d_attn_dense_h72(long q, long k, long v, long o, long cu, int total_q,
-                                  int n_seq, int q_heads, int gqa, long q_ld, long k_ld,
-                                  long v_ld, long o_ld, float scale, long stream) {
+                                  int n_seq, int max_seqlen, int q_heads, int gqa, long q_ld,
+                                  long k_ld, long v_ld, long o_ld, float scale, long stream) {
     if (!q || !k || !v || !o || !cu) return -1;
     if (total_q <= 0 || n_seq <= 0 || q_heads <= 0 || gqa <= 0 || q_heads % gqa) return -2;
+    if (max_seqlen < 0) return -2;
     if (q_ld < (long)q_heads * kHd || k_ld < (long)(q_heads / gqa) * kHd ||
         v_ld < (long)(q_heads / gqa) * kHd || o_ld < (long)q_heads * kHd)
         return -3;
@@ -298,7 +299,10 @@ extern "C" int r3d_attn_dense_h72(long q, long k, long v, long o, long cu, int t
      * kernel. `rows` floors, so a gqa that does not divide kThr leaves its last threads idle. */
     const int hpb = gqa <= kMaxHb ? gqa : 1;
     const long rows = kThr / hpb;
-    const long long tiles = ((long long)total_q + rows - 1) / rows;
+    /* A segment is at most `max_seqlen` rows, so that bounds the x axis; without it the whole
+     * batch's rows do, and the blocks past each segment's end return immediately. */
+    const long long span = (max_seqlen > 0 && max_seqlen < total_q) ? max_seqlen : total_q;
+    const long long tiles = (span + rows - 1) / rows;
     const long long heads = (long long)q_heads / hpb;
     if (tiles > 0x7fffffffLL) return -2;
     /* The launch's y and z axes carry the heads and the segments, and gfx11 caps both at 65535
@@ -378,10 +382,15 @@ extern "C" int r3d_rad_attn_dense(const RadArgs* a, RadStream s) {
     /* libref's default is `1.0f / sqrt((float)head_dim)`, not the double quotient narrowed. */
     const float dflt_scale = 1.0f / std::sqrt((float)kHd);
     const float scale = (float)r3d_getf(a, "scale", (double)dflt_scale);
+    /* The optional band parameter bounds a segment's rows, so the launch does not tile the whole
+     * batch for every segment; a caller that omits it keeps the total-rows bound. */
+    const long long max_seqlen = r3d_geti_or(a, "max_seqlen", 0);
+    if (max_seqlen < 0) return R3D_NO(RAD_E_SHAPE);
+    const int msl = (max_seqlen > 0 && max_seqlen < q_tok) ? (int)max_seqlen : 0;
     return launch_ok(r3d_attn_dense_h72(r3d_addr(q), r3d_addr(k), r3d_addr(v), r3d_addr(o),
-                                        r3d_addr(cu), (int)q_tok, (int)n_seq, (int)q_nh, (int)gqa,
-                                        (long)q_ld, (long)k_ld, (long)v_ld, (long)o_ld, scale,
-                                        (long)(uintptr_t)s));
+                                        r3d_addr(cu), (int)q_tok, (int)n_seq, msl, (int)q_nh,
+                                        (int)gqa, (long)q_ld, (long)k_ld, (long)v_ld, (long)o_ld,
+                                        scale, (long)(uintptr_t)s));
 }
 
 /* ================================================================== rope, mode axial, hd 72 */

@@ -200,7 +200,7 @@ __device__ __forceinline__ void put_slot_word(int slot, int r, uint32_t v,
         if (STAGE_V) *((r3d_lds_u32*)(sV + slot * kHeadDim) + (r - kHeadDim / 4)) = v;
     } else {
         sks[slot] = f16_to_f32((uint16_t)(v & 0xffffu));
-        svs[slot] = f16_to_f32((uint16_t)(v >> 16));
+        if (STAGE_V) svs[slot] = f16_to_f32((uint16_t)(v >> 16));
     }
 }
 
