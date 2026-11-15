@@ -1097,6 +1097,17 @@ void bench_one(int64_t N, int64_t K, int M, int B, int reps, bool tiled = false)
     args.t = ops; args.n_t = 7; args.p = params; args.n_p = 5; args.kv_used_max_h = -1;
     const LaunchFn run = (tiled && lib().tiled) ? lib().tiled : lib().gemm;
     const char* row = (tiled && lib().tiled) ? "tiled" : "m16";
+    /* The row's split arena, so the M = 1 narrow shape prices the path the engine runs. Wide N
+     * and M > 1 leave the hook at 0 and the launch on the unsplit kernel. */
+    const int splits = (M == 1 && lib().slices) ? lib().slices(N, K) : 1;
+    void* dPart = nullptr;
+    if (M == 1 && lib().gemm_scratch) {
+        const int64_t npart = lib().gemm_scratch(&args);
+        if (npart > 0 && hipMalloc(&dPart, (size_t)npart) == hipSuccess) {
+            args.scratch = dPart;
+            args.scratch_bytes = npart;
+        }
+    }
     for (int i = 0; i < 5; ++i) run(&args, (RadStream)0);
     hipDeviceSynchronize();
     hipEvent_t e0, e1;
@@ -1115,12 +1126,12 @@ void bench_one(int64_t N, int64_t K, int M, int B, int reps, bool tiled = false)
     std::sort(us.begin(), us.end());
     const double med = us[us.size() / 2];
     const double bytes = (double)weight_bytes(form(L.dtype), N, K);
-    std::printf("%s N=%lld K=%lld M=%d: %.2f us, %.1f GB/s of weight, %.1f TFLOP/s\n",
-                row, (long long)N, (long long)K, M, med, bytes / med / 1e3,
+    std::printf("%s N=%lld K=%lld M=%d split=%d: %.2f us, %.1f GB/s of weight, %.1f TFLOP/s\n",
+                row, (long long)N, (long long)K, M, splits, med, bytes / med / 1e3,
                 2.0 * M * N * K / med / 1e6);
     hipEventDestroy(e0);
     hipEventDestroy(e1);
-    hipFree(dA); hipFree(dS); hipFree(dB); hipFree(dBS); hipFree(dY);
+    hipFree(dA); hipFree(dS); hipFree(dB); hipFree(dBS); hipFree(dY); hipFree(dPart);
 }
 
 TEST(iqr_vocab_head_matches_its_reference) {
