@@ -68,6 +68,9 @@ set(R3D_UNITS
   # per 32 of K, the block's partials scaled at the block boundary.
   "r3d_gemm_mxfp4a8|"
   "r3d_gemm_inta8|"
+  # The IQR weight at decode heights (W0/W3): the computed trellis decoded where it is read, one
+  # wave a 16-row tile, v_dot4 for the group sub-sums.
+  "r3d_gemm_iqr_m16|"
   # The wave-matrix arm of the w8a8 grid: V_WMMA_I32_16X16X16_IU8 chains an exact i32 group
   # sub-sum, the group term the reference's. The `impl` point of the dot2 arm's row.
   "r3d_gemm_inta8_wmma|"
@@ -196,12 +199,9 @@ foreach(u ${R3D_UNITS})
   list(APPEND R3D_SRC "${src}")
 endforeach()
 
-# The host sources are declaration only: the row table and the operand descriptions. They are pure
-# host C++ that includes neither r3d.h nor hip_runtime.h, so the tables compile and can be inspected
-# without ROCm. libr3d has no layout source: nothing it serves is repacked, because a dot2 GEMM
-# reads a weight in the order it is stored (see r3d_rows.cpp). There is no fusion source because
-# no fused row exists.
-set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp)
+# The host sources are declaration only: the row table and the operand descriptions, plus the IQR
+# storage hooks (pure host C++, no HIP). They compile and can be inspected without ROCm.
+set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp r3d_iqr_layout.cpp)
 
 rad_add_plugin(libr3d kernels
   SOURCES     ${R3D_DECLARATION}

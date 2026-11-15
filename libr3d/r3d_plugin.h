@@ -397,6 +397,18 @@ int r3d_rad_gemm_nt_q_w8a8_m16(const RadArgs* a, RadStream s);
 int r3d_shape_gemm_nt_q_w4a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt_q_w8a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 
+/* --- r3d_gemm_iqr_m16.hip and r3d_iqr_layout.cpp: the IQR weight (r3d_iqr.h) at M <= 16. The
+ * layout hooks reorder the container's codes into the lane segments the decoder reads and invert;
+ * the shim refuses the forms the W0 kernel does not decode yet. --- */
+int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* a, RadStream s);
+int r3d_rad_layout_iqr(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                       const int* sel, const RadTensor* pl, int n, RadLayout* out);
+int r3d_rad_relayout_iqr(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                         const int* sel, const RadTensor* pl, int n, void* dst, int64_t dst_bytes);
+int r3d_rad_unrelayout_iqr(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                           const int* sel, const void* src, int64_t src_bytes,
+                           const RadTensor* pl, int n);
+
 /* The relayout writers for the three layout hooks, each delegating to rad_planes_relayout. The
  * loader converts a quantised weight into the joined operand the plan names, and only the row that
  * reads it can say how. See abi/rad_abi.h. */

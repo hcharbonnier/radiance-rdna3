@@ -49,7 +49,8 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
 # relayout_iqr_test holds the IQR relayout to the stored form r4d_iqr.h describes, so it also
 # compiles r4d_iqr_layout.cpp.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test)
+# iqr_parity_test compiles both libraries' IQR layout sources and requires byte equality (ADR-1).
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test iqr_parity_test)
 # Their relayouts' vector loops, at every CPU level (libr4d/r4d_hsimd.h), built for these tests
 # whether or not libr4d itself is.
 include(${CMAKE_SOURCE_DIR}/cmake/RadSimdLevels.cmake)
@@ -174,6 +175,12 @@ file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 if(NOT RAD_HIP_FOUND)
   list(FILTER RAD_TESTS EXCLUDE REGEX "/dspark_device_test\\.cpp$")
 endif()
+# iqr_device_test dlopens the built libr3d, so it exists only where that library is built.
+if(TARGET libr3d AND RAD_HIP_FOUND)
+  set(RAD_TESTS_WITH_R3D_DEVICE iqr_device_test)
+else()
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/iqr_device_test\\.cpp$")
+endif()
 foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
   if(n IN_LIST RAD_TESTS_NO_CORE)
@@ -220,6 +227,12 @@ foreach(t ${RAD_TESTS})
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/tools/iface.cpp)
     target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
     target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/tools)
+  elseif(n IN_LIST RAD_TESTS_WITH_R3D_DEVICE)
+    add_executable(${n} ${t})
+    target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE} ${CMAKE_DL_LIBS} ${RAD_HIP_RUNTIME})
+    target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr3d)
+    target_compile_definitions(${n} PRIVATE RAD_R3D_SO="$<TARGET_FILE:libr3d>")
+    add_dependencies(${n} libr3d)
   elseif(n IN_LIST RAD_TESTS_WITH_R4D_HOST)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/libr4d/r4d_layout.cpp
                             ${CMAKE_SOURCE_DIR}/libr4d/r4d_fp8_layout.cpp
@@ -235,6 +248,11 @@ foreach(t ${RAD_TESTS})
     endif()
     if(n STREQUAL relayout_iqr_test)
       target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_iqr_layout.cpp)
+    endif()
+    if(n STREQUAL iqr_parity_test)
+      target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_iqr_layout.cpp
+                                  ${CMAKE_SOURCE_DIR}/libr3d/r3d_iqr_layout.cpp)
+      target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr3d)
     endif()
   elseif(n IN_LIST RAD_TESTS_WITH_PACK)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/arch/minimaxh3/rad_ref2va_pack.cpp)
@@ -329,6 +347,16 @@ if(RAD_HIP_FOUND)
       TIMEOUT ${RAD_TEST_TIMEOUT}
       ENVIRONMENT "${RAD_TEST_CARD_ENV}")
   endforeach()
+  # The IQR GEMM against its host reference, on the card the library was built for.
+  if(TARGET iqr_device_test)
+    add_test(NAME iqr_device_test_card COMMAND iqr_device_test)
+    set_tests_properties(iqr_device_test_card PROPERTIES
+      LABELS gpu
+      RUN_SERIAL TRUE
+      SKIP_RETURN_CODE 77
+      TIMEOUT ${RAD_TEST_TIMEOUT}
+      ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  endif()
 endif()
 
 # plugin_test's libr4d cases run against the shipped RDNA4 library. Only a build whose GPU

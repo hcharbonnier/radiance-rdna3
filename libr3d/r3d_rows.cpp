@@ -1488,6 +1488,14 @@ static const RadConstraint cGemmQW8A8M16[]  = { C_IN("dtype", "w8a8"),
                                                 C_GE("M", 1), C_LE("M", 16),
                                                 C_DIV("K", 128), C_GE("N", 1) };
 
+/* The IQR weight at decode heights (r3d_iqr.h): the rotated int8 activation against a computed
+ * trellis or a table decoded where it is read. `group` is the activation's scale width and the
+ * weight's 128-K block; N is whole 16-row tiles and a trellis run divides it, which the shim
+ * checks because the run rides in the weight's private dtype. */
+static const RadConstraint cGemmQIqrM16[]   = { C_IN("dtype", "i8a8h"), C_EQ("group", 128),
+                                                C_GE("M", 1), C_LE("M", 16), C_DIV("K", 128),
+                                                C_DIV("N", 16) };
+
 /* The w8a8 wave-matrix arm at prefill heights. 17 <= M <= 127 complements cGemmQW8A8M16's
  * M <= 16, so the two rows never compete for a band. K % 128 is the scale group. */
 static const RadConstraint cGemmQW8A8M64[]  = { C_IN("dtype", "w8a8"),
@@ -2628,6 +2636,23 @@ static const RadKernelInfo kKernels[] = {
   ROW(cGemmQW8A8M16), tImpl2, NELEM(tImpl2), impl_tune_valid,
   nullptr, nullptr, r3d_rad_gemm_nt_q_w8a8_m16,
   nullptr, nullptr, nullptr, r3d_shape_gemm_nt_q_w8a8 },
+
+{ "gemm_iqr_nt_m64", "gemm_nt_q", "gemm",
+  "gemm_nt_q over an IQR weight (r3d_iqr.h) kept at its codes' width, decoded where it is read: a "
+  "wave a 16-row tile, each lane its 32-lane segment of a unit; at M = 1 the lanes dot their four "
+  "columns and fold the group in LDS, above 1 the tile is staged and each lane owns whole "
+  "(token, row) pairs",
+  "M <= 16; K a multiple of 128 and N of 16; a trellis run divides N. W0 reads the computed "
+  "trellis (tcq_code=mad, L = 16) under one f32 scale a row or a bf16 scale a (row, 128); the "
+  "table and grid forms are refused until the MoE lot",
+  "I8 a row-major with an f32 scale per (row, 128 of K), W an IQR form's codes decoding to int8 "
+  "values, bf16 y; per group an exact i32 sub-sum and the reference's two f32 factors, the row's "
+  "own factor in the epilogue under kRowF32",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_M16,
+  ROW(cGemmQIqrM16), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_m16,
+  nullptr, r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
+  r3d_shape_gemm_nt_q, r3d_rad_unrelayout_iqr },
 
  { "gemm_nt_q_w8a8_m64", "gemm_nt_q", "gemm",
    "the symmetric 8-bit weight grid at prefill heights: signed int8 codes against int8 "
