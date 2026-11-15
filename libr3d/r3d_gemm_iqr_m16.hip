@@ -485,7 +485,7 @@ extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M,
      * direct caller that allocates no scratch still gets the old kernel and bytes. */
     if (mt == 1) {
         const int splits = r3d_iqr_split_slices(N, K);
-        if (splits > 1 && scratch &&
+        if (splits > 1 && scratch && !((uintptr_t)scratch & 3u) &&
             scratch_bytes >= (long long)splits * N * (long long)sizeof(float))
             return r3d_gemm_iqr_splitk(a, as, b, bs, y, N, K, word, splits, scratch, stream);
     }
