@@ -147,6 +147,10 @@ static const RadParamSpec pEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_voc
 static const RadOperandSpec oEmbed[] = { { "tokens", RAD_OPD_IN, 0 },
                                          { "wte", RAD_OPD_WEIGHT, 0 },
                                          { "x", RAD_OPD_OUT, 0 } };
+/* embed_lookup_q's parameter list: embed_lookup's without `mult`, since the quantised table's
+ * scale is an operand and the row has no separate per-row factor. */
+static const RadParamSpec pEmbedQ[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
+                                        P_STR("dtype"), P_INTO("vocab_offset"), P_F64O("wscale") };
 
 /* The lm_head as up to four width classes, each a (codes, scales, ids) triple (r3d_iqr.h's lm
  * form); `vrow` is the inverse. Copied from libr4d's schema: the op is device-only and no
@@ -667,6 +671,84 @@ static const RadOperandSpec oMoeGemmQMod4[] = { { "a", RAD_OPD_IN, 0 }, { "a_sca
                                                 { "w_3", RAD_OPD_WTAB, 0 }, { "w_3_scale", RAD_OPD_WTAB, 0 },
                                                 { "y", RAD_OPD_OUT, 0 } };
 
+/* --- Per-Layer Embedding and HyperConnections (Qwen4-Exp) ---
+ *
+ * The schemas are libref's for the ops it declares; ngram_hint and the two collective writes are
+ * libr4d's device-only ops, copied slot for slot so a build that loads both plugins agrees. */
+static const RadOperandSpec oEmbedQ[] = { { "tokens", RAD_OPD_IN, 0 },
+                                          { "wte", RAD_OPD_WEIGHT, 0 },
+                                          { "scale", RAD_OPD_WEIGHT, 1 },
+                                          { "x", RAD_OPD_OUT, 0 },
+                                          { "ahead", RAD_OPD_IN, 1 } };
+static const RadParamSpec pPleGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
+                                         P_STR("dtype"), P_F64O("wadd"), P_F64O("gate_eps") };
+static const RadOperandSpec oPleGate[] = { { "k", RAD_OPD_IN, 0 },
+                                           { "q", RAD_OPD_IN, 0 },
+                                           { "v", RAD_OPD_IN, 0 },
+                                           { "w_key", RAD_OPD_WEIGHT, 0 },
+                                           { "w_query", RAD_OPD_WEIGHT, 0 },
+                                           { "w_conv", RAD_OPD_WEIGHT, 0 },
+                                           { "gv", RAD_OPD_OUT, 0 },
+                                           { "gvn", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pPleConv[] = { P_INT("M"), P_INT("n"), P_INT("width"),
+                                         P_INT("dilation"), P_STR("dtype") };
+static const RadOperandSpec oPleConv[] = { { "x", RAD_OPD_IN, 0 },
+                                           { "w", RAD_OPD_WEIGHT, 0 },
+                                           { "conv_state", RAD_OPD_INOUT, 0 },
+                                           { "cu", RAD_OPD_IN, 0 },
+                                           { "resid", RAD_OPD_IN, 1 },
+                                           { "cache_idx", RAD_OPD_IN, 1 },
+                                           { "has_init", RAD_OPD_IN, 1 },
+                                           { "num_accepted", RAD_OPD_IN, 1 },
+                                           { "y", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pHcRead[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"),
+                                        P_F64("eps"), P_STR("dtype"), P_F64O("wadd"),
+                                        P_INTO("inject"), P_INTO("group"), P_INTO("rotate"),
+                                        P_STRO("mix") };
+static const RadOperandSpec oHcRead[] = { { "h", RAD_OPD_IN, 0 },
+                                          { "w", RAD_OPD_WEIGHT, 0 },
+                                          { "mix_down", RAD_OPD_WEIGHT, 0 },
+                                          { "mix_up", RAD_OPD_WEIGHT, 0 },
+                                          { "inject_w", RAD_OPD_WEIGHT, 1 },
+                                          { "x", RAD_OPD_OUT, 0 },
+                                          { "inj", RAD_OPD_OUT, 1 },
+                                          { "q", RAD_OPD_OUT, 1 },
+                                          { "scale", RAD_OPD_OUT, 1 },
+                                          { "rq", RAD_OPD_OUT, 1 },
+                                          { "rscale", RAD_OPD_OUT, 1 } };
+static const RadParamSpec pHcWrite[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
+static const RadOperandSpec oHcWrite[] = { { "y", RAD_OPD_IN, 0 }, { "inj", RAD_OPD_IN, 0 },
+                                           { "h", RAD_OPD_INOUT, 0 } };
+static const RadOperandSpec oHcEnter[] = { { "x", RAD_OPD_IN, 0 }, { "h", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pHcProject[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("scale"),
+                                           P_STR("dtype") };
+static const RadOperandSpec oHcProject[] = { { "h", RAD_OPD_INOUT, 0 }, { "v", RAD_OPD_IN, 0 },
+                                             { "on", RAD_OPD_IN, 0 } };
+static const RadParamSpec pNgramHint[] = { P_INT("M"), P_INT("heads"), P_INT("ngram"),
+                                           P_INT("eos"), P_INT("hist") };
+static const RadOperandSpec oNgramHint[] = { { "tok", RAD_OPD_IN, 0 },
+                                             { "pos", RAD_OPD_IN, 0 },
+                                             { "cu", RAD_OPD_IN, 0 },
+                                             { "mult", RAD_OPD_WEIGHT, 0 },
+                                             { "vocab_sizes", RAD_OPD_WEIGHT, 0 },
+                                             { "offsets", RAD_OPD_WEIGHT, 0 },
+                                             { "cache_idx", RAD_OPD_IN, 1 },
+                                             { "tail", RAD_OPD_INOUT, 0 },
+                                             { "ids", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pArHcWrite[] = { P_INT("M"), P_INT("n"), P_INT("hc"),
+                                           P_INT("world_size"), P_STR("dtype"), P_INTO("wire") };
+static const RadOperandSpec oArHcWrite[] = { { "y", RAD_OPD_INOUT, 0 }, { "inj", RAD_OPD_IN, 0 },
+                                             { "h", RAD_OPD_INOUT, 0 } };
+static const RadParamSpec pArGatherHcWrite[] = { P_INT("M"), P_INT("n"), P_INT("hc"),
+                                                 P_INT("top_k"), P_INT("world_size"),
+                                                 P_STR("dtype"), P_STRO("act"), P_INTO("wire") };
+static const RadOperandSpec oArGatherHcWrite[] = {
+    { "y_expert", RAD_OPD_IN, 0 },  { "expert_w", RAD_OPD_IN, 0 },
+    { "sorted_tok", RAD_OPD_IN, 0 }, { "shared", RAD_OPD_IN, 1 },
+    { "shared_gate", RAD_OPD_IN, 1 }, { "y", RAD_OPD_INOUT, 0 },
+    { "inj", RAD_OPD_IN, 0 },       { "h", RAD_OPD_INOUT, 0 }
+};
+
 static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd) * mult. `wadd` is GemmaRMSNorm's `1 +`, "
@@ -973,6 +1055,43 @@ static const RadOpSchema kSchemas[] = {
            "Grouped GEMM over the expert-sorted rows, quantised operands, four classes by "
            "expert number mod 4. The E4M3 wave-matrix core over 8 R3dTab tables (class q = "
            "entry e/4 of tables q); unequal class shapes are refused."),
+    /* --- W9: Per-Layer Embedding --- */
+    SCHEMA("embed_lookup_q", pEmbedQ, oEmbedQ,
+           "x[m] = wte[id] * scale[0] from a table quantised with ONE scale for all of it; an "
+           "absent scale is 1, so a plain bf16 table takes the same op. Padding and bounds are "
+           "embed_lookup's."),
+    SCHEMA("ngram_hint", pNgramHint, oNgramHint,
+           "ids[s][h] = ngram_ids' hash of the n-gram ending at sequence s's newest token on a "
+           "draft pass. `hist` takes the history pass's last row; otherwise the round's one row. "
+           "`tail` keeps the two tails ngram_ids maintains. A prefetch hint only."),
+    SCHEMA("ple_gate", pPleGate, oPleGate,
+           "Per-Layer Embedding's gate: K and Q are grouped rmsnorms times their gains, "
+           "s[c] = K[c].Q[c]/sqrt(n), the signed square root with `gate_eps`, then "
+           "gv[c] = sigmoid(s[c]) * v and gvn = grouped_rmsnorm(gv) * w_conv."),
+    SCHEMA("ple_conv", pPleConv, oPleConv,
+           "A depthwise causal convolution whose taps are `dilation` apart, then silu and the "
+           "residual add: y[t] = resid[t] + silu(sum_j w[c][j] * x[t-(width-1-j)*dilation][c]). "
+           "History is (width-1)*dilation in `conv_state`, in the layout `num_accepted` selects."),
+    /* --- W8: HyperConnections --- */
+    SCHEMA("hc_read", pHcRead, oHcRead,
+           "The read half of a gated residual: N = grouped_rmsnorm(h), g = sigmoid(mix_up @ "
+           "silu(mix_down @ N / hc)), x = mean_c(g * N), and with inject_w, "
+           "inj[c] = 2*sigmoid(inject_w[c] . N / hc). Optional q/rq are the fp8 and rotated fp8 "
+           "forms of the stored x."),
+    SCHEMA("hc_write", pHcWrite, oHcWrite,
+           "The write half: h[c] += inj[c] * y for each of the hc streams, on the unnormed "
+           "residual the paired read was handed."),
+    SCHEMA("hc_enter", pHcWrite, oHcEnter,
+           "h[c] = x for each of the hc streams: the wide residual stream's first value."),
+    SCHEMA("hc_project", pHcProject, oHcProject,
+           "For each stream of a row whose `on` flag is 1, h[c] -= scale * (h[c] . v) * v, with "
+           "v the layer's unit direction and scale its stored norm."),
+    SCHEMA("ar_hc_write", pArHcWrite, oArHcWrite,
+           "The all-reduce and the gated residual's write that follows it, in one kernel. At one "
+           "rank the reduction is the identity, so this is hc_write over the message."),
+    SCHEMA("ar_gather_hc_write", pArGatherHcWrite, oArGatherHcWrite,
+           "moe_gather, then ar_hc_write: the routed experts' rows summed back to token order "
+           "(with the shared arm folded) ARE the message, and the gated write follows."),
 };
 
 extern "C" int rad_kernel_schema_count(void) {
@@ -1557,6 +1676,33 @@ static const RadConstraint cGemmQFp8a8[]  = { C_IN("dtype", "fp8a8"),
 static const RadConstraint cGemmQI8[]     = { C_IN("dtype", "i8a8"),
                                               C_EQ("group", R3D_W8_GROUP), C_GE("M", 1),
                                               C_LE("M", 16), C_DIV("K", 128), C_GE("N", 1) };
+
+/* --- Per-Layer Embedding and HyperConnections (Qwen4-Exp) --- */
+static const RadConstraint cPleGate[] = { C_IN("dtype", "bf16"), C_GE("n", 1),
+                                          C_LE("n", 4096), C_GE("hc", 2), C_LE("hc", 8) };
+static const RadConstraint cPleConv[] = { C_IN("dtype", "bf16"), C_GE("n", 1),
+                                          C_GE("width", 1), C_LE("width", 5),
+                                          C_GE("dilation", 1), C_LE("dilation", 4) };
+static const RadConstraint cEmbedQ[] = { C_IN("dtype", "bf16"), C_GE("n_embd", 1) };
+static const RadConstraint cNgramHint[] = { C_GE("heads", 1), C_GE("ngram", 2), C_LE("ngram", 8),
+                                            C_GE("hist", 0) };
+/* The stream rows are shared by hc_write, hc_enter and hc_project. */
+static const RadConstraint cHcStream[] = { C_IN("dtype", "bf16"), C_GE("M", 1),
+                                           C_GE("hc", 2), C_LE("hc", 8), C_DIV("n", 2) };
+/* The read's plain form also takes a band with no `mix` key; the E4M3 row is the higher-priority
+ * one and its constraint on the key is what splits the two. */
+static const RadConstraint cHcReadBf16[] = { C_IN("dtype", "bf16"), C_GE("M", 1),
+                                             C_GE("hc", 2), C_LE("hc", 8), C_DIV("n", 128),
+                                             C_GE("lowrank", 16) };
+static const RadConstraint cHcReadE4m3[] = { C_IN("dtype", "bf16"), C_IN("mix", "e4m3"),
+                                             C_GE("M", 1), C_GE("hc", 2), C_LE("hc", 8),
+                                             C_DIV("n", 128), C_DIV("lowrank", 64) };
+static const RadConstraint cArHc[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_EQ("world_size", 1),
+                                       C_GE("hc", 2), C_LE("hc", 8), C_DIV("n", 8) };
+static const RadConstraint cArGatherHc[] = { C_IN("dtype", "bf16"), C_GE("M", 1),
+                                             C_EQ("world_size", 1), C_GE("hc", 2), C_LE("hc", 8),
+                                             C_DIV("n", 8), C_GE("top_k", 1),
+                                             C_LE("top_k", 64) };
 
 /* ================================================================== the rows
  *
@@ -3230,6 +3376,124 @@ static const RadKernelInfo kKernels[] = {
   ROW(cGemmNTTiled), tImpl4, NELEM(tImpl4), impl_tune_valid,
   nullptr, nullptr, r3d_rad_gemm_nt_bf16_tiled, nullptr,
   nullptr, nullptr, r3d_shape_gemm_nt },
+
+/* ------------------------------------------------------------------ W9: r3d_embed_lookup_q.hip,
+ * r3d_ngram_hint.hip, r3d_ple_gate_bf16.hip, r3d_ple_conv_bf16.hip
+ *
+ * Qwen4-Exp's Per-Layer Embedding. The table is the 320-million-row n-gram embedding, E4M3 with
+ * one scale for the whole table (or a plain bf16 table read in place). The hint is a prefetch
+ * only; the gate and convolution are the same arithmetic as libref, with the sums in double where
+ * libref accumulates in double.
+ */
+{ "embed_lookup_q_bf16", "embed_lookup_q", "gemm",
+  "the table row an id names, times the table's one scale; an id outside the shard is zero",
+  "any n_embd; one workgroup a row; E4M3 codes with an optional bf16/f16/f32 scale, or a bf16 "
+  "table with no scale",
+  "codes decoded exactly and multiplied once, then one narrowing to bf16/f16/f32",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cEmbedQ), NOTUNE,
+  nullptr, nullptr, r3d_rad_embed_lookup_q, nullptr, nullptr, nullptr, nullptr },
+
+{ "ngram_hint_i32", "ngram_hint", "elem",
+  "the n-gram row ids of each sequence's newest token, one draft pass before they are hashed for "
+  "real; a prefetch hint, nothing reads them as model ids",
+  "one thread a sequence; heads split into ngram-1 equal blocks; tail keeps the two committed tails",
+  "the ngram_ids hash and narrowing, with the same EOS cut",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cNgramHint), NOTUNE,
+  nullptr, nullptr, r3d_rad_ngram_hint, nullptr, nullptr, nullptr, nullptr },
+
+{ "ple_gate_bf16", "ple_gate", "norm",
+  "the signed-square-root dot between two normed streams, its sigmoid times v, and the rms of that "
+  "product; one workgroup a (row, stream)",
+  "bf16 k/q/v/gv/gvn, f32 gains; n <= 4096 and hc 2..8, the row and register budget of the "
+  "workgroup reduction",
+  "both norms and the dot in double, the scale returned as f32, expf rather than __expf",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cPleGate), NOTUNE,
+  nullptr, nullptr, r3d_rad_ple_gate, nullptr, nullptr, nullptr, nullptr },
+
+{ "ple_conv_bf16", "ple_conv", "norm",
+  "the dilated depthwise causal convolution, its silu and the residual add; the state window is "
+  "written back in the same launch",
+  "bf16; width <= 5, dilation <= 4 so (width-1)*dilation <= 16, tokens walked 32 at a time",
+  "the taps summed in j order in f32, silu as x*sigmoid(x), one bf16 store",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cPleConv), NOTUNE,
+  nullptr, nullptr, r3d_rad_ple_conv, nullptr, nullptr, nullptr, nullptr },
+
+/* ------------------------------------------------------------------ W8: r3d_hc_bf16.hip
+ *
+ * The wide residual stream. The read is four launches (norm, down+inj, up, quant) so the weight
+ * stream spreads over the card; `d` and the stream scales travel in the row's scratch. The E4M3
+ * mixed form packs each row's codes and scales through the host layout hook below.
+ */
+{ "hc_read_e4m3", "hc_read", "norm",
+  "the gated residual's read over an E4M3 mixing pair: grouped norm, low-rank silu gate, stream "
+  "mean, injection gains, and the optional q/rq forms of x",
+  "n a multiple of 128, lowrank a multiple of 64, hc 2..8, hc*n within one 48 KiB LDS stage; "
+  "the two mix weights are the joined E4M3 form with a f32 scale per 128 of K (down) or K/4 (up)",
+  "the norm in double; each dot ascending in f32 with no FMA; the same narrowings as libref, so "
+  "the read is bit-identical to the reference",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY + 1,
+  ROW(cHcReadE4m3), NOTUNE,
+  nullptr, nullptr, r3d_rad_hc_read, r3d_rad_hc_read_scratch,
+  r3d_rad_layout_hc_mix, r3d_rad_relayout_hc_mix, nullptr, r3d_rad_unrelayout_hc_mix },
+
+{ "hc_read_bf16", "hc_read", "norm",
+  "the same read over plain bf16 mixing matrices",
+  "n a multiple of 128, hc 2..8, hc*n within one 48 KiB LDS stage",
+  "the norm in double; each dot ascending in f32 with no FMA; one bf16 narrowing per value",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cHcReadBf16), NOTUNE,
+  nullptr, nullptr, r3d_rad_hc_read, r3d_rad_hc_read_scratch,
+  nullptr, nullptr, nullptr, nullptr },
+
+{ "hc_write_bf16", "hc_write", "norm",
+  "h[c] += inj[c] * y on each of the hc streams, in place on the unnormed residual",
+  "bf16, hc 2..8, any even n",
+  "the product in f32 and one bf16 store, the write half's arithmetic",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cHcStream), NOTUNE,
+  nullptr, nullptr, r3d_rad_hc_write, nullptr, nullptr, nullptr, nullptr },
+
+{ "hc_enter_bf16", "hc_enter", "norm",
+  "hc identical copies of the embedding: the wide stream's first value",
+  "bf16 x and h, hc 2..8, any even n",
+  "one narrowing, the same value into each stream",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cHcStream), NOTUNE,
+  nullptr, nullptr, r3d_rad_hc_enter, nullptr, nullptr, nullptr, nullptr },
+
+{ "hc_project_bf16", "hc_project", "norm",
+  "the control vector's projection on the rows whose flag is set: h[c] -= scale*(h[c].v)*v",
+  "bf16 h, f32 v, i32 on; hc 2..8, any even n",
+  "the dot in double and the scale applied in double, as libref writes it; one bf16 store",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cHcStream), NOTUNE,
+  nullptr, nullptr, r3d_rad_hc_project, nullptr, nullptr, nullptr, nullptr },
+
+/* ------------------------------------------------------------------ W8: r3d_ar_hc_write.hip
+ *
+ * The collective pair at one rank. At tp:1 the reduction is the identity; the two- and four-rank
+ * forms stay with libr4d (a gfx11 card has no peer fabric path in this library).
+ */
+{ "ar_hc_write_1rank", "ar_hc_write", "ar",
+  "the one-rank all-reduce (identity) and the gated residual's write that follows it",
+  "exactly world_size 1; bf16, hc 2..8, n a multiple of 8",
+  "hc_write's arithmetic over the message, byte-identical to the unfused pair at one rank",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cArHc), NOTUNE,
+  nullptr, nullptr, r3d_rad_ar_hc_write, nullptr, nullptr, nullptr, nullptr },
+
+{ "ar_gather_hc_write_1rank", "ar_gather_hc_write", "ar",
+  "moe_gather folded in front of the one-rank ar_hc_write: the routed experts' rows summed back "
+  "to token order, then the gated write",
+  "exactly world_size 1; bf16, top_k <= 64, hc 2..8, n a multiple of 8",
+  "the gather's sums and narrows are moe_gather's; the write is hc_write's over that bf16 value",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cArGatherHc), NOTUNE,
+  nullptr, nullptr, r3d_rad_ar_gather_hc_write, nullptr, nullptr, nullptr, nullptr },
 
 
 };

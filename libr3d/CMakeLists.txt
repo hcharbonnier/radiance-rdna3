@@ -178,6 +178,15 @@ set(R3D_UNITS
   # The same shape over a block-scaled fp8 weight, decoded to f16 exactly (E4M3's four exponent bits
   # and three mantissa bits are a subset of f16's), and over int8 codes.
   "r3d_gemm_fp8a16_nt_m1|"
+  # Per-Layer Embedding and HyperConnections (Qwen4-Exp): the n-gram table gather and its prefetch
+  # hint, the PLE gate and dilated convolution, and the wide residual stream's read/write/enter/
+  # project. The HC read carries a host layout hook for the E4M3 mixing weights.
+  "r3d_embed_lookup_q|"
+  "r3d_ngram_hint|"
+  "r3d_ple_gate_bf16|"
+  "r3d_ple_conv_bf16|"
+  "r3d_hc_bf16|"
+  "r3d_ar_hc_write|"
   # A row in r3d_rows.cpp must name an entry point defined by one of these units: an undefined
   # symbol makes the whole plugin fail to load.
 )

@@ -460,6 +460,26 @@ int r3d_rad_silu_mul             (const RadArgs* a, RadStream s);
 int r3d_rad_rmsnorm_quant_fp8    (const RadArgs* a, RadStream s);
 int r3d_shape_rmsnorm_quant_fp8  (const RadParam*, int, int, RadOpdDesc*);
 
+/* --- the PLE and HyperConnections rows (W9 then W8) --- */
+int r3d_rad_embed_lookup_q (const RadArgs* a, RadStream s);
+int r3d_rad_ngram_hint     (const RadArgs* a, RadStream s);
+int r3d_rad_ple_gate       (const RadArgs* a, RadStream s);
+int r3d_rad_ple_conv       (const RadArgs* a, RadStream s);
+int r3d_rad_hc_enter       (const RadArgs* a, RadStream s);
+int r3d_rad_hc_read        (const RadArgs* a, RadStream s);
+int r3d_rad_hc_write       (const RadArgs* a, RadStream s);
+int r3d_rad_hc_project     (const RadArgs* a, RadStream s);
+int64_t r3d_rad_hc_read_scratch(const RadArgs* a);
+int r3d_rad_ar_hc_write        (const RadArgs* a, RadStream s);
+int r3d_rad_ar_gather_hc_write (const RadArgs* a, RadStream s);
+/* The joined E4M3 mixing weight: codes and a f32 scale per group in the row's tail. */
+int r3d_rad_layout_hc_mix     (const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, RadLayout*);
+int r3d_rad_relayout_hc_mix   (const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, void*, int64_t);
+int r3d_rad_unrelayout_hc_mix (const RadParam*, int, int, const RadEncoding*, const int*,
+                               const void*, int64_t, const RadTensor*, int);
+
 }  /* extern "C" */
 
 #endif  /* RAD_R3D_PLUGIN_H */
