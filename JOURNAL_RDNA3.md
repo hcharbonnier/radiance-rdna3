@@ -313,5 +313,97 @@ builder ni d'arch. Changements annulés ; l'arbre est revenu à l'état vérifi�
 fusionné, ou composite via la row fp8 existante avec dispatch sur le dtype de
 q), puis relancer le 27B et vérifier la tête vocabulaire.
 
+## 2026-11-15 — J2 : W11, norme int8, fold FFN, premier texte du 27B
+
+**`rmsnorm_had_quant_i8g`** : noyau fusionné (add résiduel → variance de la
+somme écrite bf16 → gain → arrondi bf16 → Hadamard 128 → int8 row-major), row,
+schéma et shape hook (q en I8), déclaré dans `r3d_plugin.h` et compilé comme
+unité séparée. La norme est prise sur la somme écrite, comme la paire. Le
+résidu est optionnel indépendamment de `wadd`, comme `rmsnorm_quant_fp8` et
+libref.
+
+Validation : `r3d_selftest --norm-only` compare le noyau à `add` + `rmsnorm` +
+`had_quant_act_i8g` sur M=1/5/512, avec et sans résidu : **6/6 identiques au
+bit** (codes, échelles, `out_bf16`). Selftest complet : **144 rows, 0 échec**,
+14 skips (le nouvel op n'a pas de schéma dans libref).
+
+**Fold FFN i8a8h** : la déclaration de la norme active `q8_fed` dans le bloc
+MLP, qui demande alors `gemm_nt_q_gated` en i8a8h. libr3d ne l'avait qu'en
+fp8a8 ; la seule row était libavx (host), ce qui faisait basculer toute l'unité
+de couche sur le tier mapped et déclenchait le refus « widened at load » sur
+les gains de norme f32 (le `RAD_E_STATE` de la veille). Ajout de
+`gemm_iqr_gated_i8a8h` : `gemm_iqr_m16` calcule le gate_up bf16 dans le scratch
+de l'op, puis `gated_had_quant_i8g` fait silu + rotation + int8. C'est la même
+forme intermédiaire que libr4d stage dans `r4d_gemm_iqr_gated`.
+
+**Convention d'échelle** : libr3d pliait `1/sqrt(128)` dans les quantiseurs
+tournés `*_i8g` et `*_fp8` alors que docs/OPS et libref ne plient rien (le
+1/128 est porté par le plan de poids, `libquant` stocke `scale/128`). Corrigé
+pour `had_quant_act_i8g`, `gated_had_quant_i8g`, `had_quant_act_fp8`,
+`gated_had_quant_fp8`, `rmsnorm_had_quant_i8g` et la tête IQR : échelle
+`amax/127` (ou `/448`), groupe nul → 1, et le produit gaté est arrondi bf16
+avant la rotation comme la paire non fusionnée. Deux bugs de shim corrigés au
+passage : le plan `b_scale` d'une forme `block=1x*` n'est pas `[N, K/128]`
+(extent privé, plus de refus de forme), et le scratch de la tête était
+calculé avec `n_t` au lieu des seuls paramètres (donc jamais alloué).
+
+**27B** : démarre, charge 21,17 GiB en 3,0 s, et génère « Paris.\nThe capital of
+Germany is » en 8 tokens, **28,7 tok/s**, TTFT 83 ms. La tête tournait alors
+sous `RAD_IQR_VOCAB=1` ; le désaccord de son test synthétique (0,507812 contre
+-3,15625) venait de la **référence du test**, qui lisait la queue d'échelles au
+mauvais offset (`align256(rows*4)` au lieu de `cf_off`) et appliquait le facteur
+de ligne après coup : la référence validée `reference()`, celle que le test m16
+contrôle, donne exactement 0,507812. Le test de la tête utilise maintenant cette
+référence ; il est vert, et la variable d'environnement a été supprimée.
+
+**W11 terminé** : la tête vocabulaire est servie par défaut et validée.
+
+## 2026-11-15 — J2 (suite) : revue des changements et préfill > 16 tokens
+
+Revue indépendante des changements non commités ; sept points corrigés.
+
+- **IQR tiled** : le shim `r3d_rad_gemm_nt_q_iqr_tiled` gardait le contrôle
+  d'extension exact sur `b_scale` que le m16 venait d'assouplir ; il refuse
+  désormais lui aussi la forme `block=1x*`. Un cas M=33 a été ajouté à
+  `iqr_device_test` (le tiled passe, 33 rows en 16+16+1).
+- **Selftest de la norme** : les cas « sans résidu » liaient quand même le
+  buffer résiduel ; depuis que le shim lit `res` dès qu'il est liée, ils
+  échouaient (3 FAIL dans la dernière exécution). Le slot est maintenant
+  absent quand `residual=false`, et un cas « résidu lié, `wadd=0` » pin la
+  sémantique de libref. **7/7 cas verts, selftest complet RC=0, 144 rows,
+  0 échec.**
+- **gfx1102** : le FWHT du noyau fusionné tournait dans la boucle de groupes,
+  le motif que le dépôt documente comme mal compilé sur gfx1102. Il passe
+  désormais par une tranche LDS par wave (`fwht128_lds`, même réseau et même
+  ordre d'opérandes que `r3d_fwht_wave`, donc bit-identique) : plus de DPP
+  dans la boucle, tous targets.
+- **Tête vocabulaire** : la référence du test lisait la queue des échelles au
+  mauvais offset ; remplacée par la référence GEMM validée. Le test est vert et
+  la variable d'environnement a été supprimée.
+- **Gated IQR** : la description de row ne prétend plus économiser un launch
+  device ; le fold garde les deux noyaux et le scratch (fusion d'épilogue en
+  W12).
+- **Shape hook gated** : `N % 256` (au lieu de 128) pour coller à la
+  contrainte de row et au quantiseur.
+- **out_bf16** : les quatre bf16 par lane sont écrits en deux dwords au lieu
+  de quatre stores 2 octets, avec contrôle d'alignement.
+
+**Préfill > 16 tokens** : les prompts de 15 et 16 tokens passent et génèrent
+(« Paris. The quick », « city of Paris. », 28,4 tok/s). À 33 et 83 tokens, le
+processus meurt en SIGSEGV ; `rocgdb` pointe
+`r3d_rad_gemm_nt_bf16_tiled` (`rad_gemm_run`) appelé par `GdnFP8::step`. Le
+chemin IQR tiled est validé séparément au M=33.
+
+**Cause et correctif** : `rad_gemm_run` lisait les premiers octets de tout
+poids comme un en-tête `rad.planes`, y compris pour un poids bf16 simple
+(`ssm_ab`, [96, 5120]) placé en VRAM : la lecture hôte d'un pointeur device
+provoque le SIGSEGV. Le peek d'en-tête ne s'applique plus qu'aux poids privés
+(`w->dtype != RAD_BF16`), c'est-à-dire aux têtes quantisées, qui sont mappées
+et lisibles par l'hôte. Vérifié : prompts de **33, 83 et 819 tokens** verts,
+préfill 68–79 tok/s, décodage 21–28 tok/s. Le 819 tokens (« the Cook Islands
+is ») traverse les bandes tiled M ≤ 64/127/512.
+
+**Selftest après correctif** : RC=0, 144 rows, 0 échec, 14 skips ; norme 7/7.
+
 
 

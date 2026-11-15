@@ -17,21 +17,25 @@
 | W8 — HC | **terminé (revu, device vert)** | 3,5 sem | 6 rows ; perf à mesurer en W12 |
 | W9 — PLE | **terminé (revu, device vert)** | 1,5 sem | 4 rows ; `opd_shape` en W11 |
 | W10 — vision | **terminé (revu, 142 rows vertes)** | 3 sem | coût attn_dense à optimiser en W12 |
-| W11 — intégration | en cours | 1,5 sem | **`rmsnorm_had_quant_i8g` manquant** (bloque M1) ; tête vocabulaire IQR |
+| W11 — intégration | **terminé (2026-11-15)** | 1,5 sem | tête vocabulaire validée et servie par défaut |
 | W12 — optimisation | à faire | 3–4 sem | |
 | M0 — Go/No-Go | **GO (2026-11-15)** | fin S3 | `MEMO_M0_RDNA3.md` |
-| M1 — dense IQR | **chargé et à l'écoute, premier pas bloqué** | fin S8 | norme int8 `rmsnorm_had_quant_i8g` |
+| M1 — dense IQR | **atteint : 27B texte, decode 21–28 tok/s, préfill jusqu'à 819 tokens** | fin S8 | optimisation en W12 |
 
 ## Risques ouverts
 
 - **R1** — *résolu* : W6 (attn h256 gqa 6, kv_store i8, imrope) est vert.
-- **R2** — Tête vocabulaire IQR : le kernel existe mais échoue la référence ; il
-  se refuse au run. À corriger avant M1.
+- **R2** — *résolu* : la tête vocabulaire était correcte ; la référence du test
+  lisait la queue d'échelles au mauvais offset. Le test utilise désormais la
+  référence GEMM validée et passe ; la row est servie par défaut (plus de
+  `RAD_IQR_VOCAB`).
 - **R3** — Relayout hôte scalaire : le chargement du 27B peut être long ;
   mesurer, puis vectoriser si nécessaire.
 - **R4** — Aucune fixture MoE : référence hôte à produire en W5.
 - **R5** — *résolu* : la vision est fusionnée et verte (142 rows).
-- **R6** — La norme int8 du trunk 27B (`rmsnorm_had_quant_i8g`) manque à
-  libr3d ; l'architecture retombe sur la norme E4M3, qui refuse un q int8.
-  Bloque M1. Une première tentative de composite a été annulée (`RAD_E_STATE`
-  au plan de buffers) ; voir le journal.
+- **R6** — *résolu* : `rmsnorm_had_quant_i8g` est déclarée, fusionnée (add +
+  norme + Hadamard + int8), validée 7/7 contre la paire (dont l'absence de
+  résidu et `wadd=0`), et le fold FFN `gemm_iqr_gated_i8a8h` est en place.
+- **R7** — *résolu* : le préfill > 16 tokens segfaultait parce que
+  `rad_gemm_run` lisait l'en-tête `rad.planes` sur un poids bf16 en VRAM ; le
+  peek ne s'applique plus qu'aux poids privés. 33/83/819 tokens verts.
