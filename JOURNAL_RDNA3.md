@@ -455,6 +455,54 @@ occupation du gated (1,4 bloc/CU), classes parallèles de la tête, mesure isol�
 h256/vision, HC/PLE. Détail dans `HANDOVER_RDNA3_PHASE5.md` et
 `TABLEAU_REEL_IDEAL_RDNA3.md`.
 
+## 2026-11-15 — W13 : split-K, tête 16 bits, h256, vision, WMMA éteinte
+
+Cinq chants en worktrees Agent Manager (le sixième, occupation du gated, n'a rien
+livré), revus par leurs auteurs puis fusionnés sur `rdna3-iqr` (`f6be390`).
+
+- **Split-K `down`** : huit tranches de K pour le GEMV M=1 à N ≤ 8192, partiels
+  i32 par tranche, réduction en ordre croissant, scratch 256-aligné fourni par le
+  hook de la row `gemm_iqr_nt_m64` (repli sans scratch si absent). GEMV
+  5120×17408 M=1 : **104,0 → 67,3 µs, 428,5 → 662,4 GB/s** (49,5 → 76,6 % de 864).
+  Décodage 27B : **+5,2 %** à 16/33 tokens. Test device dédié : 1 ulp bf16 sur
+  1 sortie de 5120 (borne 2).
+- **Tête 16 bits, un lancement** : les quatre classes passent en un seul grid
+  (`blockIdx.z`), repli f32 factorisé, `M=1` hi/lo sur 32 lanes et **pitch 33** ;
+  test **bit-exact M=1 vs M=2** ajouté, classes à comptes inégaux couvertes.
+- **`attn_paged` h256** : cache LDS des scores de la passe max (5120 f32) et
+  pitch de 272 octets pour étaler les bancs ; la passe deux ne rejoue que V si le
+  cache tient, sinon elle recalcule le dot dans le même ordre. 15/15 identiques
+  à libref.
+- **`attn_dense` hd72** : quatre clés par pas dans la marche (chaînes
+  indépendantes, ordre inchangé), et test M=16384 à segments uniformes
+  (18 874 368 valeurs exactes). kbench : **684,7 → 350,7 µs à M=512 (−49 %)**,
+  342 → 180 à M=256, 176 → 94 à M=128, 92 → 49 à M=64 ; M≤16 au plancher.
+- **Tuile WMMA du préfill** : construite et bit-identique, mais **25–32 % plus
+  lente** que le `v_dot4` résident sur builds propres (12288×2560 M=512 2801 contre
+  2083 µs ; M=4096 23 110 contre 17 410 ; down 5120×17408 M=512 7387 contre
+  5683). Le préfill 27B tombe de 301 à 231 tok/s avec elle. Elle reste dans
+  l'arbre, **éteinte** (`kIqrWmmaMinM = 1 << 30`), marquée W14 : le problème est
+  l'émission/le staging, pas la résidence.
+
+**Validation** : `iqr_device_test` 6 cas / 27 checks verts (dont split 1 ulp,
+tête bit-exacte M=1/M=2, vision M=16384 exacte) ; `r3d_selftest` **144 rows,
+0 échec, 14 skips** ; 27B mêmes sorties greedy.
+
+**Mesures 27B, builds propres, 3 lots** : préfill 16/33/819 = 103,4 / 122,1 /
+**301,0** tok/s (W12 : 103,1 / 122,0 / 299,7) ; décodage 16/33/819 = **28,4 /
+28,2 / 21,2** tok/s (W12 : 27,0 / 26,8 / 20,7) ; TTFT 819 2,72 s.
+
+**Piège majeur** : un `rsync -a` dans un répertoire de build existant préserve
+les mtimes et peut laisser des objets périmés ; les A/B incrémentaux ont d'abord
+annoncé un préfill à 229 tok/s, puis un build **neuf** a redonné 301. Toute
+comparaison se fait dans un build neuf, avec vérification du binaire du serveur
+(`/proc/<pid>/exe`) et du port 8100 libre. Les .so sont écrits directement dans
+`radiance_home/kernels` (`LIBRARY_OUTPUT_DIRECTORY`), donc un serveur lancé
+pendant un build charge un mélange.
+
+**Reste (W14)** : WMMA (émission/staging), occupation du gated fusionné, mesure
+`attn_dense` à M=16384 dans kbench, mesure isolée h256, HC/PLE, E4M3 non-IQR.
+
 
 
 

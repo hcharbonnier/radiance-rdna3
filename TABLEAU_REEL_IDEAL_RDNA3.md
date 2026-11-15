@@ -49,50 +49,82 @@ Lecture : le **GEMM IQR résident** porte le préfill (+223 tok/s, −74 % de TT
 3 % à cause d'un conflit de bancs LDS (stride 32 dwords), supprimé par un pitch de
 33 dwords — elle est désormais à parité, avec l'accumulation f32.
 
+## W13 — split-K, tête, h256, vision (commit `f6be390`, 2026-11-15)
+
+27B, **builds propres** (répertoires neufs ; un build incrémental après rsync peut
+garder des objets périmés et fausser l'A/B), 64 tokens greedy, 3 lots, mêmes
+requêtes que W12. W12 = `9558549` (les chiffres W12 de la section précédente ont
+été re-mesurés ici sur build propre ; écarts < 1,5 %).
+
+| prompt | préfill W12 | préfill W13 | décodage W12 | décodage W13 | TTFT W12 | TTFT W13 |
+|---|---|---|---|---|---|---|
+| 16 tok | 103,1 | 103,4 | 27,0 | **28,4** | 150 ms | 155 ms |
+| 33 tok | 122,0 | 122,1 | 26,8 | **28,2** | 271 ms | 270 ms |
+| 819 tok | 299,7 | 301,0 | 20,7 | **21,2** | 2,73 s | 2,72 s |
+
+Noyaux (mesures propres) :
+
+| noyau | forme | W12 | W13 |
+|---|---|---|---|
+| GEMV `down` | 5120×17408, M=1, split-K 8 | 104,0 µs, 428,5 GB/s | **67,3 µs, 662,4 GB/s** (49,5 → 76,6 % de 864) |
+| `attn_dense` hd72 | M=512 | 684,7 µs | **350,7 µs (−49 %)** |
+| `attn_dense` hd72 | M=256 / 128 / 64 / 32 | 342,5 / 175,6 / 92,1 / 48,4 µs | 179,6 / 94,3 / 48,7 / 26,7 µs |
+| `gemm_iqr_tiled` résident | 12288×2560, M=512 / 4096 | 2083 / 17 410 µs (15,5 / 14,8 TFLOP/s) | idem |
+| tuile WMMA (construite, éteinte) | mêmes formes | — | 2801 / 23 110 µs (11,5 / 11,2 TFLOP/s) |
+
+Lecture : le **split-K** porte le décodage (+5,2 % à 16 et 33 tokens, +2,4 % à
+819) et 1,55× sur le GEMV `down` ; la **vision** gagne 45–49 % de M=32 à M=512
+(les petites tailles restent au plancher de lancement) ; la **tête** (un lancement,
+pitch 33, bit-exact M=1/M=2) et **h256** (cache de scores LDS, pitch 272) sont
+validés et neutres en préfill ; la **tuile WMMA** est 25–32 % plus lente que le
+`v_dot4` et le préfill 27B tombe de 301 à 231 tok/s avec elle — construite,
+testée, **désactivée** (`kIqrWmmaMinM` au-delà de tout M), à reprendre en W14.
+
 ## Lecture
 
-- Le GEMV atteint la cible sur la forme large. La forme `down` (N=5 120) manque de
-  parallélisme : 320 tuiles de 16 lignes pour 96 CU ; un split-K de 4 à 8 lèverait
-  la limite.
-- Le chemin M=16 n'est pas une performance : il décode la tuile en LDS puis fait
-  un `v_dot4` par (token, ligne). La cible du rapport pour le préfill suppose la
-  matrice 16×16×16 IU8 ; c'est le travail de W3/W4, pas un écart du décodeur.
-- Aucune mesure HC/PLE ni MoE n'est encore faite, et les changements W12 de
-  h256/vision ne sont pas isolés (seuls les chiffres 27B les incluent). Une seule
-  carte, benchmarks séquentiels ; voir « Optimisations différées ».
+- Le GEMV large atteint 86 % ; la forme `down` était à 49,5 %, le split-K la
+  porte à 76,6 % (662 GB/s sur 864).
+- Le chemin M≥64 reste un `v_dot4` : la matrice 16×16×16 IU8 construite en W13
+  est 25–32 % **plus lente** et reste éteinte. La cible « WMMA » du rapport n'est
+  pas atteinte par cette forme ; c'est la piste W14 (émission/staging, pas la
+  résidence).
+- La vision `attn_dense` hd72 gagne 45–49 % de M=32 à M=512 ; la mesure à
+  M=16384 reste à faire (kbench s'arrête à 512 sur ce conteneur).
+- h256 et la tête sont mesurés de bout en bout (préfill 301, décodage 21,2 à 819),
+  pas isolément. HC/PLE et MoE restent non mesurés. Une seule carte, benchmarks
+  séquentiels, builds propres.
 
 ## À remplir / différé
 
 | Lot | Forme | Réel | Idéal | η |
 |---|---|---|---|---|
-| W3 | GEMV 27B, split-K | 51,5 % sur `down` (W0) | 864 GB/s | split-K non fait |
-| W4 | `gemm_iqr_tiled` M=512/4096 | bout en bout seul (303 tok/s à 819) | borne WMMA | noyau non mesuré ; `v_dot4` |
+| W3 | GEMV 27B, split-K | 662,4 GB/s (76,6 %) sur `down` | 864 GB/s | **fait** |
+| W4 | `gemm_iqr_tiled` M=512/4096 | 15,5 / 14,8 TFLOP/s (résident) ; WMMA 11,5 / 11,2 | borne WMMA | WMMA plus lente, éteinte |
 | W5 | `moe_gemm_iqr` préfill/décodage | | | aucun modèle MoE |
-| W6 | `attn_paged` h256 decode/prefill | inclus dans les chiffres 819, non isolé | | à mesurer |
+| W6 | `attn_paged` h256 decode/prefill | inclus 27B : préfill 301, décodage 21,2 | | à isoler |
 | W8/W9 | `hc_read`, `ple_gate`, `ple_conv` | | | à mesurer |
-| W10 | `attn_dense` hd72 M=16384 | non isolé | | à mesurer |
-| M1 | 27B tokens/s (préfill, décodage) | 303,2 / 20,8–27,2 | | **atteint** |
+| W10 | `attn_dense` hd72 | −49 % à M=512 | | M=16384 non mesuré |
+| M1 | 27B tokens/s (préfill, décodage) | 301,0 / 21,2–28,4 | | **dépassé** |
 | M5 | Flash-Next tokens/s | | | aucun modèle |
 
-## Optimisations différées (W13+)
+## Optimisations différées (W14+)
 
 Ces noyaux sont livrés et validés, mais pas à leur optimum ; ils restent dans
 l'arbre et sont marqués à optimiser, pas à supprimer.
 
-- **`gemm_iqr_tiled` résident** : le préfill est passé à 303 tok/s, mais le cœur
-  reste un échafaudage `v_dot4` ; la matrice 16×16×16 IU8/WMMA n'est pas utilisée.
-  C'est le premier levier du préfill.
-- **`down` 5 120 × 17 408** : 320 tuiles pour 96 CU, 51,5 % ; split-K (4 à 8) non
-  fait.
-- **`gemm_iqr_gated_i8a8h` fusionné** : 512 threads et 136 groupes pour 136 blocs
-  (1,4 bloc/CU sur 96 CU) ; gagnerait à un bloc de 2 groupes ou 256 threads.
-  Gain actuel ~1,5 % en décodage.
-- **Tête IQR 16 bits** : à parité après le pitch 33, mais deux passes int8 et un
-  lancement par classe ; la parallélisation des classes et le recouvrement du
-  décodage restent ouverts.
-- **`attn_paged` h256** : staging i8 en 16 octets et passe max sans V livrés ;
-  aucun gain isolé mesuré. Split du préfill non fait.
-- **`attn_dense` hd72** : tuilage LDS et chargements vectorisés livrés, ordre
-  inchangé ; coût à M=16384 non mesuré.
+- **Tuile WMMA du préfill** : construite, bit-identique, couverte par les tests,
+  **éteinte** car 25–32 % plus lente que le `v_dot4` à toutes les formes mesurées.
+  Le problème est l'émission et le staging (decode par une seule wave, fragments),
+  pas la résidence : W14 doit la reprendre et la rallumer si elle gagne.
+- **`gemm_iqr_gated_i8a8h` fusionné** : 512 threads, 136 blocs pour 96 CU (1,4
+  bloc/CU) ; essayer un découpage à 256 threads ou un kernel persistant. Gain
+  actuel ~1,5 % en décodage, à ne pas régresser.
+- **`attn_dense` hd72 à M=16384** : le gain est mesuré jusqu'à M=512 ; ajouter un
+  cas kbench à 16384 avant d'aller plus loin.
+- **`attn_paged` h256** : le cache de scores et le pitch 272 sont livrés ; le gain
+  isolé n'est pas mesuré et le split du préfill reste interdit par l'ordre exact
+  que les tests exigent.
 - **HC/PLE** : aucune mesure.
+- **E4M3/rotated** : aucun modèle non-IQR sur l'hôte.
+
 

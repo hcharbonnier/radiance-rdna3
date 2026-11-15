@@ -9,8 +9,8 @@
 | W0 — spike IQR 27B | **terminé (GO)** | 2,5 sem | parité et η atteintes ; mémo M0 |
 | W1 — formes et hooks | en cours | 1,5 sem | forme table/grid/`kE4m3`/`tcq_rb` en kernel ; refus en place |
 | W2 — décodeur device | en cours | 1,5 sem | treillis calculé gfx11 fait ; table/grid à faire |
-| W3 — GEMM M ≤ 16 | en cours | 1,5 sem | GEMV 86 % ; m16 `v_dot4` à porter |
-| W4 — m64 et préfill | à faire | 2,5 sem | m64, tuile préfill, bout en bout 27B |
+| W3 — GEMM M ≤ 16 | **terminé (2026-11-15)** | 1,5 sem | GEMV 86 % ; split-K `down` 76,6 % (1,55×) |
+| W4 — m64 et préfill | **terminé (résident) ; WMMA éteinte** | 2,5 sem | tuile résidente 15,5 TFLOP/s ; WMMA 25–32 % plus lente, à reprendre en W14 |
 | W5 — MoE IQR | à faire | 4 sem | run map, formes mixtes, experts bf16 |
 | W6 — attention h256/GQA/KV i8 | **terminé (revu, 15/15 device)** | 3,5 sem | + kv_store i8, rope_table, imrope |
 | W7 — QSA | à faire | 2,5 sem | après W6 |
@@ -18,9 +18,10 @@
 | W9 — PLE | **terminé (revu, device vert)** | 1,5 sem | 4 rows ; `opd_shape` en W11 |
 | W10 — vision | **terminé (revu, 142 rows vertes)** | 3 sem | coût attn_dense à optimiser en W12 |
 | W11 — intégration | **terminé (2026-11-15)** | 1,5 sem | tête vocabulaire validée et servie par défaut |
-| W12 — optimisation | **terminé (2026-11-15)** | 3–4 sem | préfill 27B ×3,8 ; gated fusionné ; tête 16 bits ; h256/vision ; W13 = WMMA/IU8, split-K `down`, mesures isolées |
+| W12 — optimisation | **terminé (2026-11-15)** | 3–4 sem | préfill 27B ×3,8 ; gated fusionné ; tête 16 bits ; h256/vision |
+| W13 — optimisation | **terminé (2026-11-15)** | 2 sem | split-K `down` 1,55× ; vision −49 % à M=512 ; tête un lancement ; h256 ; WMMA mesurée plus lente et éteinte |
 | M0 — Go/No-Go | **GO (2026-11-15)** | fin S3 | `MEMO_M0_RDNA3.md` |
-| M1 — dense IQR | **atteint et dépassé : 27B texte, décodage 27,2 tok/s (16 tok) / 20,8 (819), préfill 303 tok/s à 819** | fin S8 | W13 : préfill WMMA, split-K |
+| M1 — dense IQR | **atteint et dépassé : 27B texte, décodage 28,4 tok/s (16 tok) / 21,2 (819), préfill 301 tok/s à 819** | fin S8 | W14 : WMMA, occupation gated, mesure M=16384 |
 
 ## Risques ouverts
 
@@ -39,12 +40,21 @@
 - **R7** — *résolu* : le préfill > 16 tokens segfaultait parce que
   `rad_gemm_run` lisait l'en-tête `rad.planes` sur un poids bf16 en VRAM ; le
   peek ne s'applique plus qu'aux poids privés. 33/83/819 tokens verts.
-- **R8** — Les gains de `attn_paged` h256 et `attn_dense` hd72 ne sont pas isolés :
-  les chiffres 27B les incluent sans les distinguer. Les noyaux restent dans
-  l'arbre, marqués à mesurer puis optimiser en W13 (voir
-  `TABLEAU_REEL_IDEAL_RDNA3.md`, « Optimisations différées »).
+- **R8** — *partiellement résolu* : `attn_dense` hd72 est mesuré (−49 % à M=512,
+  M=32–512) ; `attn_paged` h256 reste mesuré de bout en bout seulement (préfill
+  301, décodage 21,2 à 819). Les noyaux restent dans l'arbre, marqués à mesurer
+  isolément et optimiser en W14.
 - **R9** — La vérification des formes E4M3/rotated sur un modèle non-IQR reste
   impossible : aucun 2B/4B sur l'hôte, seulement le 27B et le Flash-Next.
 - **R10** — `gemm_iqr_gated_i8a8h` fusionné n'utilise que 1,4 bloc par CU
   (136 groupes, 96 CU) ; son gain est réel (~1,5 % en décodage) mais son
-  occupation est à revoir en W13 (deux groupes par bloc ou 256 threads).
+  occupation est à revoir en W14 (deux groupes par bloc ou 256 threads).
+- **R11** — *résolu, à garder en tête* : un build incrémental après `rsync -a`
+  peut garder des objets périmés (mtimes préservés) et fausser un A/B de 25 %
+  (préfill 301 contre 229). Les comparaisons se font dans des répertoires de
+  build neufs, et le serveur doit être vérifié (`/proc/<pid>/exe`) avant de
+  mesurer.
+- **R12** — La tuile WMMA du préfill est construite, testée et bit-identique,
+  mais 25–32 % plus lente que le `v_dot4` ; elle est éteinte par
+  `kIqrWmmaMinM` au-delà de tout M, pas supprimée. W14 doit la reprendre
+  (émission/staging) avant de la rallumer.
