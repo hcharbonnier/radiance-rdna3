@@ -209,9 +209,8 @@ struct Case {
 };
 
 /* Split-K sums S slab partials instead of the reference's one ascending chain: the same group
- * terms, associated differently. The seeded down fixture measures zero bf16 ulp of difference; two
- * covers a value that sits on a bf16 rounding boundary and is still orders below any decode or
- * scale error. */
+ * terms, associated differently. The seeded down fixture measures one bf16 ulp on one output of
+ * 5120; two covers a second boundary flip and is still orders below any decode or scale error. */
 constexpr int kSplitMaxUlps = 2;
 
 /* The decoded weight, row-major [N, K]. The values are canonical_state's, one (n, k) at a time,
@@ -772,7 +771,8 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
     const Case cases[] = {
         { "mad u4 L16 one-f32-row, GEMV", 4, 16, 0, kRowF32, 512, 384, 1 },
         { "mad u4 L16 one-f32-row, 16 tokens", 4, 16, 0, kRowF32, 512, 384, 16 },
-        { "mad u4 L16 one-f32-row, wide GEMV (no split)", 4, 16, 0, kRowF32, 12288, 1280, 1 },
+        { "mad u5 L16 one-f32-row, wide GEMV 12288x2560 (no split)", 5, 16, 0, kRowF32, 12288,
+          2560, 1 },
         { "mad u4 L16 one-f32-row, 2 tokens", 4, 16, 0, kRowF32, 256, 512, 2 },
         { "mad u4 L16 bf16, 5 tokens", 4, 16, 0, kBf16, 256, 256, 5 },
         { "mad u4 L16 bf16, 16 tokens", 4, 16, 0, kBf16, 256, 512, 16 },
