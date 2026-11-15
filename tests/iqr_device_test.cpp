@@ -1,4 +1,4 @@
-/* iqr_device_test.cpp -- libr3d's IQR GEMM (r3d_gemm_iqr_m16.hip) against a host reference written
+﻿/* iqr_device_test.cpp -- libr3d's IQR GEMM (r3d_gemm_iqr_m16.hip) against a host reference written
  * from r3d_iqr.h, on the card.
  *
  * The reference decodes the container's canonical planes itself (the state recurrence and the
@@ -15,6 +15,7 @@
 #include "rad_test.h"
 #include "rad_plugin.h"
 
+#include "iqr_ref.h"
 #include "r3d_codecs.h"
 #include "r3d_iqr.h"
 
