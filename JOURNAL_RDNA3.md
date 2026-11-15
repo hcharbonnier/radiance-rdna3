@@ -139,3 +139,60 @@ plugin `qwen4exp_fp8@0.1.0`. Même monde que le handover.
 
 **Blocages** : aucun. Points d'attention : fixture IQR absente ; M1 dépend de W6.
 
+## 2026-11-15 — J1 (suite) : declare du 27B, revue W6
+
+**Lot** : W1/W2/M1 (préparation), revue du sous-agent W6.
+
+**Ce qui débloque le declare du 27B**
+
+Le 27B échouait avant toute requête de layout (`rad_arch_declare` → E_INVAL sans
+message). Instrumentation opt-in ajoutée : `RAD_ARCH_TRACE` (étape `RAD_ARCH_TRY`
+qui échoue), `RAD_BUILD_TRACE` (refus de poids par row, erreurs du builder),
+`RAD_R3D_TRACE` (refus des hooks IQR). Causes trouvées et corrigées :
+
+1. `gated_had_quant_i8g` et `had_quant_act_i8g` de libr3d n'acceptaient que
+   `n == 128` ; le 27B a n=5120, 6144, 17408. Les kernels servent désormais une
+   wave par (token, groupe de 128), grille (M, n/128), ce qui évite aussi le bug
+   DPP de gfx1102 dans une boucle.
+2. `embed_lookup` IQR : row `embed_lookup_iqr` ajoutée (décodage par ligne
+   demandée, Hadamard 128 en f32, échelles E4M3/f32), port de libr4d.
+3. `logits_gemm_vocab` : schéma device-only (libref ne le déclare pas) et row
+   `logits_gemm_vocab_iqr` avec les hooks de layout ; le kernel refuse encore
+   (`RAD_E_UNSUPPORTED`) jusqu'à son écriture.
+4. `gemm_iqr_tiled` : row M ≥ 1 (declare résout l'architecture à son bucket le
+   plus large) ; aujourd'hui un lancement m16 par tranche de 16, correct mais
+   re-lecteur du poids.
+
+Après ces correctifs, le 27B **déclare** sur gfx1100 (rapport de sélection
+complet, 135 bandes device non résolues) :
+
+| Op manquant | Paramètres | Lot |
+|---|---|---|
+| `attn_paged` | h256, gqa 6, kv i8, block 16, q_len 16/512 | W6 |
+| `kv_store` | h256, n_head_kv 4, kv i8 | W6 |
+| `rope` | h256, n_head 24/4, mode **imrope**, sections 11 11 10 | W6 |
+| `rope_table` | rot 64, theta 1e7, f32 | W6 |
+| `attn_dense` | hd72, vison (ViT) | W10 |
+| `rope` | hd72, mode **axial**, vison | W10 |
+
+**Revue W6**
+
+Le sous-agent a livré `aa86e04` (4 rows h256, 784 lignes, selftest de 15 cas).
+Fusion locale faite puis **annulée** : `r3d_selftest` sur la carte montre 13 cas
+faux sur 15 (decode causal/ragged dès dim 0 ; prefill faux à partir de row 16,
+donc frontière de tuile ; max |diff| jusqu'à 178). Seuls « windowed » et
+« prefill empty » passent. Le sous-agent a reçu les cas exacts, l'autorisation
+d'exécuter `r3d_selftest` (pas de benchmark ni serveur) et le complément de
+périmètre kv_store i8 / rope_table / imrope. La carte lui est laissée pour cette
+passe.
+
+**Décisions**
+
+- `r3d_selftest` : l'invariant « aucune row ne porte de hook de layout » est
+  assoupli pour les rows IQR (ADR-1 exige l'inverse), le reste inchangé.
+
+**Prochaine étape** : attendre la correction W6, puis (1) écrire le kernel
+`logits_gemm_vocab_iqr`, (2) W5 table/grid, (3) mesurer le 27B et M1.
+
+**Blocages** : aucun ; carte occupée par W6.
+

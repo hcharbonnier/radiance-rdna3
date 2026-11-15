@@ -173,9 +173,16 @@ static void check_table() {
         /* A layout hook and its relayout writer come as a pair (abi/rad_abi.h: a query answering
          * RAD_OK promises the loader the writer produces that form; a hook without one fails at
          * load). No row may carry an unrelayout, since this library invents no format a tool
-         * would need to invert. */
-        if ((k->layout && !joined) || (k->layout && !k->relayout) || (k->relayout && !joined)
-            || (k->relayout && !k->layout) || k->unrelayout)
+         * would need to invert -- except the IQR rows, whose stored lane order is a format of its
+         * own and whose inverse is part of the port's contract (ADR-1). */
+        const bool iqr = !std::strncmp(k->name, "gemm_iqr", 8) ||
+                         !std::strncmp(k->name, "embed_lookup_iqr", 16) ||
+                         !std::strncmp(k->name, "logits_gemm_vocab_iqr", 21);
+        if (iqr) {
+            if ((k->layout && !k->relayout) || (k->relayout && !k->layout))
+                fail("IQR row '%s' declares a hook without its writer", k->name);
+        } else if ((k->layout && !joined) || (k->layout && !k->relayout) || (k->relayout && !joined)
+                   || (k->relayout && !k->layout) || k->unrelayout)
             fail("row '%s' declares a layout hook; libr3d stores weights in order", k->name);
         if (!k->computes || !*k->computes || !k->shape || !*k->shape || !k->dtypes ||
             !*k->dtypes)
