@@ -178,10 +178,10 @@ gemm_iqr_resident_kernel(const int8_t* __restrict__ a, const float* __restrict__
     const uint32_t lane = threadIdx.x & (kIqrWave - 1);
     const uint32_t wave = threadIdx.x / kIqrWave;
     const uint32_t nkb = (uint32_t)(K / 128);
-    const uint32_t nm = (uint32_t)((M + 16 * W - 1) / (16 * W));
+    const uint32_t nm = ((uint32_t)M + 16u * W - 1u) / (16u * W);
     /* Consecutive blocks share a weight tile, so the L2 stream a group of blocks reads is one. */
     const uint32_t rt = (uint32_t)blockIdx.x / nm;
-    const int m0 = (int)((uint32_t)blockIdx.x % nm) * (16 * W) + (int)wave * 16;
+    const uint32_t m0 = ((uint32_t)blockIdx.x % nm) * (16u * W) + wave * 16u;
     Ctx c;
     c.W = b;
     c.S = bs;
@@ -191,7 +191,7 @@ gemm_iqr_resident_kernel(const int8_t* __restrict__ a, const float* __restrict__
     c.tab = nullptr;
 
     /* The decoded 16x128 int8 tile, shared by the workgroup's W slices. */
-    __shared__ uint8_t sW[16 * kIqrSWPitch * 4];
+    __shared__ uint32_t sW[16 * kIqrSWPitch];
     const int row0 = (int)rt * 16;
 
     constexpr int NP = 8;   /* (token, row) pairs a lane: 16 tokens x 16 rows over one wave */
@@ -206,19 +206,19 @@ gemm_iqr_resident_kernel(const int8_t* __restrict__ a, const float* __restrict__
             Dec<F>::rows(r, c, 1.0f, w);
             Dec<F>::unzero(c, rt, kb, w);
 #pragma unroll
-            for (int q = 0; q < 16; ++q)
-                *(uint32_t*)(sW + q * (kIqrSWPitch * 4) + 4u * lane) = w[q];
+            for (int q = 0; q < 16; ++q) sW[q * kIqrSWPitch + lane] = w[q];
         }
         __syncthreads();
 
 #pragma unroll
         for (int i = 0; i < NP; ++i) {
             const int p = (int)lane + kIqrWave * i;
-            const int m = m0 + p / 16, q = p % 16;
-            if (m >= M) continue;
+            const uint32_t mu = m0 + (uint32_t)(p / 16);
+            if (mu >= (uint32_t)M) continue;
+            const int m = (int)mu, q = p % 16;
             int sub = 0;
             const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
-            const uint32_t* wp = (const uint32_t*)(sW + q * (kIqrSWPitch * 4));
+            const uint32_t* wp = sW + q * kIqrSWPitch;
 #pragma unroll
             for (int c4 = 0; c4 < 32; ++c4)
                 sub = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub);
@@ -232,8 +232,9 @@ gemm_iqr_resident_kernel(const int8_t* __restrict__ a, const float* __restrict__
 #pragma unroll
     for (int i = 0; i < NP; ++i) {
         const int p = (int)lane + kIqrWave * i;
-        const int m = m0 + p / 16, q = p % 16;
-        if (m >= M) continue;
+        const uint32_t mu = m0 + (uint32_t)(p / 16);
+        if (mu >= (uint32_t)M) continue;
+        const int m = (int)mu, q = p % 16;
         y[(long long)m * y_ld + row0 + q] = f32_to_bf16(acc[i] * row_scale<F>(c, row0 + q));
     }
 }
@@ -284,9 +285,11 @@ template <class F>
 static int launch_resident(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
                            int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream) {
     constexpr int W = kIqrResidentWaves;
-    const int nt = N / 16;
-    const int nm = (M + 16 * W - 1) / (16 * W);
-    const dim3 grid((unsigned)(nt * nm)), block(W * kIqrWave);
+    const long long nt = N / 16;
+    const long long nm = ((long long)M + 16 * W - 1) / (16 * W);
+    const long long blocks = nt * nm;
+    if (blocks > 0x7FFFFFFFll) return -2;   /* no launch geometry this large */
+    const dim3 grid((unsigned)blocks), block(W * kIqrWave);
     R3D_KLAUNCH(R3D_KNAME((gemm_iqr_resident_kernel<F, W>)), grid, block, (hipStream_t)stream,
                 (const int8_t*)a, (const float*)as, b, bs, (uint16_t*)y, M, N, K, a_ld, y_ld,
                 run_tiles);
