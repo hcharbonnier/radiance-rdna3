@@ -118,6 +118,14 @@ int64_t r3d_logits_gemm_vocab_iqr_scratch(const RadArgs* a) {
 }
 
 int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream stream) {
+    /* W11: the class GEMM through the decode row disagrees with the host reference on the 27B's
+     * head form (same q/s, same weight: device 0.0449, reference -0.279). The row refuses until
+     * that is resolved, so a container with a vocabulary-weighted head declares and fails loudly
+     * at the first step instead of emitting wrong logits. See JOURNAL_RDNA3.md. */
+    (void)a;
+    (void)stream;
+    return R3D_NO(RAD_E_UNSUPPORTED);
+#if 0
     if (!a || a->n_t < 15 || !a->scratch) return R3D_NO(RAD_E_INVAL);
     const RadTensor* x = r3d_opt(a, 0);
     const RadTensor* lg = r3d_opt(a, 14);
@@ -181,6 +189,7 @@ int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream stream) {
                     (uint32_t)rows[i], (int32_t)voff, (uint32_t)rows[i], (uint32_t)ld);
     }
     return hipGetLastError() == hipSuccess ? RAD_OK : R3D_NO(RAD_E_DEVICE);
+#endif
 }
 
 }  // extern "C"
