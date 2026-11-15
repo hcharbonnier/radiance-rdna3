@@ -71,8 +71,9 @@ set(R3D_UNITS
   # The IQR weight at decode heights (W0/W3): the computed trellis decoded where it is read, one
   # wave a 16-row tile, v_dot4 for the group sub-sums.
   "r3d_gemm_iqr_m16|"
-  # The i8a8h gated fold (the int8 trunk's feed-forward), gate_up in the op's scratch then the
-  # gated Hadamard quantiser, so the FFN fusion resolves on the device.
+  # The i8a8h gated fold (the int8 trunk's feed-forward): one workgroup a 128-column group, the
+  # gate's and the up's IQR decode, the gate, the bf16 rounding, the Hadamard and the codes in one
+  # launch, with no [M,N] intermediate and no scratch.
   "r3d_gemm_iqr_gated|"
   # The embedding table at its codes' width: the gather decodes the rows it is asked for.
   "r3d_iqr_embed|"

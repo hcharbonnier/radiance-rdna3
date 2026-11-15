@@ -48,6 +48,8 @@ struct Lib {
     RelayoutFn relayout = nullptr;
     LaunchFn gemm = nullptr;
     LaunchFn tiled = nullptr;
+    LaunchFn gated = nullptr;
+    LaunchFn fused = nullptr;
     LaunchFn logits = nullptr;
     ScratchFn logits_scratch = nullptr;
     bool ok() const { return h && layout && relayout && gemm; }
@@ -62,6 +64,8 @@ Lib& lib() {
         x.relayout = (RelayoutFn)dlsym(x.h, "r3d_rad_relayout_iqr");
         x.gemm = (LaunchFn)dlsym(x.h, "r3d_rad_gemm_nt_q_iqr_m16");
         x.tiled = (LaunchFn)dlsym(x.h, "r3d_rad_gemm_nt_q_iqr_tiled");
+        x.gated = (LaunchFn)dlsym(x.h, "r3d_rad_gated_had_quant_i8g");
+        x.fused = (LaunchFn)dlsym(x.h, "r3d_rad_gemm_nt_q_iqr_gated");
         x.logits = (LaunchFn)dlsym(x.h, "r3d_rad_logits_gemm_vocab_iqr");
         x.logits_scratch = (ScratchFn)dlsym(x.h, "r3d_logits_gemm_vocab_iqr_scratch");
         return x;
@@ -410,6 +414,220 @@ bool run_case(const Case& c) {
     return true;
 }
 
+/* gemm_iqr_gated_i8a8h against its unfused chain: r3d_rad_gemm_nt_q_iqr_m16 writes the [M, 2n]
+ * bf16 gate_up, r3d_rad_gated_had_quant_i8g gates, rotates and codes it; the fused row must give the
+ * same code bytes and the same f32 scales with no intermediate and no scratch. The weight is the
+ * 27B's feed-forward width (n = 17408, so 136 groups of 128) at a shorter K, and M in {1, 5, 16},
+ * act in {silu, sigmoid} and out_bf16 present or absent are all run against it. */
+bool run_gated_fold() {
+    const int64_t n = 17408, N = 2 * n, K = 2560;
+    const int64_t nkb = K / 128, ng = n / 128;
+    const uint32_t B = 4, L16 = 16;
+    W w;
+    rad_enc_clear(&w.enc);
+    rad_enc_copy_str(w.enc.scheme, "trellis");
+    rad_enc_add_plane(&w.enc, "codes", kU[B], 1, 1);
+    rad_enc_add_plane(&w.enc, "scale", RAD_F32, 1, 0);
+    rad_enc_add_plane(&w.enc, "scale.col", RAD_F32, 0, 128);
+    const int t = rad_enc_add_table(&w.enc, "trellis", RAD_I8, (int64_t)1 << L16, 1);
+    w.enc.plane[t].block[0] = 256;
+    w.enc.plane[t].block[1] = 0;
+    rad_enc_add_table(&w.enc, "trellis.mad", RAD_U32, 2, 1);
+    rad_enc_copy_str(w.enc.transform, "fwht128");
+    w.size(N, K);
+
+    for (auto& b : w.data[(size_t)w.find("codes")]) b = (uint8_t)rnd();
+    const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
+    uint32_t* ab = (uint32_t*)w.data[(size_t)w.find("trellis.mad")].data();
+    ab[0] = A;
+    ab[1] = Bc;
+    int8_t* tab = (int8_t*)w.data[(size_t)w.find("trellis")].data();
+    for (uint32_t st = 0; st < (1u << L16); ++st) tab[st] = (int8_t)mad_value(st, A, Bc);
+    float* rs = (float*)w.data[(size_t)w.find("scale")].data();
+    for (int64_t i = 0; i < N; ++i) rs[i] = 0.001f + 0.0005f * (float)(i % 7);
+    float* cf = (float*)w.data[(size_t)w.find("scale.col")].data();
+    for (int64_t kb = 0; kb < nkb; ++kb) cf[kb] = 0.5f + 0.1f * (float)kb;
+
+    const std::vector<RadParam> lp = { pint("N", N), pint("K", K), pint("group", 128),
+                                       pstr("dtype", "i8a8h") };
+    std::vector<int> selB, selS;
+    std::vector<RadTensor> plB, plS;
+    for (int i = 0; i < w.enc.n_planes; ++i) {
+        const char* r = w.enc.plane[i].role;
+        if (!std::strncmp(r, "scale", 5)) {
+            selS.push_back(i);
+            plS.push_back(w.t(i));
+        } else {
+            selB.push_back(i);
+            plB.push_back(w.t(i));
+        }
+    }
+    RadLayout L{};
+    if (lib().layout(lp.data(), (int)lp.size(), 2, &w.enc, selB.data(), plB.data(),
+                     (int)plB.size(), &L) != RAD_OK) {
+        std::fprintf(stderr, "gated fold: weight layout refused\n");
+        return false;
+    }
+    std::vector<uint8_t> sb((size_t)L.bytes, 0);
+    if (lib().relayout(lp.data(), (int)lp.size(), 2, &w.enc, selB.data(), plB.data(),
+                       (int)plB.size(), sb.data(), L.bytes) != RAD_OK) {
+        std::fprintf(stderr, "gated fold: weight relayout refused\n");
+        return false;
+    }
+    RadLayout LS{};
+    if (lib().layout(lp.data(), (int)lp.size(), 3, &w.enc, selS.data(), plS.data(),
+                     (int)plS.size(), &LS) != RAD_OK) {
+        std::fprintf(stderr, "gated fold: scale layout refused\n");
+        return false;
+    }
+    std::vector<uint8_t> sbs((size_t)LS.bytes, 0);
+    if (lib().relayout(lp.data(), (int)lp.size(), 3, &w.enc, selS.data(), plS.data(),
+                       (int)plS.size(), sbs.data(), LS.bytes) != RAD_OK) {
+        std::fprintf(stderr, "gated fold: scale relayout refused\n");
+        return false;
+    }
+
+    const int Mmax = 16;
+    std::vector<int8_t> a((size_t)(Mmax * K));
+    std::vector<float> as((size_t)(Mmax * nkb));
+    for (auto& v : a) v = (int8_t)((int)(rnd() % 255) - 127);
+    for (auto& v : as) v = 0.01f + 0.001f * (float)(rnd() % 7);
+
+    void *dA = nullptr, *dAS = nullptr, *dB = nullptr, *dBS = nullptr, *dGU = nullptr;
+    void *dQ = nullptr, *dSC = nullptr, *dOB = nullptr;
+    auto clean = [&] {
+        hipFree(dA);  hipFree(dAS); hipFree(dB);  hipFree(dBS); hipFree(dGU);
+        hipFree(dQ);  hipFree(dSC); hipFree(dOB);
+    };
+    if (hipMalloc(&dA, a.size()) != hipSuccess ||
+        hipMalloc(&dAS, as.size() * 4) != hipSuccess ||
+        hipMalloc(&dB, sb.size()) != hipSuccess ||
+        hipMalloc(&dBS, sbs.size()) != hipSuccess ||
+        hipMalloc(&dGU, (size_t)(Mmax * N) * 2) != hipSuccess ||
+        hipMalloc(&dQ, (size_t)(Mmax * n)) != hipSuccess ||
+        hipMalloc(&dSC, (size_t)(Mmax * ng) * 4) != hipSuccess ||
+        hipMalloc(&dOB, (size_t)(Mmax * n) * 2) != hipSuccess) {
+        clean();
+        return false;
+    }
+    hipMemcpy(dA, a.data(), a.size(), hipMemcpyHostToDevice);
+    hipMemcpy(dAS, as.data(), as.size() * 4, hipMemcpyHostToDevice);
+    hipMemcpy(dB, sb.data(), sb.size(), hipMemcpyHostToDevice);
+    hipMemcpy(dBS, sbs.data(), sbs.size(), hipMemcpyHostToDevice);
+
+    bool ok = true;
+    const int32_t ms[3] = { 1, 5, 16 };
+    for (int mi = 0; mi < 3; ++mi) {
+        const int64_t M = ms[mi];
+        for (int act = 0; act < 2; ++act) {
+            for (int ob = 0; ob < 2; ++ob) {
+                const char* act_s = act ? "sigmoid" : "silu";
+                RadTensor ta{}, tas{}, tb{}, tbs{}, tgu{}, tq{}, tsc{}, tob{};
+                ta.data = dA;  ta.dtype = RAD_I8;  ta.rank = 2;  ta.shape[0] = M; ta.shape[1] = K;
+                rad_tensor_pack(&ta);
+                tas.data = dAS; tas.dtype = RAD_F32; tas.rank = 2; tas.shape[0] = M;
+                tas.shape[1] = nkb; rad_tensor_pack(&tas);
+                tb.data = dB;  tb.dtype = L.dtype;  tb.rank = 2;  tb.shape[0] = N; tb.shape[1] = K;
+                rad_tensor_pack(&tb);
+                tbs.data = dBS; tbs.dtype = LS.dtype; tbs.rank = 2; tbs.shape[0] = N;
+                tbs.shape[1] = nkb; rad_tensor_pack(&tbs);
+                tgu.data = dGU; tgu.dtype = RAD_BF16; tgu.rank = 2; tgu.shape[0] = M;
+                tgu.shape[1] = N; rad_tensor_pack(&tgu);
+                tq.data = dQ;  tq.dtype = RAD_I8;  tq.rank = 2;  tq.shape[0] = M; tq.shape[1] = n;
+                rad_tensor_pack(&tq);
+                tsc.data = dSC; tsc.dtype = RAD_F32; tsc.rank = 2; tsc.shape[0] = M;
+                tsc.shape[1] = ng; rad_tensor_pack(&tsc);
+                if (ob) {
+                    tob.data = dOB; tob.dtype = RAD_BF16; tob.rank = 2; tob.shape[0] = M;
+                    tob.shape[1] = n; rad_tensor_pack(&tob);
+                }
+
+                /* The pair: m16 into the [M, 2n] bf16 scratch, then the gated quantiser. */
+                RadTensor pair_ops[5] = { ta, tas, tb, tbs, tgu };
+                const RadParam pair_p[] = { pint("M", M), pint("N", N), pint("K", K),
+                                            pint("group", 128), pstr("dtype", "i8a8h") };
+                RadArgs pa{};
+                pa.t = pair_ops; pa.n_t = 5; pa.p = pair_p; pa.n_p = 5; pa.kv_used_max_h = -1;
+                int rc = lib().gemm(&pa, (RadStream)0);
+                if (rc != RAD_OK || hipDeviceSynchronize() != hipSuccess) {
+                    std::fprintf(stderr, "gated fold M=%lld %s ob=%d: pair GEMM rc=%d\n",
+                                 (long long)M, act_s, ob, rc);
+                    ok = false;
+                    continue;
+                }
+                RadTensor gated_ops[4] = { tgu, tq, tsc, ob ? tob : RadTensor{} };
+                const RadParam gated_p[] = { pint("group", 128), pstr("dtype", "bf16"),
+                                             pstr("act", act_s) };
+                RadArgs pg{};
+                pg.t = gated_ops; pg.n_t = 4; pg.p = gated_p; pg.n_p = 3; pg.kv_used_max_h = -1;
+                rc = lib().gated(&pg, (RadStream)0);
+                if (rc != RAD_OK || hipDeviceSynchronize() != hipSuccess) {
+                    std::fprintf(stderr, "gated fold M=%lld %s ob=%d: pair quantiser rc=%d\n",
+                                 (long long)M, act_s, ob, rc);
+                    ok = false;
+                    continue;
+                }
+                std::vector<uint8_t> qp((size_t)(M * n)), sp((size_t)(M * ng) * 4);
+                std::vector<uint8_t> op(ob ? (size_t)(M * n) * 2 : 0);
+                hipMemcpy(qp.data(), dQ, qp.size(), hipMemcpyDeviceToHost);
+                hipMemcpy(sp.data(), dSC, sp.size(), hipMemcpyDeviceToHost);
+                if (ob) hipMemcpy(op.data(), dOB, op.size(), hipMemcpyDeviceToHost);
+
+                /* Poison the outputs the fused row must write every byte of: identical values either
+                 * way would not prove the second launch ran. */
+                hipMemset(dQ, 0x5A, (size_t)(M * n));
+                hipMemset(dSC, 0x5A, (size_t)(M * ng) * 4);
+                if (ob) hipMemset(dOB, 0xDE, (size_t)(M * n) * 2);
+
+                /* The fused row: one launch, no scratch. */
+                RadTensor fused_ops[7] = { ta, tas, tb, tbs, tq, tsc, ob ? tob : RadTensor{} };
+                const RadParam fused_p[] = { pint("M", M), pint("N", N), pint("K", K),
+                                             pint("group", 128), pstr("dtype", "i8a8h"),
+                                             pstr("act", act_s) };
+                RadArgs pf{};
+                pf.t = fused_ops; pf.n_t = 7; pf.p = fused_p; pf.n_p = 6; pf.kv_used_max_h = -1;
+                rc = lib().fused(&pf, (RadStream)0);
+                if (rc != RAD_OK || hipDeviceSynchronize() != hipSuccess) {
+                    std::fprintf(stderr, "gated fold M=%lld %s ob=%d: fused rc=%d\n",
+                                 (long long)M, act_s, ob, rc);
+                    ok = false;
+                    continue;
+                }
+                std::vector<uint8_t> qf((size_t)(M * n)), sf((size_t)(M * ng) * 4);
+                std::vector<uint8_t> of(ob ? (size_t)(M * n) * 2 : 0);
+                hipMemcpy(qf.data(), dQ, qf.size(), hipMemcpyDeviceToHost);
+                hipMemcpy(sf.data(), dSC, sf.size(), hipMemcpyDeviceToHost);
+                if (ob) hipMemcpy(of.data(), dOB, of.size(), hipMemcpyDeviceToHost);
+
+                const auto same = [&](const char* what, const std::vector<uint8_t>& got,
+                                      const std::vector<uint8_t>& want, bool as_f32) {
+                    size_t first = got.size();
+                    for (size_t i = 0; i < got.size(); ++i)
+                        if (got[i] != want[i]) { first = i; break; }
+                    if (first == got.size()) return true;
+                    if (as_f32) {
+                        const float g = ((const float*)got.data())[first / 4];
+                        const float h = ((const float*)want.data())[first / 4];
+                        std::fprintf(stderr, "gated fold M=%lld %s ob=%d: %s differs at %zu "
+                                     "(got %.9g want %.9g)\n", (long long)M, act_s, ob, what,
+                                     first / 4, g, h);
+                    } else {
+                        std::fprintf(stderr, "gated fold M=%lld %s ob=%d: %s differs at byte %zu "
+                                     "(got 0x%02x want 0x%02x)\n", (long long)M, act_s, ob, what,
+                                     first, got[first], want[first]);
+                    }
+                    return false;
+                };
+                if (!same("codes", qf, qp, false)) ok = false;
+                if (!same("scales", sf, sp, true)) ok = false;
+                if (ob && !same("out_bf16", of, op, false)) ok = false;
+            }
+        }
+    }
+    clean();
+    return ok;
+}
+
 }  // namespace
 
 TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
@@ -433,6 +651,19 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
         { "mad u4 L16 bf16, 512 tokens (resident)", 4, 16, 0, kBf16, 256, 384, 512 },
     };
     for (const Case& c : cases) CHECK(run_case(c));
+}
+
+TEST(iqr_gated_fold_is_bit_identical_to_the_unfused_pair) {
+    if (!lib().ok() || !lib().gated || !lib().fused) {
+        std::fprintf(stderr, "skip: %s or its gated rows not loadable here\n", RAD_R3D_SO);
+        return;
+    }
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) {
+        std::fprintf(stderr, "skip: no card\n");
+        return;
+    }
+    CHECK(run_gated_fold());
 }
 
 /* ------------------------------------------------------------------ the vocabulary head

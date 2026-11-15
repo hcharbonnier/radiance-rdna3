@@ -3391,15 +3391,18 @@ static const RadKernelInfo kKernels[] = {
   r3d_shape_gemm_nt_q_gated },
 
 { "gemm_iqr_gated_i8a8h", "gemm_nt_q_gated", "gemm",
-  "the gated MLP fold over a rotated int8 (i8a8h) IQR weight: gate_up in the op's scratch, then "
-  "silu, the 128-wide Hadamard and the per-group int8 quantiser",
-  "M <= 16, N and K multiples of 256, group 128; the same IQR forms and private layout as "
-  "gemm_iqr_m16, whose kernel computes the gate_up bf16 half, and gated_had_quant_i8g, whose "
-  "kernel gates, rounds, rotates and codes it. One graph edge and one host dispatch fewer than the "
-  "pair; the two device kernels still run through the op's scratch, which is the same bf16 gate_up "
-  "libr4d's fused gated GEMM stages (a one-launch epilogue is W12's work)",
+  "the gated MLP fold over a rotated int8 (i8a8h) IQR weight: the gate's and the up's IQR decode, "
+  "the bf16 gate_up rounding, silu, the 128-wide Hadamard and the per-group int8 quantiser in one "
+  "launch",
+  "M <= 16, N a multiple of 256, K a multiple of 128, group 128; the same IQR forms and private "
+  "layout as gemm_iqr_m16. One workgroup is one 128-column group, sixteen waves: eight decode the "
+  "gate's 16-row tiles and eight the up's, each with the m16 kernel's K loop and order, then the "
+  "gate and up values meet in LDS and a wave a token runs the Hadamard and the codes. No [M,2n] "
+  "bf16 intermediate and no scratch (the hook answers 0), so the row is one device launch where the "
+  "pair is two, and its codes and scales are the pair's bytes",
   "I8 a row-major with an f32 scale per (row, 128 of K), IQR b/b_scale, I8 q (row-major), f32 "
-  "scale per (row, 128 of n), optional bf16 out_bf16; fp32 arithmetic through the pair",
+  "scale per (row, 128 of n), optional bf16 out_bf16; fp32 arithmetic in the m16 order, a bf16 "
+  "round trip a value before the gate, as the pair stores it",
   RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_M16,
   ROW(cGemmGatedI8), NOTUNE,
   nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_gated, r3d_rad_gemm_nt_q_iqr_gated_scratch,
