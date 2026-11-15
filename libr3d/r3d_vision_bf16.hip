@@ -293,6 +293,9 @@ extern "C" int r3d_attn_dense_h72(long q, long k, long v, long o, long cu, int t
     const long long tiles = ((long long)total_q + rows - 1) / rows;
     const long long heads = (long long)q_heads / hpb;
     if (tiles > 0x7fffffffLL || heads > 0x7fffffffLL) return -2;
+    /* The launch's z axis carries the segments and gfx11 caps it at 65535 (maxGridSize[2]); a batch
+     * wider than that is refused here rather than handed to the runtime as a failed configuration. */
+    if (n_seq > 65535) return -2;
     /* A row is kHd bf16 wide, so a pitch that is a multiple of eight keeps it 16-byte aligned
      * whenever the operand's base is; the kernel reads 16 bytes at a time when both hold. */
     const int align16 = r3d_aligned((const void*)(uintptr_t)q, 16) &&
