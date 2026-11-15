@@ -115,6 +115,7 @@ set(R3D_UNITS
   "r3d_qsa_block_key|"
   "r3d_qsa_score|"
   "r3d_qsa_select|"
+  "r3d_qsa_work|"
   "r3d_gated_had_quant_i8|"
   "r3d_had_quant_act_fp8|"
   "r3d_gated_had_quant_fp8|"

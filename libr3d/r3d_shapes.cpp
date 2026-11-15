@@ -517,6 +517,32 @@ int r3d_shape_qsa_select(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     R3D_PICK(list);
 }
 
+/* The QSA work list: `M` is tokens, `work` is the block bound, and the two extents differ. The
+ * `cu` description is cumulative when a tool honours the flag (pos is pinned to zero, so no block
+ * completes and the description is safe for every geometry a cold launch can build). The one-
+ * component `bpos` form is described; `rope` stays absent. */
+int r3d_shape_qsa_work(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ratio = gi(p, n_p, "ratio", 0), ring = gi(p, n_p, "ring", 0);
+    const int64_t seqs = gi(p, n_p, "seqs", 0), work = gi(p, n_p, "work", 0);
+    if (M <= 0 || n <= 0 || ratio <= 0 || ring < ratio || seqs <= 0 || work <= 0)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd((uint32_t)RAD_BF16, M, n),                       /* k */
+        opd_idx(M, 1, 0),                                    /* positions */
+        opd_idx(seqs + 1, 1, 0, RAD_OPD_F_IDX_CU),           /* cu_seqlens */
+        opd((uint32_t)RAD_BF16, seqs, 1, ring, n),           /* the tail state */
+        opd_idx(seqs, 1, 0, 0, 1),                           /* the state row, column 0 */
+        opd_idx(seqs, work, 0, 0, work),                     /* the block-key table */
+        opd_none(),                                          /* rope: the one-component form */
+        opd((uint32_t)RAD_BF16, work * ratio, n),            /* stage */
+        opd((uint32_t)RAD_I32, work),                        /* page */
+        opd((uint32_t)RAD_I32, work),                        /* bpos */
+        opd((uint32_t)RAD_I32, seqs)                         /* nc */
+    };
+    R3D_PICK(list);
+}
+
 /* The gated Hadamard int8: a [M, n], b [M, n] (optional, fused gate_up when absent), q [M, n] i8,
  * scale [M]. */
 int r3d_shape_gated_had_quant_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

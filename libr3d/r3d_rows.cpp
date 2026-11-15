@@ -70,6 +70,9 @@
 #define P_STRO(k)  { (k), RAD_P_STR, RAD_OPTIONAL }
 #define P_F64(k)   { (k), RAD_P_F64, RAD_REQUIRED }
 #define P_F64O(k)  { (k), RAD_P_F64, RAD_OPTIONAL }
+/* A count the kernel is handed as a bound and never writes past its operands for (rad_abi.h,
+ * RAD_PROLE_CAPACITY). */
+#define P_CAP(k)   { (k), RAD_P_INT, RAD_REQUIRED, RAD_PROLE_CAPACITY }
 
 #define C_EQ(k, v)  { (k), RAD_C_EQ,  (long long)(v), nullptr }
 #define C_LE(k, v)  { (k), RAD_C_LE,  (long long)(v), nullptr }
@@ -264,6 +267,20 @@ static const RadOperandSpec oQsaSelect[] = { { "score", RAD_OPD_IN, 0 },
                                              { "sel", RAD_OPD_OUT, 0 },
                                              { "nsel", RAD_OPD_OUT, 0 },
                                              { "seqused", RAD_OPD_OUT, 0 } };
+/* `work` bounds the blocks that can complete; slots past the real count get page -1. */
+static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
+                                         P_INT("seqs"), P_CAP("work"), P_STR("dtype") };
+static const RadOperandSpec oQsaWork[] = { { "k", RAD_OPD_IN, 0 },
+                                           { "pos", RAD_OPD_IN, 0 },
+                                           { "cu", RAD_OPD_IN, 0 },
+                                           { "state", RAD_OPD_IN, 0 },
+                                           { "sidx", RAD_OPD_IN, 0 },
+                                           { "bt", RAD_OPD_IN, 0 },
+                                           { "rope", RAD_OPD_IN, 1 },
+                                           { "stage", RAD_OPD_OUT, 0 },
+                                           { "page", RAD_OPD_OUT, 0 },
+                                           { "bpos", RAD_OPD_OUT, 0 },
+                                           { "nc", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pGatedHadQuantI8[] = { P_INT("M"), P_INT("n"), P_INT("group"),
                                                  P_STR("dtype"), P_STRO("act"), P_INTO("mode") };
 static const RadOperandSpec oGatedHadQuantI8[] = { { "a", RAD_OPD_IN, 0 },
@@ -882,6 +899,11 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("qsa_select", pQsaSelect, oQsaSelect,
            "The QSA selection: the topk highest-scoring complete blocks a query has passed, as "
            "page ids, ties to the lower block index, then the partial page holding the query."),
+    SCHEMA("qsa_work", pQsaWork, oQsaWork,
+           "The blocks completing in this batch: per block its `ratio` raw keys (this step's rows, "
+           "or the tail's at q % ring) staged contiguously, its block-key page and its first-token "
+           "position; slots past the count get page -1. nc is each sequence's complete-block "
+           "count. Under M-RoPE an optional `rope` gives each block's first-token components."),
     SCHEMA("gated_had_quant_i8", pGatedHadQuantI8, oGatedHadQuantI8,
            "A gated product (mode 0 silu(a)*b, mode 1 sigmoid(a)*b), a block Hadamard along n, "
            "then per-row symmetric int8: the rotation shrinks the row maximum, so int8 beats e4m3."),
@@ -1606,6 +1628,8 @@ static const RadConstraint cQsaScoreF16[]  = { C_IN("dtype", "f16") };
 static const RadConstraint cQsaScoreF32[]  = { C_IN("dtype", "f32") };
 static const RadConstraint cQsaSelect[] = { C_GE("blocks", 1), C_GE("topk", 1),
                                             C_GE("ratio", 1), C_GE("seqs", 1) };
+static const RadConstraint cQsaWork[] = { C_IN("dtype", "bf16"), C_GE("n", 1), C_GE("ratio", 1),
+                                          C_GE("seqs", 1), C_GE("work", 1) };
 /* group is the block width: the kernel instantiates 128, 256 and 512 (the shim declines the
  * DIV-legal 384, which no wave form serves). */
 static const RadConstraint cGatedHadQuantI8[] = { C_IN("dtype", "bf16"), C_DIV("group", 128),
@@ -2380,6 +2404,16 @@ static const RadKernelInfo kKernels[] = {
   ROW(cQsaSelect), NOTUNE,
   nullptr, nullptr, r3d_rad_qsa_select, nullptr, nullptr, nullptr,
   r3d_shape_qsa_select },
+{ "qsa_work_bf16", "qsa_work", "kv",
+  "the blocks completing this step gathered into the flat list qsa_block_key reads",
+  "one workgroup a potential block: ceil(T / ratio) + seqs bounds the count; keys come from this "
+  "step's k where the position is in the chunk and from the tail state where it is not (q % ring); "
+  "slots past the real count report page -1; nc is each sequence's complete-block count",
+  "bf16 k, tail state and stage; i32 pos/cu/sidx/bt/page/bpos/nc; optional i32 rope for M-RoPE",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cQsaWork), NOTUNE,
+  nullptr, nullptr, r3d_rad_qsa_work, nullptr, nullptr, nullptr,
+  r3d_shape_qsa_work },
 
 { "gated_had_quant_i8_bf16", "gated_had_quant_i8", "quant",
   "a gated product (silu(a)*b or sigmoid(a)*b), a block Hadamard along n, then per-row int8",
