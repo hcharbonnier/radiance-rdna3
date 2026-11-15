@@ -1,4 +1,4 @@
-/* r3d_rows.cpp -- the libr3d row table: what each kernel computes and for which geometry.
+﻿/* r3d_rows.cpp -- the libr3d row table: what each kernel computes and for which geometry.
  *
  * One row per (kernel, band). A row is a `RadKernelInfo`: names, prose, the geometry it serves as
  * constraints, the tuning axes and the entry points that launch it. The engine reads this table at
@@ -8,7 +8,7 @@
  * ============================================================ the schema table
  *
  * The first plugin in hierarchy order to declare an op fixes its schema, and a plugin whose schema
- * disagrees is refused at load (rad_abi.h, spec §2.3): arguments are positional, so two schemas
+ * disagrees is refused at load (rad_abi.h, spec Â§2.3): arguments are positional, so two schemas
  * would give one call two meanings. libref declares the vocabulary (`docs/OPS.md`), so every schema
  * below is libref's: the same keys, types, requiredness, operand roles and optionality, in the same
  * order. The prose describes this library's rows; the loader compares only the positional slots.
@@ -18,7 +18,7 @@
  *
  * ============================================================ the constraint table
  *
- * A constraint is a necessary condition on the geometry (spec §2.1). An operand's dtype is a
+ * A constraint is a necessary condition on the geometry (spec Â§2.1). An operand's dtype is a
  * property of the call, and the shim checks it on the tensor. Constraints state what the kernel
  * cannot do (the divisibility its lane map assumes, the band its grid is sized for, the scheme its
  * decoders implement) and what the selector needs to choose between rows. A constraint the kernel
@@ -254,6 +254,16 @@ static const RadParamSpec pQsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads")
 static const RadOperandSpec oQsaScore[] = { { "q", RAD_OPD_IN, 0 }, { "bk", RAD_OPD_IN, 0 },
                                             { "bt", RAD_OPD_IN, 0 }, { "cu", RAD_OPD_IN, 0 },
                                             { "nc", RAD_OPD_IN, 0 }, { "score", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pQsaSelect[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
+                                           P_INT("ratio"), P_INT("seqs"), P_INTO("signed") };
+static const RadOperandSpec oQsaSelect[] = { { "score", RAD_OPD_IN, 0 },
+                                             { "bt", RAD_OPD_IN, 0 },
+                                             { "nc", RAD_OPD_IN, 0 },
+                                             { "pos", RAD_OPD_IN, 0 },
+                                             { "cu", RAD_OPD_IN, 0 },
+                                             { "sel", RAD_OPD_OUT, 0 },
+                                             { "nsel", RAD_OPD_OUT, 0 },
+                                             { "seqused", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pGatedHadQuantI8[] = { P_INT("M"), P_INT("n"), P_INT("group"),
                                                  P_STR("dtype"), P_STRO("act"), P_INTO("mode") };
 static const RadOperandSpec oGatedHadQuantI8[] = { { "a", RAD_OPD_IN, 0 },
@@ -869,6 +879,9 @@ static const RadOpSchema kSchemas[] = {
            "bk[bt[seq(m)][b]])) / sqrt(n), for b below min(nc[seq], the table's and the score "
            "plane's widths). The relu is per (block, head) and the sum is over the heads, in "
            "that order. `bt` holds page ids; a negative entry scores -inf, never zero."),
+    SCHEMA("qsa_select", pQsaSelect, oQsaSelect,
+           "The QSA selection: the topk highest-scoring complete blocks a query has passed, as "
+           "page ids, ties to the lower block index, then the partial page holding the query."),
     SCHEMA("gated_had_quant_i8", pGatedHadQuantI8, oGatedHadQuantI8,
            "A gated product (mode 0 silu(a)*b, mode 1 sigmoid(a)*b), a block Hadamard along n, "
            "then per-row symmetric int8: the rotation shrinks the row maximum, so int8 beats e4m3."),
@@ -1172,7 +1185,7 @@ extern "C" const RadOpSchema* rad_kernel_schema_at(int i) {
 
 /* ================================================================== tuning
  *
- * The axes a kernel is instantiated along, measured per card by `rad-tune` (spec §15). Without a
+ * The axes a kernel is instantiated along, measured per card by `rad-tune` (spec Â§15). Without a
  * matrix instruction to size a tile against, the rows have few axes: how the work is split across
  * the card and how the weight stream is read.
  */
@@ -1591,6 +1604,8 @@ static const RadConstraint cQsaBlockKey[] = { C_IN("dtype", "bf16"), C_LE("n", 4
 static const RadConstraint cQsaScoreBf16[] = { C_IN("dtype", "bf16") };
 static const RadConstraint cQsaScoreF16[]  = { C_IN("dtype", "f16") };
 static const RadConstraint cQsaScoreF32[]  = { C_IN("dtype", "f32") };
+static const RadConstraint cQsaSelect[] = { C_GE("blocks", 1), C_GE("topk", 1),
+                                            C_GE("ratio", 1), C_GE("seqs", 1) };
 /* group is the block width: the kernel instantiates 128, 256 and 512 (the shim declines the
  * DIV-legal 384, which no wave form serves). */
 static const RadConstraint cGatedHadQuantI8[] = { C_IN("dtype", "bf16"), C_DIV("group", 128),
@@ -2354,6 +2369,17 @@ static const RadKernelInfo kKernels[] = {
   ROW(cQsaScoreF32), NOTUNE,
   nullptr, nullptr, r3d_rad_qsa_score, nullptr, nullptr, nullptr,
   r3d_shape_qsa_score },
+
+{ "qsa_select_bf16", "qsa_select", "attn",
+  "the topk highest-scoring complete blocks a query has passed, as page ids, then the partial page",
+  "a workgroup a query; four-digit radix threshold and workgroup prefix-count emit; ties to the "
+  "lower block index, never to atomic order; signed ranks by the float total order, unsigned by "
+  "max(score, 0)",
+  "f32 score [M,blocks], i32 bt [seqs,blocks]/nc/pos/cu, i32 sel [M,topk+1]/nsel/seqused",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cQsaSelect), NOTUNE,
+  nullptr, nullptr, r3d_rad_qsa_select, nullptr, nullptr, nullptr,
+  r3d_shape_qsa_select },
 
 { "gated_had_quant_i8_bf16", "gated_had_quant_i8", "quant",
   "a gated product (silu(a)*b or sigmoid(a)*b), a block Hadamard along n, then per-row int8",
@@ -3434,7 +3460,7 @@ static const RadKernelInfo kKernels[] = {
   "the same 128x128 tile as the fp8a8 arm, with the codes unpacked on the way into LDS -- 8 codes "
   "from a 4-byte load at U2, 16 from a 16-byte load at U4 -- and the epilogue folding "
   "(code - zero) * scale per staged element, so the dot runs over values and no a_sum term is "
-  "reduced: the zero comes off term by term, which is why Σ a(q-z) needs no Σ a here while the m16 "
+  "reduced: the zero comes off term by term, which is why Î£ a(q-z) needs no Î£ a here while the m16 "
   "row needs it to lift the integer bias off its f16-as-int dot. The row's scale and zero are one "
   "per ROW on a {1, group} plane, so the staging reads 128 scalars a chunk where the fp8a8 arm reads "
   "one, at the row the grid puts it; issued one chunk ahead of the fold that consumes them, because "

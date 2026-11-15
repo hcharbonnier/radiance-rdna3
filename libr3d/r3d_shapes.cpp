@@ -1,4 +1,4 @@
-/* r3d_shapes.cpp -- the extent and content domain of each operand of an op at a geometry.
+﻿/* r3d_shapes.cpp -- the extent and content domain of each operand of an op at a geometry.
  *
  * libr3d's side of the `RadShapeFn` hook. The component that reads an operand knows its extent,
  * and a row that exists only here is invisible to the hand-written table in `tools/`. Correctness
@@ -489,6 +489,30 @@ int r3d_shape_qsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out
         opd_idx(s + 1, M + 1, -1, RAD_OPD_F_IDX_CU, 1),  /* cu: cumulative query rows */
         opd_idx(s, nb + 1, -1, 0, 1),                    /* nc: complete blocks, 0 .. nb */
         opd((uint32_t)RAD_F32, M, nb)                    /* score */
+    };
+    R3D_PICK(list);
+}
+
+/* The QSA selection: score [M, blocks] f32, the sequence's table [seqs, blocks] i32, the live
+ * count [seqs], each query's position [M], the join [seqs+1], and the table [M, topk+1] with its
+ * two per-query scalars. The table is filled with page 0 (every block live) and `nc` with the
+ * declared width, so a generic draw selects rather than reads padding; `cu` is one sequence over
+ * every row, which is a valid join for a case with no boundaries to hold. */
+int r3d_shape_qsa_select(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), blocks = gi(p, n_p, "blocks", 0);
+    const int64_t topk = gi(p, n_p, "topk", 0), ratio = gi(p, n_p, "ratio", 0);
+    const int64_t seqs = gi(p, n_p, "seqs", 0);
+    if (M <= 0 || blocks <= 0 || topk <= 0 || ratio <= 0 || seqs <= 0)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd((uint32_t)RAD_F32, M, blocks),                       /* score */
+        opd_idx(seqs, blocks, 0, 0, blocks),                     /* bt: page 0 everywhere */
+        opd_idx(seqs, blocks + 1, blocks),                       /* nc: the declared width */
+        opd_idx(M, 0, blocks * ratio - 1),                       /* pos: the last block boundary */
+        opd_idx(seqs + 1, 0, 0),                                 /* cu: every row in sequence 0 */
+        opd((uint32_t)RAD_I32, M, topk + 1),                     /* sel */
+        opd((uint32_t)RAD_I32, M, 1),                            /* nsel */
+        opd((uint32_t)RAD_I32, M, 1)                             /* seqused */
     };
     R3D_PICK(list);
 }

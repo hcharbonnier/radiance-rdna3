@@ -1,4 +1,4 @@
-# libr3d serves RDNA3 only, declared here and nowhere else. Its kernels rely on wave32 and on
+﻿# libr3d serves RDNA3 only, declared here and nowhere else. Its kernels rely on wave32 and on
 # instructions RDNA3 has: v_dot2acc_f32_f16 and the 16x16x16 v_wmma wave-matrix family for the
 # matrix work, v_cvt_pkrtz_f16_f32, DPP16 and v_permlanex16. The GEMM rows carry two arms each,
 # the dot2 pairs and the wave matrix, points of the row's `impl` axis the tune cache picks per
@@ -7,7 +7,7 @@
 # the reason.
 #
 # A build targeting other cards skips libr3d. Without a device kernel library the engine refuses ops
-# only a reference library implements, unless --debug-accept-reference-kernels is passed (spec §17).
+# only a reference library implements, unless --debug-accept-reference-kernels is passed (spec Â§17).
 # libr4d is the kernel library for gfx12, libr3d for gfx11.
 #
 # Built in radiance's tree, or standalone against an installed radiance
@@ -24,7 +24,7 @@ endif()
 # `gfx11-generic`, as `^gfx12` does for libr4d. The RDNA3 chips differ in CU count and clock, not in
 # the instructions these kernels issue, so one code object per family serves them all. A build
 # listing both a chip and the family gets both, and the engine prefers the chip's object
-# (docs/PLUGIN.md §10).
+# (docs/PLUGIN.md Â§10).
 rad_plugin_gpu_targets(R3D_GPU_TARGETS "^gfx11")
 if(NOT R3D_GPU_TARGETS)
   message(STATUS
@@ -114,6 +114,7 @@ set(R3D_UNITS
   "r3d_qsa_tail_store|"
   "r3d_qsa_block_key|"
   "r3d_qsa_score|"
+  "r3d_qsa_select|"
   "r3d_gated_had_quant_i8|"
   "r3d_had_quant_act_fp8|"
   "r3d_gated_had_quant_fp8|"

@@ -1,4 +1,4 @@
-/* r3d_selftest -- dump the libr3d row table, cross-check it, and prove every row links and runs.
+﻿/* r3d_selftest -- dump the libr3d row table, cross-check it, and prove every row links and runs.
  *
  * A transcription error in a constraint table stays invisible until a model silently picks the
  * wrong kernel, so the table is printed and checked against itself:
@@ -421,6 +421,8 @@ static void check_shapes() {
                              PF("eps", 1e-6), PF("theta", 1e7), PS("dtype", "bf16") } },
         { "qsa_score", { PI("M", 8), PI("n", 128), PI("heads", 4), PI("blocks", 256),
                          PI("seqs", 2), PS("dtype", "bf16") } },
+        { "qsa_select", { PI("M", 8), PI("blocks", 32), PI("topk", 8), PI("ratio", 4),
+                          PI("seqs", 2), PI("signed", 0) } },
         { "gated_had_quant_i8", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
         { "had_quant_act_fp8", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
         { "gated_had_quant_fp8", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
