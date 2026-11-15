@@ -175,18 +175,20 @@ __global__ __launch_bounds__(kThr) R3D_WAVES(4) void attn_dense_h72_kernel(
     const int rows = kThr / hpb;                     /* query rows a block carries */
 
     /* `cu` is the description's promise; a last boundary past the query plane is clamped here so a
-     * long descriptor cannot make a key read leave K or V (`seq_of`'s rows are the reference's). */
+     * long descriptor cannot make a key read leave K or V (`seq_of`'s rows are the reference's).
+     * The row index is 64-bit because the tile bound is measured in rows and a plane of near-int
+     * extent must not overflow it; `row` itself is a plane row and fits an int. */
     const int b0 = cu[s];
     int b1 = cu[s + 1];
     if (b1 > total_q) b1 = total_q;
-    const int row0 = b0 + (int)blockIdx.x * rows;
+    const long long row0 = (long long)b0 + (long long)(int)blockIdx.x * rows;
     if (b1 <= b0 || row0 >= b1) return;
-    const int i = row0 + r;
+    const long long i = row0 + r;
     /* A row the block does not carry -- the last tile's tail, or the padding `gqa` leaves when it
      * does not divide kThr -- loads a row that exists so the walk stays branch-free, and stores
      * nothing. */
     const bool live = r < rows && i < b1;
-    const int row = live ? i : b1 - 1;
+    const int row = (int)(live ? i : (long long)(b1 - 1));
 
     const uint16_t* qrow = q + (size_t)row * q_ld + (size_t)h * kHd;
     float qv[kHd];
@@ -214,10 +216,15 @@ __global__ __launch_bounds__(kThr) R3D_WAVES(4) void attn_dense_h72_kernel(
         if (align16) stage_plane<true>(sK, src, k_ld, nu, tid);
         else stage_plane<false>(sK, src, k_ld, nu, tid);
         group_barrier();
-        for (int u = 0; u < nu; ++u) {
-            const float sc = dot_row(qv, sK + u * kHd) * scale;
-            if (sc > mx) mx = sc;
-        }
+        /* A thread whose row the block does not carry still stages the tile and still meets every
+         * barrier, but nothing it computes is stored: skip its arithmetic, so a short segment's idle
+         * waves do not spend the block's issue slots on it. A wave is all-live or all-idle unless it
+         * straddles the tile's end, so the test is uniform in the common case. */
+        if (live)
+            for (int u = 0; u < nu; ++u) {
+                const float sc = dot_row(qv, sK + u * kHd) * scale;
+                if (sc > mx) mx = sc;
+            }
         group_barrier();
     }
 
@@ -238,19 +245,20 @@ __global__ __launch_bounds__(kThr) R3D_WAVES(4) void attn_dense_h72_kernel(
             stage_plane<false>(sV, vsrc, v_ld, nu, tid);
         }
         group_barrier();
-        for (int u = 0; u < nu; ++u) {
-            const float w = expf(dot_row(qv, sK + u * kHd) * scale - mx);
-            sum += w;
-            const float* vrow = sV + u * kHd;
+        if (live)
+            for (int u = 0; u < nu; ++u) {
+                const float w = expf(dot_row(qv, sK + u * kHd) * scale - mx);
+                sum += w;
+                const float* vrow = sV + u * kHd;
 #pragma unroll
-            for (int c = 0; c < kQuad; ++c) {
-                const r3d_u32x4 raw = *(const r3d_u32x4*)(const void*)(vrow + 4 * c);
-                acc[4 * c] += w * __uint_as_float(raw.x);
-                acc[4 * c + 1] += w * __uint_as_float(raw.y);
-                acc[4 * c + 2] += w * __uint_as_float(raw.z);
-                acc[4 * c + 3] += w * __uint_as_float(raw.w);
+                for (int c = 0; c < kQuad; ++c) {
+                    const r3d_u32x4 raw = *(const r3d_u32x4*)(const void*)(vrow + 4 * c);
+                    acc[4 * c] += w * __uint_as_float(raw.x);
+                    acc[4 * c + 1] += w * __uint_as_float(raw.y);
+                    acc[4 * c + 2] += w * __uint_as_float(raw.z);
+                    acc[4 * c + 3] += w * __uint_as_float(raw.w);
+                }
             }
-        }
         group_barrier();
     }
 
@@ -292,10 +300,11 @@ extern "C" int r3d_attn_dense_h72(long q, long k, long v, long o, long cu, int t
     const long rows = kThr / hpb;
     const long long tiles = ((long long)total_q + rows - 1) / rows;
     const long long heads = (long long)q_heads / hpb;
-    if (tiles > 0x7fffffffLL || heads > 0x7fffffffLL) return -2;
-    /* The launch's z axis carries the segments and gfx11 caps it at 65535 (maxGridSize[2]); a batch
-     * wider than that is refused here rather than handed to the runtime as a failed configuration. */
-    if (n_seq > 65535) return -2;
+    if (tiles > 0x7fffffffLL) return -2;
+    /* The launch's y and z axes carry the heads and the segments, and gfx11 caps both at 65535
+     * (maxGridSize[1], [2]); a geometry past that is refused here rather than handed to the runtime
+     * as a failed configuration. */
+    if (heads > 65535 || n_seq > 65535) return -2;
     /* A row is kHd bf16 wide, so a pitch that is a multiple of eight keeps it 16-byte aligned
      * whenever the operand's base is; the kernel reads 16 bytes at a time when both hold. */
     const int align16 = r3d_aligned((const void*)(uintptr_t)q, 16) &&
