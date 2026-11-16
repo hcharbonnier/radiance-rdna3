@@ -36,6 +36,10 @@
   - **Chaque agent Agent Manager relit son propre travail** (`/review worktree`)
     avant de conclure, puis **corrige lui-même** les bugs qu'il a trouvés et
     revérifie. Un agent qui délègue sans relecture n'a pas terminé.
+  - **Fusion** : l'agent principal est **responsable de la fusion** du code dans
+    la branche courante dès que le travail des sous-agents est terminé, validé
+    et corrigé (build + tests + kbench, cf. `## Validation`). Ne pas laisser un
+    worktree validé non fusionné.
   - Ne pas créer de session Agent Manager pour du non-code ; une réponse à un
     message inter-agents se fait via `agent_manager` avec le `replyTo` fourni.
   - Un seul travail GPU à la fois sur l'hôte (voir `flock`) : le parallélisme
