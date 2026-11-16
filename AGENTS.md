@@ -188,7 +188,9 @@ contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_
 `gather_rows_u8_device_test` couvre les rows u8 du tier KV (fragment 4 128 octets,
 octets opaques, pitches larges). Vision : build **`-DRAD_WITH_FFMPEG=ON`**
 (libavformat 62.3), `capabilities.image=true`, image 512² → 256 tokens,
-1024² → 1 024 ; la tour (856,68 Mio) est en VRAM, le staging média 48,27 Mio.
+1024² → 1 024, 2048² → 4 096 (un pass complet, TTFT ~121 s) ; au-delà de
+`image-max-pixels` l'image est réduite à 2048², pas refusée. La tour
+(856,68 Mio) est en VRAM, le staging média 48,27 Mio.
 
 Recette 27B (dense, IQR) : `--kv-cache-dtype i8 --num-speculative-tokens 0`
 (le drafter h128 fenêtré réclame bf16), `--max-num-seqs 4` — le multi-séquence
@@ -204,6 +206,11 @@ est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill ≈ 318 tok/s
   (`capabilities.image=false`) ; l'hôte exige les paquets `libav*-dev` et
   `pkg-config --modversion libavformat` doit répondre. `<gpu-user>` n'a pas
   `sudo` : l'installation des paquets est une action administrateur.
+- **Passes média** : une image au-delà de `image-max-pixels` (4 194 304 px) est
+  redimensionnée à 2048², pas refusée ; le watchdog peut journaliser
+  « nothing has been logged for 20/40 s » (`core/engine.cpp:1307`) pendant une
+  passe de ~121 s, c'est du bruit. `THROTTLE_STATUS` d'`amd-smi` vaut
+  `THROTTLED` même au repos ici : suivre puissance et fréquence.
 - Les cas `ngram_hint` restent sans oracle : leur « Not covered » n'est pas une
   régression. Les cas **MTP 48** sont en revanche exigibles depuis l'ADR-7
   (2026-11-16, vision et MTP de Flash-Next dans la cible) : un MTP non couvert

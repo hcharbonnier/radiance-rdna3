@@ -362,6 +362,45 @@ par différence de TTFT, pas profilé par op). `kbench` ciblé vision :
 --max-cases 1` reste **856/856** dans les deux modes.
 La vidéo est annoncée par le processeur mais n'a pas été testée.
 
+### Robustesse du chemin média (W26, 18 cas)
+
+Même serveur, même build, une seule session `flock` ; 18 cas, tous aboutis,
+`/health` à 200 après chacun, **VRAM constante à 45 896 MiB** (aucune croissance
+par image, rendue à l'arrêt), 0 panic/abort/OOM/HIP error, texte de contrôle
+identique avant/après.
+
+| cas | HTTP | tokens image | TTFT | note |
+|---|---|---|---|---|
+| 2048² (16 384 patches, un pass) | 200 | 4 098 | 121,5 s | plafond du pass, 48 tokens générés |
+| 3000² (9 Mpx) | 200 | 4 098 | 121,9 s | **redimensionnée** à 2048², pas refusée |
+| 2 × 512² | 200 | 516 | 15,1 s | les deux images distinguées |
+| 2 × 1024² | 200 | 2 052 | 58,5 s | 2 × 4 096 patches |
+| texte→image / image→texte | 200 | 258 | ~8,0 s | même prompt, même TTFT |
+| PNG alpha (RGBA) / JPEG | 200 | 258 | ~7,9 s | décodés, descriptions correctes |
+| base64 invalide, `data:text/plain`, PNG tronqué, part inconnu | 400 | — | 0,0 s | message explicite et champ fautif, aucun travail GPU |
+| requête valide après les 4 erreurs | 200 | 258 | 7,8 s | récupération immédiate |
+
+Tokens image : 512² → 256 (+2 marqueurs), 1024² → 1 024, 2048² → 4 096,
+2 × 512² → 512, 2 × 1024² → 2 048.
+
+Limites observées, à connaître pour l'exploitation :
+- **Redimensionnement silencieux** : au-delà de `image-max-pixels` (4 194 304
+  px ici) l'image est réduite à 2048², jamais refusée ; le client ne voit que
+  le nombre de tokens image.
+- **Watchdog bruyant** : 12 avertissements « nothing has been logged for
+  20/40 s » (`core/engine.cpp:1307`) pendant les passes longues, toutes
+  abouties ; à traiter comme du bruit pour les passes média.
+- **Coût d'un pass complet** : TTFT ~121 s (≈34 tok/s de préfill, ≈135
+  patches/s), puis ~4 tok/s de décodage à `max-num-seqs 1` ; ce n'est pas une
+  recette interactive.
+- **Type MIME non vérifié** : `decode_media_url` reconnaît le format aux
+  octets ; une `data:text/plain` portant un PNG valide serait acceptée.
+- **`THROTTLE_STATUS` d'`amd-smi`** vaut `THROTTLED` même au repos sur cet
+  hôte : suivre la puissance et la fréquence, pas ce champ.
+- **Non couvert** : 2 × 2048² (32 768 patches au total) ; le staging média est
+  dimensionné pour un pass de 16 384 patches, chaque image étant préparée
+  séparément.
+
 ### Ce que M6 ne démontre pas
 
 - Le préfixe multi-tour **au-delà de 2 048 tokens** : le tier KV hôte est actif

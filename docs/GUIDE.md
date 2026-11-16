@@ -2473,6 +2473,12 @@ keys are refused on it, and so are the pixel bands.
 | `image-gen-max-pixels: N`, `image-gen-max-refs: N` | the model's | an image generator's largest image, in pixels, and the reference pictures a request. The generator sizes its per-image and conditioning buffers, and so the activation arena, for them; on a card the weights nearly fill, a smaller image is what makes room. Larger requests are refused; a generator that keeps fixed buffers is named at startup. Images in flight follow `max-num-seqs` |
 | `max-source-pixels: N` | 67108864 | the largest image or frame the decoder accepts, before any resize |
 
+An image above `image-max-pixels`, or one whose patches would exceed one encoder pass
+(`mm-max-patches`), is **scaled down to fit, not refused**; `max-source-pixels` is the only hard cap,
+and it applies before any resize. The effective size is not echoed in the response, so the image
+token count is the visible signal. The `data:` URL's declared media type is not cross-checked
+against the bytes: the decoder identifies the format from the content.
+
 **Quality measurement**, instead of serving; see [TOOLS.md](TOOLS.md#the-kl-mode)
 
 | key | |

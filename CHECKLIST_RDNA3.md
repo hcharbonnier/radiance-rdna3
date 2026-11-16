@@ -212,7 +212,10 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       256 tokens (281 avec le texte), TTFT 8,19 s ; image 1024² →
       1024 tokens (1045), TTFT 28,73 s ; réponses correctes (couleurs et
       disposition, dégradé). La tour (856,68 Mio) est en VRAM, la vidéo est
-      annoncée mais non testée.
+      annoncée mais non testée. **Robustesse** : 18 cas, 2048² (4 098
+      tokens, 121,5 s), 3000² redimensionnée, 2 × 1024², alpha/JPEG, 4
+      erreurs 400 explicites, VRAM constante, aucune fuite ; limites
+      consignées dans `TABLEAU_REEL_IDEAL_RDNA3.md` § Vision.
 - [x] 4bis.6 Robustesse : prompt de 12 002 tokens refusé proprement (HTTP 400,
       message explicite avec le nombre de tokens à couper) et serveur toujours
       vivant ; `max_tokens` hors contexte plafonné à 8 191 (pas de 400) et
@@ -306,8 +309,9 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       handover courant (`HANDOVER_RDNA3_PHASE7.md` §8) couvre la reprise
       immédiate.
 - [x] 8.8 **Vision servie (ADR-7)** : build `RAD_WITH_FFMPEG=ON`,
-      `capabilities.image=true`, tours image 512² et 1024² acceptés et
-      répondus, limite retirée de `TABLEAU_REEL_IDEAL_RDNA3.md` (W26).
+      `capabilities.image=true`, tours image 512²/1024²/2048² acceptés et
+      répondus, 18 cas de robustesse (multi-images, formats, erreurs 400),
+      limite retirée de `TABLEAU_REEL_IDEAL_RDNA3.md` (W26).
 - [ ] 8.9 **MTP Flash-Next (ADR-7)** : `mtp_enter` et `logit_rerank` en device,
       run avec `num-speculative-tokens > 0`, cas MTP 48 couverts par kbench
       (0 « Not covered » sur le MTP), gain de décodage mesuré et consigné.

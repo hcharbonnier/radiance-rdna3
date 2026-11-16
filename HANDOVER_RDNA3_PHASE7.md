@@ -17,7 +17,7 @@ faire (W25). Ce document remplace
 | kbench 27B | **605/605, 0 échec** dans les deux modes (W20), pire rel_l2 3,6e-3 |
 | Contrat capacité (W20) | `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` : rouge sur `a772d70`, vert sur `fae6c44` |
 | R21 tier KV (W22a) | rows u8 `gather_rows`/`scatter_rows` ; Flash-Next **2 groupes, 51,38 Kio/entrée**, 27B **1 groupe, 516 Kio** ; rejeu 27B : `to_host` 471, `promoted` 245, 0 échec (hash de vérification actif) |
-| R26 vision (W26) | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3, ffmpeg 8.0) ; tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16 384 patches ; `capabilities.image=true` ; 512² : 256 tokens image (281 avec le texte), TTFT 8,19 s ; 1024² : 1 024 tokens, TTFT 28,73 s ; réponses correctes ; 480/480 cas vision et 856/856 kbench, 0 divergence |
+| R26 vision (W26) | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3, ffmpeg 8.0) ; tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16 384 patches ; `capabilities.image=true` ; 512² : 256 tokens image (281 avec le texte), TTFT 8,19 s ; 1024² : 1 024 tokens, TTFT 28,73 s ; 2048² : 4 096 tokens, TTFT 121,5 s ; 3000² redimensionnée ; 18 cas de robustesse (2 images, alpha/JPEG, 4 × 400) sans fuite ; 480/480 cas vision et 856/856 kbench, 0 divergence |
 | Périmètre v1 (2026-11-16) | vision **livrée** (W26 : image 512²/1024² servie, `capabilities.image=true`) ; MTP Flash-Next **inclus** (ADR-7) et restant à livrer (W25, rows `mtp_enter`/`logit_rerank`) ; le 27B reste à `NS=0` |
 | Mesures à froid W18 (HC/PLE/QSA par row) | 182 + 147 cas, 0 échec ; `hc_read` **1,77 ms à M=1** (η 0,6 %), η lien **1,7 %**, MoE par row bloqué (format du conteneur) |
 | Démo serveur M6 / W19 | préfill 38,7–41,9 tok/s, décodage 4,41 (1 séq.) / 15,5 (4) / 22,1 (6) tok/s ; cache ×12 sur prompt identique, **0 % en rejeu agent** (R22 ouverte) ; 4 décodeurs ×7,0 à côté d'un préfill |
@@ -143,6 +143,13 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
 - **Média** : un build sans `-DRAD_WITH_FFMPEG=ON` refuse toute image
   (`capabilities.image=false`) ; l'hôte exige les paquets `libav*-dev`
   (`pkg-config --modversion libavformat`), et `<gpu-user>` n'a pas `sudo`.
+- **Passes média** : au-delà de `image-max-pixels` (4 194 304 px ici) l'image
+  est **réduite** à 2048², jamais refusée ; seul le nombre de tokens image le
+  révèle. Une passe complète fait ~121 s (≈34 tok/s de préfill, ~135
+  patches/s) et le watchdog peut afficher « nothing has been logged for
+  20/40 s » (`core/engine.cpp:1307`) : c'est du bruit, la requête aboutit.
+  `THROTTLE_STATUS` d'`amd-smi` vaut `THROTTLED` même au repos sur cet hôte :
+  suivre puissance et fréquence.
 - **Paramètre rangé = capacité** : `M` dans les args est le plafond de la bande
   (`max_seqs × (1 + spec)`), jamais le nombre de lignes du pas ; l'étendue est
   sur les tenseurs. Une row qui compare les deux refuse un pas plus étroit que sa
@@ -210,10 +217,14 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
    portent les chiffres dans le dépôt.
 6. **Image / vision — livrée (ADR-7, W26)** : build
    `-DRAD_WITH_FFMPEG=ON`, tour en VRAM, `capabilities.image=true`, images
-   512² et 1024² servies. Reste non testé : la vidéo (annoncée par le
-   processeur) et l'audio. Le corpus de démonstration vit hors dépôt dans
-   `<work-root>/images` ; les paquets `libav*-dev` sont requis et `sudo`
-   n'est pas accordé à `<gpu-user>`.
+   512²/1024²/2048² servies. Robustesse : 18 cas (2 images par requête,
+   alpha/JPEG, ordre des parts, 4 erreurs 400 explicites), VRAM constante,
+   aucune fuite. Limites : resize silencieux au-delà de 4 194 304 px,
+   avertissements de watchdog pendant les passes longues, pass complet
+   ~121 s, type MIME reconnu aux octets, 2 × 2048² non testé. Reste non
+   testé : la vidéo (annoncée par le processeur) et l'audio. Le corpus de
+   démonstration vit hors dépôt dans `<work-root>/images` ; les paquets
+   `libav*-dev` sont requis et `sudo` n'est pas accordé à `<gpu-user>`.
 7. **Nettoyage code (non fait)** : traces `r3d_trace_on` ajoutées au bring-up
    (gated mais répétées par couche) et déduplication `dot4_i8`/`i8_codes4` ; à
    faire avec la prochaine passe code, pas avec les mesures.

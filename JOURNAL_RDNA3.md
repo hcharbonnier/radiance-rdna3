@@ -878,6 +878,37 @@ complet 2 189/2 189 et ciblé vision **480/480**, 0 divergence.
 
 Reste non testé : la vidéo et l'audio (annoncés par le processeur).
 
+### W26 — robustesse du chemin média
+
+Campagne de 18 cas dans une seule session serveur (même build, même recette,
+sous `flock`) : aucun crash, aucun 5xx, aucune fuite — **VRAM constante à
+45 896 MiB** sur toute la campagne, rendue à l'arrêt, texte de contrôle
+identique avant/après.
+
+- **Bord haut** : 2048² (16 384 patches, un pass) → 4 098 tokens image
+  (4 096 + 2 marqueurs), TTFT 121,5 s. 3000² (9 Mpx) **n'est pas refusée** :
+  elle est redimensionnée à 2048² (mêmes 4 098 tokens, 121,9 s).
+- **Plusieurs images** : 2 × 512² → 516 tokens, 15,1 s ; 2 × 1024² →
+  2 052 tokens, 58,5 s ; les deux images sont distinguées.
+- **Ordre, formats** : texte→image et image→texte donnent le même prompt ;
+  PNG RGBA (alpha) et JPEG décodés, descriptions correctes.
+- **Erreurs** : base64 invalide, `data:text/plain`, PNG tronqué, type de part
+  inconnu → 400 en 0,0 s avec champ fautif, aucun travail GPU ; une requête
+  valide juste après passe (200, 7,8 s).
+- **Carte** : edge 36→68 °C, hotspot 42→84 °C, mémoire 46→80 °C, 22–158 W,
+  gfx jusqu'à 2 896 MHz, 100 % d'utilisation pendant les passes. Le champ
+  `THROTTLE_STATUS` d'`amd-smi` vaut `THROTTLED` même au repos sur cet hôte :
+  il n'est pas exploitable ; la puissance et la fréquence le sont.
+- **À documenter** : redimensionnement silencieux au-delà de 4 194 304 px ;
+  12 avertissements de watchdog (`core/engine.cpp:1307`, seuil 20 s) pendant
+  les passes longues, toutes abouties ; coût d'un pass complet ~121 s
+  (≈34 tok/s de préfill, ≈135 patches/s) puis ~4 tok/s de décodage ;
+  `decode_media_url` reconnaît le format aux octets et ne vérifie pas le type
+  MIME déclaré ; 2 × 2048² (32 768 patches) non testé.
+- Aucun défaut de contrat à corriger : les deux améliorations possibles sont
+  de diagnostic (une ligne de log par image : taille après resize, patches,
+  tokens ; un message de watchdog adapté aux passes média).
+
 
 
 
