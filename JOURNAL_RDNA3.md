@@ -503,6 +503,38 @@ pendant un build charge un mélange.
 **Reste (W14)** : WMMA (émission/staging), occupation du gated fusionné, mesure
 `attn_dense` à M=16384 dans kbench, mesure isolée h256, HC/PLE, E4M3 non-IQR.
 
+## 2026-11-16 — W14 : audit Flash-Next, QSA, MoE IQR, formes
+
+Huit chants en worktrees Agent Manager, revus par leurs auteurs puis fusionnés
+sur `rdna3-iqr`.
+
+- **Audit Flash-Next** (`FLASH_NEXT_AUDIT.md`) : le conteneur mélange treillis
+  `kTrellisMad` (gate_up, u3/u4/u5), codebook `w4nl` (tous les `down`, 25 590
+  poids), **`kSigned` 8 tourné** (k/v/output, `ssm_out`, partagés, PLE) et bf16
+  protégé ; il demande les cinq QSA, `gdn_conv_recurrent_update_had`,
+  `kv_store` block 4, `rope` imrope h128, `router_gemm_topk_scatter`,
+  `gemm_nt` N=1, et impose `max_mixed_tok ≤ 2048` (plan de scores).
+- **QSA** : `qsa_work`, `qsa_block_key`, `qsa_score`, `qsa_select` (en plus de
+  `tail_store`) déclarés et testés contre libref — 529, 5 504, 781 et 781
+  valeurs/checks identiques, 7/16/14 cas.
+- **MoE IQR** : row `moe_gemm_iqr` (`libr3d/r3d_moe_iqr.hip`), run map triée,
+  bande 16 lignes et préfill, classes paires/impaires, scratch ; `moe_iqr_device_test`
+  15/15 vert. La **référence hôte** (`tests/iqr_ref.h`, `tests/moe_iqr_test.cpp`)
+  est écrite mais la comparaison carte échoue (`RAD_E_UNSUPPORTED`, écarts
+  top-k/parts) : agent d'intégration en cours (R15).
+- **Formes denses** : `kTable` (u2..u5) et `kGrid` (V=4) acceptées, échelles
+  bf16, tests contre `reference()` ; le treillis reste bit-identique. Ce n'est
+  pas encore la forme `w4nl` du conteneur.
+- **Revue W12** : pitch gated MT>1, borne `max_seqlen` vision, store V h256.
+
+**Validation** : `iqr_device_test` et les quatre tests QSA verts ; `r3d_selftest`
+**151 rows, 0 échec, 14 skips** ; `moe_iqr_test` en échec (voir R15).
+
+**Lancement W15** : `kSigned` 8, `gdn_conv_recurrent_update_had`, `kv_store`
+block 4, `rope` h128 imrope, router fusionné, `gemm_nt` N=1, rows vision
+(`gemm_nt_bias`, `grid_embed`), et réconciliation MoE ; `moe_gemm_w4nl` suivra.
+
+
 
 
 
