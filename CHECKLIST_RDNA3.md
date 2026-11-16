@@ -1,7 +1,7 @@
 # Checklist de clôture — RDNA3 / Qwen3.8 Flash-Next IQR-V4
 
-État au 2026-11-16, branche `rdna3-iqr`, pointe `2177619` (W14 et W15 fusionnés,
-seul `moe_gemm_w4nl` reste en cours). Sert à suivre l'avancement ; cocher au fur et à
+État au 2026-11-16, branche `rdna3-iqr`, pointe `12de89d` (W14 et W15 fusionnés,
+`moe_gemm_w4nl` inclus ; bring-up Flash-Next en cours). Sert à suivre l'avancement ; cocher au fur et à
 mesure et dater la ligne. Le détail des décisions et mesures est dans
 `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md`, `SUIVI_LOTS_RDNA3.md`,
 `HANDOVER_RDNA3_PHASE6.md` et `FLASH_NEXT_AUDIT.md`.
@@ -25,8 +25,8 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
       réconcilié (10 formes, 0 écart)
 - [x] W15 — `kSigned` 8, `gdn_conv_recurrent_update_had`, `kv_store` block 4,
       `rope` imrope h128, router fusionné, `gemm_nt` N=1, `gemm_nt_bias`,
-      `grid_embed` ; **158 rows / 0 échec / 15 skips**, tous les tests device
-      W15 verts. Seul `moe_gemm_w4nl` reste (agent en cours).
+      `grid_embed`, `moe_gemm_w4nl` ; **159 rows / 0 échec / 15 skips**, tous
+      les tests device W15 verts, `moe_iqr_test` et `moe_w4nl` verts.
 - [x] M1 — 27B texte : décodage 28,4 tok/s (16 tok), 21,2 (819), préfill 301
 - [x] M7 (dense) — tableau rempli pour les rows denses
 - [x] ADR-1 à ADR-6 — écrits dans `docs/adr/`
@@ -69,7 +69,7 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 - [ ] 2.8 Mesure M2 : décodage 1 et 4 séquences, préfill 2048/4096, **η lien
       ≥ 80 %**.
 - [ ] 2.9 Doc de la row MoE et des limites connues.
-- [~] 2.10 **`moe_gemm_w4nl`** : forme `kW4NL` (table f32[16], E4M3/64 + f32,
+- [x] 2.10 **`moe_gemm_w4nl`** : forme `kW4NL` (table f32[16], E4M3/64 + f32,
       `group=64`), row device, `a_order` token/sorted, N=1280/2560,
       K=2560/640, MTP 48. **Requis pour Flash-Next** (25 590 poids `down`).
 - [ ] 2.11 MoE : formes mixtes dans une couche (treillis gate_up + w4nl down)
@@ -100,19 +100,23 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 - [x] 4.5 `gemm_nt` **N=1** device (shared gate, K=2560, M=2048) ; agent W15.
 - [x] 4.6 `gemm_nt_bias` et `grid_embed` vision device ; agent W15.
 - [x] 4.7 `kSigned` 8 (voir 1.6 et 1.7).
-- [~] 4.8 `moe_gemm_w4nl` (voir 2.10).
+- [x] 4.8 `moe_gemm_w4nl` (voir 2.10).
 
 ## 4bis. M5/M6 — intégration Flash-Next (~1,5 semaine)
 
 - [x] 4bis.1 Audit du conteneur 121 GB (`FLASH_NEXT_AUDIT.md`), graphe obtenu
       avec deux contournements de debug.
-- [ ] 4bis.2 Démarrage réel avec `libr3d` seul : résoudre
-      `gdn_conv_recurrent_update_had`, `moe_gemm_iqr`, `moe_gemm_w4nl`, les
-      quatre QSA, `kSigned`, `kv_store` b4, `rope` h128, `router`.
-- [ ] 4bis.3 Configuration v1 : `num-speculative-tokens: 0` (MTP hors v1),
+- [x] 4bis.2 Déclaratif avec `libr3d` seul : **0 bande device non résolue**
+      sur 5 074 questions ; le serveur démarre (44,35 GiB/carte, 21 s) avec
+      `/tmp/fn-v1.yaml`. Toutes les rows W15 sont résolues.
+- [~] 4bis.2b Premier pas réel : `hc_read_e4m3` refuse `M=5` alors que la bande
+      est `M≤2048` (`shape this kernel does not serve`). Agent de bring-up
+      dédié : corriger la garde ou déclarer la contrainte pour retomber sur
+      l'hôte, puis traiter les refus runtime suivants jusqu'au texte servi.
+- [~] 4bis.3 Configuration v1 : `num-speculative-tokens: 0` (MTP hors v1),
       `placement: expert_tiered`, `host-pool-mib: 43000`, KV i8,
       **`max_mixed_tok ≤ 2048`** (le plan `score` fait 512 MiB à 2048 lignes,
-      1 Gio à 4096 et le plugin refuse), `max-model-len` ajusté.
+      1 Gio à 4096 et le plugin refuse), `max-model-len: 8192`.
 - [ ] 4bis.4 Texte : 1 et 4 séquences, préfill 2048 et 4096, sorties conformes.
 - [ ] 4bis.5 Image / vision si le conteneur la sert (dépend de 4.6).
 - [ ] 4bis.6 Robustesse : formes refusées, erreurs de plan, arrêt propre,
@@ -157,7 +161,7 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 
 ## 8. Critères de clôture du projet
 
-- [ ] 8.1 `r3d_selftest` **158/0/15** (144 + QSA/MoE + W15), `iqr_device_test`,
+- [ ] 8.1 `r3d_selftest` **159/0/15** (144 + QSA/MoE + W15), `iqr_device_test`,
       `moe_iqr_test` et les quatre tests QSA verts sur la pointe.
 - [ ] 8.2 Flash-Next démarre et génère (texte, 1 et 4 séquences, préfills
       2048/4096) sans fallback ni avertissement nouveau.

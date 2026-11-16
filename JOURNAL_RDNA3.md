@@ -567,6 +567,23 @@ GDN had verts ; `r3d_selftest` **158 rows, 0 échec, 15 skips**.
 de Flash-Next avec `num-speculative-tokens: 0`, `max_mixed_tok ≤ 2048`,
 `expert_tiered`, et les mesures HC/PLE.
 
+## 2026-11-16 — `moe_gemm_w4nl` et premier démarrage Flash-Next
+
+- **`moe_gemm_w4nl`** : forme `w4nl64a8i8h` (codes u4, table f32[16] vérifiée
+  valeur par valeur, échelle E4M3 par 64 sous niveau f32 2^−13), row au run map
+  du MoE IQR, hooks de layout/relayout dédiés, MTP 48 couvert (80 slots,
+  48 experts, N=1280 K=2560 : 102 400 valeurs bf16 exactes), `a_group` 128/256.
+  `r3d_selftest` : **159 rows, 0 échec, 15 skips**.
+- **Déclaratif Flash-Next** avec `libr3d` seul : 5 074 questions,
+  **0 bande device non résolue** ; les 372 non résolues sont des replis hôte.
+  Le serveur démarre en 21 s, 44,35 GiB par carte, `expert_tiered`.
+- **Premier pas refusé** : `hc_read_e4m3` refuse `M=5` alors que la bande est
+  `M≤2048` (`shape this kernel does not serve`), et le moteur s'arrête. Agent
+  de bring-up dédié pour identifier la garde exacte et corriger la row (ou
+  déclarer la contrainte pour retomber sur la row hôte), puis les refus
+  suivants jusqu'au texte 1/4 séquences.
+
+
 
 
 
