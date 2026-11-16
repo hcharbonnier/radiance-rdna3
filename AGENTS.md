@@ -58,8 +58,10 @@
 - **Mesures** : donner le chiffre, la commande et l'état de la carte ; un chiffre
   throttlé (PPT0/PPT1) est invalide. Comparer à la borne (plancher de lancement,
   débit mémoire) et pas seulement entre versions.
-- **Arbres hôte** : `w15-main` est l'état `a772d70`, `w20-r24` l'état corrigé
-  (W20). Tout A/B se fait dans un **nouveau** répertoire avec un build neuf.
+- **Arbres hôte** : `w15-main` est l'état `a772d70`, `w20-r24` l'état
+  corrigé (W20), **`w26-vision` l'état de référence courant** (FFmpeg, vision
+  servie, R21 + R26). Tout A/B se fait dans un **nouveau** répertoire avec un
+  build neuf.
 - **Documents** : handover courant `HANDOVER_RDNA3_PHASE7.md` ; état détaillé
   `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md`, `SUIVI_LOTS_RDNA3.md`,
   `CHECKLIST_RDNA3.md`. `RAPPORT_RDNA3.md`, `PLAN_IMPLEMENTATION_RDNA3.md`,

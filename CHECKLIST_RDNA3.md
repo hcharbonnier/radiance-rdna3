@@ -44,8 +44,13 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [ ] 5.5 R9 — modèle non-IQR absent de l'hôte (dérogation écrite, à reprendre
       si un conteneur 2B/4B arrive).
 - [ ] 5.6 — décider l'ajout de `RAPPORT_RDNA3.md` au dépôt (à jour, hors dépôt).
-- [ ] 1.5 / 5.7 / 8.6 — `docs/OPS.md`, `libr3d/README.md`, limites connues ;
-      2.9 doc de la row MoE ; 3.9 doc des cinq ops QSA.
+- [x] 1.5 / 5.7 / 8.6 — `docs/OPS.md` (rows, dont les cinq ops QSA) et
+      `libr3d/README.md` (inventaire 161 rows / 99 schémas, limites connues) ;
+      2.9 la row MoE est déjà documentée dans `docs/OPS.md` (§`moe_gemm_q`,
+      w4nl) ; 3.9 les cinq ops QSA sont documentées (W24).
+- [ ] `qsa_tail_store` / `qsa_work` — refuser explicitement un index qui n'est
+      pas i32 (le shim caste sans vérifier) et ajouter le test de refus ; écart
+      relevé pendant W24, sans impact sur le moteur qui alloue i32.
 - [ ] 8.7 — handover final de phase.
 - [ ] 6.1–6.6 — optimisations différées (non bloquantes).
 - Hors v1 : codebook `w4nl` dans `w4a8` seulement (MTP et vision sont revenus
