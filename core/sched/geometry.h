@@ -68,7 +68,14 @@ struct ChunkGeometry {
      * grid_origin + k * grid. Where chunks split at the interval and it fits the budget, `grid` is
      * the interval times the span the budget holds, from grid_origin = the interval when that span
      * is over 1. Otherwise `grid` is --max-num-batched-tokens rounded down to the quantum, and the
-     * interval is rounded up to a multiple of it. Zero when not exact. */
+     * interval is rounded up to a multiple of it. Zero when not exact.
+     *
+     * One resume position is off the grid: a linear-state prompt shorter than the first interval
+     * anchors a snapshot at its last quantum boundary (Scheduler::tail_checkpoint,
+     * kShortTailMin), because exact has no grid point to resume there and the next turn of an
+     * agent conversation would otherwise reuse no linear state at all. A longer prompt's cold run
+     * cuts its first interval whole, so that hit recomputes the interval's end in a shorter
+     * chunk, as nearest does. A window-only model keeps its own tail rule below. */
     bool    exact = false;
     int64_t grid = 0;
     int64_t grid_origin = 0;

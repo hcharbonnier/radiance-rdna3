@@ -222,7 +222,10 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
                  "of the same prompt starts a chunk (every %lld tokens%s) and a prompt's tail "
                  "snapshot is taken where its last chunk starts, so the hit recomputes the cold "
                  "run's own chunks and answers bit-identically; a turn re-prefills up to one chunk "
-                 "more than --prefix-resume nearest", (long long)g.grid,
+                 "more than --prefix-resume nearest. A linear-state prompt shorter than one "
+                 "interval anchors a snapshot at its own tail instead (no grid point exists "
+                 "there): the next turn resumes on it and recomputes the interval's end in a "
+                 "shorter chunk", (long long)g.grid,
                  g.grid_origin > 0 ? fmt(" from %lld", (long long)g.grid_origin).c_str() : "");
     if (cfg.prefill_span > 1) {
         /* What the span does here, said once: the intervals the budget holds can be fewer than

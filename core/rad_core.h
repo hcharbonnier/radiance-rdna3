@@ -970,7 +970,9 @@ struct Config {
      *   chunks the same prompt on (ChunkGeometry::grid), and a prompt's tail snapshot is taken
      *   where its last chunk starts. The hit recomputes the cold run's own chunks, so its output
      *   is the cold run's bit for bit even where a kernel rounds a row differently at another
-     *   chunk length.
+     *   chunk length. A linear-state prompt shorter than one interval has no grid point to
+     *   resume at, so it anchors a snapshot at its own tail (Scheduler::kShortTailMin) and the
+     *   next turn resumes there, recomputing the interval's end in a shorter chunk.
      * - nearest: a hit resumes at the deepest snapshot or block, and a prompt's tail snapshot is
      *   at its last quantum boundary. Up to a chunk less is re-prefilled a turn, and a hit can
      *   differ from a cold run in the last bits (a near-tie in greedy text). */

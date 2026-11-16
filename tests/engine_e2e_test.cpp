@@ -625,6 +625,26 @@ double metric(int port, const std::string& name) {
     return -1;
 }
 
+/* A counter whose series carry more labels than the model's and whose name alone would match
+ * another series first (a reason-labelled counter): the first line naming `name` whose labels also
+ * carry `label`. */
+double metric_where(int port, const std::string& name, const std::string& label) {
+    Call c;
+    std::string out;
+    if (!c.send(port, "GET", "/metrics", "") || c.read(&out) != 200) return -1;
+    for (size_t at = 0; (at = out.find(name, at)) != std::string::npos; at += name.size()) {
+        if (at > 0 && out[at - 1] != '\n') continue;
+        const size_t eol = out.find('\n', at);
+        const std::string line = out.substr(at, eol == std::string::npos ? std::string::npos
+                                                                        : eol - at);
+        if (line.find(label) == std::string::npos) continue;
+        const size_t sp = line.rfind(' ');
+        if (sp == std::string::npos) return -1;
+        return std::atof(line.c_str() + sp + 1);
+    }
+    return -1;
+}
+
 /* A completion of `n` tokens from token ids: greedy unless `temp` is set, end-of-text ignored so
  * every reply has the same length. */
 json completion(const std::vector<int32_t>& prompt, int n, double temp = 0.0, int64_t seed = 0,
@@ -2323,6 +2343,63 @@ TEST(the_snapshot_store_is_sized_by_auto_unless_a_count_is_given) {
         CHECK(ok);
         CHECK_EQ(s.stop(), 0);
     }
+}
+
+/* R22: an agent conversation whose turns stay under one checkpoint interval. Exact resume -- the
+ * default -- has no grid position below the first interval, so such a turn wrote no snapshot at
+ * all; the next turn matched its attention blocks, found no slot to resume the linear state from
+ * and reused nothing (prefix_hit_cuts_total{reason="no_snapshot"}), which is M6's agent replay:
+ * 0 of 8 543 prompt tokens served, one checkpoint for five turns while a growing conversation
+ * above the interval served 2 048 a turn. The turn now anchors a snapshot at its own tail -- the
+ * last quantum boundary of the cold run's own cut -- from kShortTailMin tokens up, so the next
+ * turn resumes there and recomputes only what it appended. */
+TEST(a_conversation_under_one_checkpoint_interval_reuses_its_tail) {
+    REQUIRE(world().ok);
+    Server s;
+    REQUIRE(s.start(world().qwen35, { "--max-num-seqs", "1", "--num-speculative-tokens", "0" }));
+    const auto counter = [&](const char* name, const char* label) {
+        return label ? metric_where(s.port, name, label) : metric(s.port, name);
+    };
+
+    /* Turn 1: a 600-token prompt, under one 2048-token interval. */
+    std::vector<int32_t> transcript = prompt_ids(97, 600);
+    int status = 0;
+    const json t1 = post(s.port, "/completion", completion(transcript, 8), &status);
+    REQUIRE_EQ(status, 200);
+    const std::vector<int32_t> reply1 = tokens_of(t1);
+    REQUIRE_EQ(reply1.size(), 8u);
+    /* The cold turn serves nothing and writes exactly one snapshot: its tail anchor. */
+    CHECK_EQ(counter("radiance:linear_cached_tokens_total", nullptr), 0.0);
+    CHECK_EQ(counter("radiance:linear_checkpoints_written_total", nullptr), 1.0);
+
+    /* Turn 2: the transcript plus the reply plus a new message, still under the interval. */
+    transcript.insert(transcript.end(), reply1.begin(), reply1.end());
+    const std::vector<int32_t> message = prompt_ids(98, 120);
+    transcript.insert(transcript.end(), message.begin(), message.end());
+    const json t2 = post(s.port, "/completion", completion(transcript, 8), &status);
+    REQUIRE_EQ(status, 200);
+    const double served = counter("radiance:linear_cached_tokens_total", nullptr);
+    if (!(served > 0))
+        fprintf(stderr, "    turn 2 served %g of %zu prompt tokens\n", served, transcript.size());
+    CHECK(served >= 256.0);
+    CHECK(served < (double)transcript.size());
+    CHECK_EQ(counter("radiance:prefix_hit_cuts_total", "reason=\"no_snapshot\""), 0.0);
+
+    /* Turn 3 resumes deeper than turn 2 did: the ladder keeps growing with the conversation. */
+    const std::vector<int32_t> reply2 = tokens_of(t2);
+    REQUIRE_EQ(reply2.size(), 8u);
+    transcript.insert(transcript.end(), reply2.begin(), reply2.end());
+    const std::vector<int32_t> message3 = prompt_ids(99, 120);
+    transcript.insert(transcript.end(), message3.begin(), message3.end());
+    const json t3 = post(s.port, "/completion", completion(transcript, 8), &status);
+    REQUIRE_EQ(status, 200);
+    (void)t3;
+    const double served3 = counter("radiance:linear_cached_tokens_total", nullptr);
+    CHECK(served3 > served);
+    CHECK(served3 - served >= 64.0);       /* one quantum deeper, the turn's own growth */
+    CHECK(served3 >= 640.0);
+    CHECK_EQ(counter("radiance:prefix_hit_cuts_total", "reason=\"no_snapshot\""), 0.0);
+    CHECK_EQ(s.stop(), 0);
 }
 
 /* A snapshot store that cannot be had stops the start, naming --checkpoint-slots, the size and

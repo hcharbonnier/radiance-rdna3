@@ -498,6 +498,13 @@ public:
      * or the interval where that is lower. A prompt reaches it at kWindowSnapshotMin +
      * max(quantum, 16) tokens: 528 at a quantum of 16. */
     static constexpr int64_t kWindowSnapshotMin = 512;
+    /* The least reusable depth a prompt inside its first checkpoint interval must reach for
+     * tail_checkpoint to anchor a linear-state snapshot at its tail (one quantum below its last
+     * boundary, so a re-rendered tail stays reachable). Below it, the copy and the extra chunk the
+     * split costs are not worth a slot; from it, a turn of an agent conversation would otherwise
+     * re-prefill the whole conversation (Scheduler::admit_one, HitCut::NoSnapshot). Same depth as
+     * kSharedHeadMin, and for the same reason. */
+    static constexpr int64_t kShortTailMin = 256;
     /* Visible for tests: the chunk the scheduler would give a request at `n_computed` under a
      * token budget, and the checkpoint position it will land on (-1 for none). `keep_at` is the
      * request's own checkpoint (Request::checkpoint_at), 0 for none. */

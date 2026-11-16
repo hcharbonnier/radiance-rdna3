@@ -1114,8 +1114,10 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
          * a chunk (ChunkGeometry::grid), so a hit that resumes at one recomputes the cold run's
          * own chunks. Splits at the interval and a span's end as nearest does (below). The tail
          * snapshot is at the start of the prompt's last chunk (tail_checkpoint), a boundary an
-         * idle chunk already ends on, so it costs a copy and no step. A step that shares the
-         * budget (another request, decode rows) may straddle it, and is split there. */
+         * idle chunk already ends on, so it costs a copy and no step -- except a short prompt's
+         * anchor, which splits its last quantum off (Scheduler::kShortTailMin). A step that
+         * shares the budget (another request, decode rows) may straddle either, and is split
+         * there. */
         const int64_t I = geo_.checkpoint_interval;
         const bool periodic = !geo_.window_ckpt || geo_.window_periodic;
         const int64_t next = periodic ? ((n_computed / I) + 1) * I : INT64_MAX;
@@ -1273,10 +1275,34 @@ int64_t Scheduler::bidi_fit(const Request& r, int64_t n_computed, int64_t n_targ
  * last chunk starts (below). Under nearest, its last quantum boundary, only past the first
  * interval (a shorter prompt is cheap to redo) and only where it gains at least a quarter
  * interval over the interval checkpoint below it, which pays for the extra step; a window
- * snapshot follows its own rule (below). */
+ * snapshot follows its own rule (below).
+ *
+ * Inside the first interval the rule is the short-turn anchor: a prompt shorter than one interval
+ * has no interval checkpoint and, under exact, no grid position either, so a turn that appends to
+ * it would match its attention blocks and reuse no linear state at all (admit_one,
+ * HitCut::NoSnapshot). An agent conversation of turns under an interval would then re-prefill the
+ * whole transcript every turn. Such a prompt anchors a snapshot at its last quantum boundary --
+ * less a quantum when that boundary is off the exact grid, so a re-rendered tail cannot push it
+ * past the divergence -- from kShortTailMin tokens up. The cost is one snapshot and, where the
+ * prompt does not already end on that boundary, one short final chunk; the next turn resumes
+ * there and recomputes only what it appends. This is the one resume position under exact that is
+ * not a cold-run chunk start: a longer prompt's cold run cuts its first interval whole, so a hit
+ * from the anchor recomputes that interval's end in a shorter chunk (the trade --prefix-resume
+ * nearest already makes everywhere). Past the first interval exact keeps to the grid. */
 int64_t Scheduler::tail_checkpoint(int64_t target) const {
     const int64_t I = geo_.checkpoint_interval, Q = geo_.quantum;
     if (I <= 0 || Q <= 0) return -1;
+    /* A short-turn anchor is only useful when a later turn can find it. */
+    const int64_t anchor_margin = std::max<int64_t>(Q, 16);
+    int64_t short_anchor = target / Q * Q;
+    /* A client that re-renders the prompt's last tokens (the generation prompt replaced by the
+     * reply) leaves a snapshot taken at the very tail unreachable: back the anchor off a quantum,
+     * as the window rule below does. An anchor on a cold run's own boundary -- the interval, or a
+     * grid point under exact -- is kept as it is: it is where the cold run chunks anyway. */
+    const bool on_boundary = short_anchor % I == 0 || (geo_.exact && geo_.on_grid(short_anchor));
+    if (!on_boundary) short_anchor = (target - anchor_margin) / Q * Q;
+    const int64_t short_tail = cfg_.prefix_cache && target <= I && short_anchor >= kShortTailMin
+                             ? short_anchor : -1;
     if (geo_.exact) {
         /* --prefix-resume exact: where the prompt's last chunk starts on the resume grid, so an
          * exact repeat re-prefills that chunk as the cold run did, and an appended turn that chunk
@@ -1286,7 +1312,8 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
         const int64_t margin = geo_.window_ckpt ? std::max<int64_t>(Q, 16) : 1;
         const int64_t t = geo_.grid_floor(target - margin);
         if (geo_.window_ckpt) return t >= I ? t : -1;
-        return t > I ? t : -1;
+        if (t > I) return t;
+        return short_tail;
     }
     const int64_t tail = target / Q * Q;
     /* A window snapshot is taken at the tail of a prompt, a block short of its end: the next turn
@@ -1301,6 +1328,7 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
         const int64_t t = (target - std::max<int64_t>(Q, 16)) / Q * Q;
         return t >= std::min<int64_t>(I, kWindowSnapshotMin) ? t : -1;
     }
+    if (short_tail >= 0) return short_tail;
     return tail > I && tail - tail / I * I >= std::max<int64_t>(Q, I / 4) ? tail : -1;
 }
 
@@ -1576,8 +1604,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
 
         /* --prefix-resume exact: resume only on the grid an idle cold prefill chunks this prompt
          * on (ChunkGeometry::grid), so the tokens recomputed below are cut into the cold run's own
-         * chunks. A snapshot is already on it (plan_chunk writes none off it, but for a request's
-         * own Request::checkpoint_at); a hit at a block (no snapshot needed) steps back to it. */
+         * chunks. A snapshot is already on it, or is a short prompt's anchor below the first
+         * interval (tail_checkpoint, kShortTailMin; plan_chunk writes no other off the grid, but
+         * for a request's own Request::checkpoint_at); a hit at a block (no snapshot needed)
+         * steps back to the grid. */
         if (geo_.exact && reuse > 0 &&
             !(geo_.checkpoints() && h.checkpoint_slot >= 0 && reuse == h.n_linear_tokens)) {
             const int32_t g = (int32_t)geo_.grid_floor(reuse);
