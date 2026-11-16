@@ -15,6 +15,9 @@
 
 #include "r3d_args.h"
 #include "r3d_iqr.h"
+#include "r3d_moe_w4nl.h"
+
+#include "rad_planes.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1040,3 +1043,81 @@ int moe_params(const RadParam* p, int n_p, int operand, bool mod4, MoeParams* v)
 R3D_MOE_IQR_HOOKS(moe_iqr, false)
 R3D_MOE_IQR_HOOKS(moe_iqr_mod4, true)
 #undef R3D_MOE_IQR_HOOKS
+
+/* ==================================================================== the w4nl codebook experts
+ *
+ * moe_gemm_w4nl's tables at dtype `w4nl64a8i8h`: the codes view selects `codes,table` and the scale
+ * view `scale,scale.1` (arch/common/rad_block_moe_fp8.h, format 5). Both are stored in the joined
+ * form of abi/rad_planes.h, as libref's codebook hooks store them, and the kernel reads the planes
+ * where they lie.
+ *
+ * The relayout also checks the two values the encoding cannot state: the table's sixteen levels
+ * against the w4nl table and the second level against the fixed 2^-13. A container quantised
+ * against another table of the same shape is refused here, by name, rather than served as noise.
+ * A weight whose table matches needs no second level other than the one the kernel folds.
+ */
+namespace {
+
+bool w4nl_dtype(const RadParam* p, int n_p) {
+    const char* d = r3d_pgets(p, n_p, "dtype");
+    return d && std::strcmp(d, "w4nl64a8i8h") == 0;
+}
+
+/* `operand` 2/6 is a class's codes view, 3/7 its scale view. */
+int w4nl_check(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
+               int n_planes) {
+    if (!w4nl_dtype(p, n_p)) return RAD_E_DTYPE;
+    const bool codes = operand == 2 || operand == 6;
+    const bool scale = operand == 3 || operand == 7;
+    if ((!codes && !scale) || !enc || !sel || n_planes != 2) return RAD_E_DTYPE;
+    if (std::strcmp(enc->transform, "fwht128") != 0) return RAD_E_DTYPE;
+    for (int i = 0; i < 2; ++i)
+        if (sel[i] < 0 || sel[i] >= enc->n_planes) return RAD_E_SHAPE;
+    const RadEncPlane& a = enc->plane[sel[0]];
+    const RadEncPlane& b = enc->plane[sel[1]];
+    if (codes) {
+        if (std::strcmp(a.role, "codes") != 0 || a.kind != RAD_PLANE_TILED ||
+            a.dtype != RAD_U4 || a.block[0] != 1 || a.block[1] != 1)
+            return RAD_E_DTYPE;
+        if (std::strcmp(b.role, "table") != 0 || b.kind != RAD_PLANE_TABLE ||
+            b.dtype != RAD_F32 || b.extent[0] != 1 || b.extent[1] != 16)
+            return RAD_E_DTYPE;
+        return RAD_OK;
+    }
+    if (std::strcmp(a.role, "scale") != 0 || a.kind != RAD_PLANE_TILED ||
+        a.dtype != RAD_F8E4M3 || a.block[0] != 1 || a.block[1] != r3d_w4nl::kGroup)
+        return RAD_E_DTYPE;
+    if (std::strcmp(b.role, "scale.1") != 0 || b.kind != RAD_PLANE_TILED ||
+        b.dtype != RAD_F32 || b.block[0] != 0 || b.block[1] != 0)
+        return RAD_E_DTYPE;
+    return RAD_OK;
+}
+
+/* The values the shapes cannot state, checked on the planes the relayout is about to copy. */
+int w4nl_check_values(int operand, const RadTensor* planes, int n_planes) {
+    if (n_planes != 2 || !planes[0].data || !planes[1].data) return RAD_E_INVAL;
+    if (operand == 2 || operand == 6) {
+        if (!r3d_w4nl::table_is_w4nl((const float*)planes[1].data, 16)) return RAD_E_DTYPE;
+        return RAD_OK;
+    }
+    const float level = ((const float*)planes[1].data)[0];
+    return level == r3d_w4nl::kLevel ? RAD_OK : RAD_E_DTYPE;
+}
+
+}  /* namespace */
+
+extern "C" int r3d_rad_layout_moe_w4nl(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel,
+                                       const RadTensor* pl, int n, RadLayout* out) {
+    const int rc = w4nl_check(p, n_p, operand, enc, sel, n);
+    return rc != RAD_OK ? rc : rad_planes_layout(enc, sel, pl, n, out);
+}
+
+extern "C" int r3d_rad_relayout_moe_w4nl(const RadParam* p, int n_p, int operand,
+                                         const RadEncoding* enc, const int* sel,
+                                         const RadTensor* pl, int n, void* dst,
+                                         int64_t dst_bytes) {
+    int rc = w4nl_check(p, n_p, operand, enc, sel, n);
+    if (rc == RAD_OK) rc = w4nl_check_values(operand, pl, n);
+    return rc != RAD_OK ? rc : rad_planes_relayout(enc, sel, pl, n, dst, dst_bytes);
+}

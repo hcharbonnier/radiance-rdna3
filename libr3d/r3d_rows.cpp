@@ -1586,6 +1586,21 @@ extern "C" int r3d_rad_unrelayout_moe_iqr(const RadParam* p, int n_p, int operan
                                           const RadEncoding* enc, const int* sel, const void* src,
                                           int64_t src_bytes, const RadTensor* pl, int n);
 
+/* The grouped w4nl codebook GEMM (r3d_moe_w4nl.hip): the same routed-row walk as the IQR row, over
+ * experts stored as u4 codes, a sixteen-level f32 table and an E4M3 scale per (row, 64 of K) under
+ * one f32 2^-13. Its layout hooks (r3d_iqr_layout.cpp) join the codes and table and the two scale
+ * planes, and refuse a table or level that is not the w4nl one. Declared here because the plugin's
+ * own header is not the ABI. */
+extern "C" int r3d_rad_moe_gemm_w4nl(const RadArgs* a, RadStream s);
+extern "C" int64_t r3d_rad_moe_gemm_w4nl_scratch(const RadArgs* a);
+extern "C" int r3d_rad_layout_moe_w4nl(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel,
+                                       const RadTensor* pl, int n, RadLayout* out);
+extern "C" int r3d_rad_relayout_moe_w4nl(const RadParam* p, int n_p, int operand,
+                                         const RadEncoding* enc, const int* sel,
+                                         const RadTensor* pl, int n, void* dst,
+                                         int64_t dst_bytes);
+
 /* A split's partials are f32 over the output, plus one arrival counter per split. Sized at the
  * band's bounds and the axis's widest split, because a scratch hook runs at declare, where the
  * range may still be open: the buffer must hold any point the tuner can pick. */
@@ -1863,6 +1878,13 @@ static const RadConstraint cMoeGemmMxfp4[] = { C_IN("dtype", "mxfp4a8"), C_GE("n
                                                C_GE("top_k", 1) };
 static const RadConstraint cMoeGemmQW4A8[] = { C_IN("dtype", "w4a8"), C_GE("n_expert", 1),
                                                C_GE("top_k", 1) };
+/* The w4nl codebook experts: an E4M3 scale a 64 of K under a fixed f32 second level and a
+ * sixteen-entry table, so `group` stays the op's base 128 (the scale grid is 1 x group/2, as
+ * libref derives it) while the row folds every 64. `a_group` is optional and left unconstrained:
+ * its default is `group`, and the launcher accepts 128 or 256. */
+static const RadConstraint cMoeGemmQW4NL[] = { C_IN("dtype", "w4nl64a8i8h"), C_GE("n_expert", 1),
+                                               C_LE("n_expert", 512), C_GE("top_k", 1),
+                                               C_EQ("group", 128) };
 static const RadConstraint cMoeGemmW4A4[] = { C_IN("dtype", "w4a4"), C_GE("n_expert", 1),
                                                 C_GE("top_k", 1) };
 static const RadConstraint cMoeGather[] = { C_GE("M", 1), C_GE("n", 1), C_GE("top_k", 1),
@@ -3097,6 +3119,35 @@ static const RadKernelInfo kKernels[] = {
     nullptr, nullptr, r3d_rad_moe_gemm_iqr,
     r3d_rad_moe_gemm_iqr_scratch, r3d_rad_layout_moe_iqr, r3d_rad_relayout_moe_iqr,
     nullptr, r3d_rad_unrelayout_moe_iqr,
+    nullptr, 0 },
+
+  /* ------------------------------------------------------------------ r3d_moe_w4nl.hip
+   *
+   * The grouped w4nl codebook GEMM: the routed-row walk of the IQR row over experts whose weight is
+   * u4 codes indexing a sixteen-entry f32 table, with an E4M3 scale per (row, 64 of K) under one
+   * fixed f32 level. A row of moe_gemm_q selected by dtype=w4nl64a8i8h; the even experts in `w` /
+   * `w_scale`, the odd in `w_odd` / `w_odd_scale`. The layout hook stores the codes and table as one
+   * joined operand and the two scale planes as another.
+   */
+  { "moe_gemm_w4nl", "moe_gemm_q", "moe",
+    "The grouped GEMM over experts stored in the w4nl codebook form: y[i] = a[sorted_tok[i]/top_k] "
+    "@ w_e^T, e the expert of sorted row i, each 64-K group's exact int8*table sub-sum folded by "
+    "the activation's scale and the weight's E4M3 scale times its fixed f32 level",
+    "16 sorted rows and four 16-column weight tiles a block, a wave a tile; the decode band (M * "
+    "top_k <= 1.5 * n_expert) walks the expert runs in its tile; above it a run map in the row's "
+    "scratch gives a block one run of up to 64 rows and a decoded 16x128 unit is reused over four "
+    "token tiles; the group fold is libref's (sub * a_scale) * (w_scale * level / 8), groups "
+    "ascending, so the int8 result is bit-exact; equal classes (N_odd = N, K_odd = K), N % 64, "
+    "K % 128, `group` 128, `a_group` 128 or 256, parts divides N in 64-column blocks",
+    "I8 a with an f32 scale per (row, 128 or 256 of K); u4 weight tables (two codes a byte) joined "
+    "with the f32[16] table, and E4M3 scale tables joined with the fixed f32 2^-13; bf16 y in "
+    "sorted order; token or sorted a; zero-row experts and dropped slots handled; bf16 protected "
+    "experts are the bf16 row's",
+    RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+    ROW(cMoeGemmQW4NL), NOTUNE,
+    nullptr, nullptr, r3d_rad_moe_gemm_w4nl,
+    r3d_rad_moe_gemm_w4nl_scratch, r3d_rad_layout_moe_w4nl, r3d_rad_relayout_moe_w4nl,
+    nullptr, nullptr,
     nullptr, 0 },
 
   /* ------------------------------------------------------------------ r3d_moe_gemm_w4a8.hip

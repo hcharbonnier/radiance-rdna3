@@ -154,14 +154,16 @@ static void check_table() {
          * container's quantised weight (codes and scales as planes behind one operand), which the
          * mapped tier places only if a loaded library can read it in place. The rows below cover
          * w2a8's {1,group} grid with a zero, and the fp8a8 GEMM's and lm_head's {128,128} grid
-         * without, each transcribed from the reference's hook. Any other name is a rule change and
-         * should fail here. */
+         * without, each transcribed from the reference's hook. moe_gemm_w4nl reads the w4nl
+         * codebook's codes+table and scale+scale.1 the same way. Any other name is a rule change
+         * and should fail here. */
         const bool joined = 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_m16")
                          || 0 == std::strcmp(k->name, "logits_gemm_bf16")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_fp8a8_tiled")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_tiled")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w4a16asym_m64")
-                         || 0 == std::strcmp(k->name, "gemm_nt_q_w5a16_m64");
+                         || 0 == std::strcmp(k->name, "gemm_nt_q_w5a16_m64")
+                         || 0 == std::strcmp(k->name, "moe_gemm_w4nl");
         /* The query and the writer come as a pair, and the pair is the rule: a row with a hook must
          * supply the relayout that produces the form the hook names (abi/rad_abi.h -- a query
          * answering RAD_OK is a promise the loader keeps on the row's word), and no row may carry an

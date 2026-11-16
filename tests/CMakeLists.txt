@@ -180,7 +180,7 @@ endif()
 if(TARGET libr3d AND RAD_HIP_FOUND)
   set(RAD_TESTS_WITH_R3D_DEVICE iqr_device_test ple_hc_device_test qsa_block_key_device_test
                                 qsa_score_device_test qsa_select_device_test qsa_work_device_test
-                                moe_iqr_device_test moe_iqr_test kv_store_b4_device_test
+                                moe_iqr_device_test moe_iqr_test moe_w4nl_device_test kv_store_b4_device_test
                                 r3d_rope_imrope_h128_device_test router_fused_device_test
                                 gemv_n1_device_test vision_rows_device_test
                                 gdn_conv_recurrent_had_device_test)
@@ -188,6 +188,7 @@ if(TARGET libr3d AND RAD_HIP_FOUND)
 else()
   list(FILTER RAD_TESTS EXCLUDE REGEX "/iqr_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/moe_iqr_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/moe_w4nl_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/ple_hc_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_block_key_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_score_device_test\\.cpp$")
@@ -256,7 +257,8 @@ foreach(t ${RAD_TESTS})
     add_dependencies(${n} libr3d)
     # The MoE IQR tests must round their scale multiplies separately, as the kernel does, and state
     # their f32 order (a multiply and an add, not an fma).
-    if(n STREQUAL moe_iqr_device_test OR n STREQUAL "moe_iqr_test")
+    if(n STREQUAL moe_iqr_device_test OR n STREQUAL "moe_iqr_test" OR
+       n STREQUAL moe_w4nl_device_test)
       target_compile_options(${n} PRIVATE -ffp-contract=off)
     endif()
     # The PLE/HC ladder compares against libref's row-by-row oracle.
@@ -389,6 +391,7 @@ if(RAD_HIP_FOUND)
   # built for.
   foreach(n iqr_device_test ple_hc_device_test qsa_block_key_device_test qsa_score_device_test
             qsa_select_device_test qsa_work_device_test moe_iqr_device_test moe_iqr_test
+            moe_w4nl_device_test
             kv_store_b4_device_test r3d_rope_imrope_h128_device_test router_fused_device_test
             gemv_n1_device_test vision_rows_device_test gdn_conv_recurrent_had_device_test)
     if(TARGET ${n})

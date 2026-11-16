@@ -204,6 +204,10 @@ set(R3D_UNITS
   # read, a block walking the sorted rows' expert runs in the decode band and a run map above it so
   # a decoded 16x128 unit serves four token tiles.
   "r3d_moe_iqr|"
+  # The grouped w4nl codebook GEMM (moe_gemm_q): u4 codes indexing a sixteen-entry f32 table, an
+  # E4M3 scale per (row, 64 of K) under one f32 level; the IQR row's run walk, with the group fold
+  # libref's order so the int8 result is bit-exact.
+  "r3d_moe_w4nl|"
   # The grouped GEMM with unquantised bf16 experts: the same run-walk / gather as moe_gemm_q, the
   # bf16 operands loaded straight into the bf16 wave-matrix fragments (f32 accumulate), no decode.
   "r3d_moe_gemm_bf16|"
