@@ -116,6 +116,9 @@ set(R3D_UNITS
   "r3d_qsa_score|"
   "r3d_qsa_select|"
   "r3d_qsa_work|"
+  # The QSA indexer's query rotary: imrope at head_dim 128, rotary 64, four heads. A separate unit
+  # so the fused h256 imrope row and its entry point are untouched.
+  "r3d_rope_imrope_h128|"
   "r3d_gated_had_quant_i8|"
   "r3d_had_quant_act_fp8|"
   "r3d_gated_had_quant_fp8|"

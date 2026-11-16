@@ -92,6 +92,10 @@
  */
 
 /* --- norms and elementwise --- */
+/* r3d_rope_imrope_h128.hip: the QSA query's imrope row. Kept out of r3d_plugin.h so the h256 and
+ * h72 rows' translation units and entry points stay untouched. */
+extern "C" int r3d_rad_rope_imrope_h128(const RadArgs*, RadStream);
+
 static const RadParamSpec pRmsNorm[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
                                          P_F64O("wadd"), P_F64O("mult") };
 static const RadOperandSpec oRmsNorm[] = { { "x", RAD_OPD_IN, 0 },
@@ -1614,6 +1618,12 @@ static const RadConstraint cRopeTableF32[] = { C_IN("dtype", "f32"), C_EQ("rot",
 static const RadConstraint cRopeImrope[] = { C_IN("mode", "imrope"), C_EQ("head_dim", 256),
                                              C_EQ("rotary_dim", 64), C_GE("n_head", 1),
                                              C_LE("n_head", 24), C_LE("n_head_kv", 4) };
+/* Flash-Next's QSA query: four indexer heads of 128 lanes, no key or value heads, a 64-lane
+ * partial rotary and Qwen3-VL's 11 11 10 sections. The fused attention block keeps the h256 row;
+ * the two bands cannot overlap on head_dim. */
+static const RadConstraint cRopeImropeH128[] = { C_IN("mode", "imrope"), C_EQ("head_dim", 128),
+                                                 C_EQ("rotary_dim", 64), C_EQ("n_head", 4),
+                                                 C_EQ("n_head_kv", 0), C_GE("M", 1) };
 
 static const RadConstraint cEmbed[] = { C_IN("dtype", "bf16"), C_DIV("n_embd", 2) };
 /* An IQR table: the gather decodes the rows it is asked for, so n_embd is whole 128-blocks. */
@@ -3954,6 +3964,17 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cRopeImrope), NOTUNE,
   nullptr, nullptr, r3d_rad_rope, nullptr, nullptr, nullptr, r3d_shape_rope },
+
+{ "rope_imrope_h128", "rope", "attn",
+  "the QSA indexer's interleaved three-component rotary over NeoX pairs, sections 11 11 10, in "
+  "place on four 128-wide query heads at rotary_dim 64; the head past the rotary is untouched",
+  "head_dim 128; rotary_dim 64; n_head 4; n_head_kv 0; mode imrope; positions [M], [M, 3] "
+  "token-major or [3, M] component-major at their own strides; YaRN's blend and magnitude; one "
+  "block a token",
+  "bf16 qkv in place, i32 positions, fp32 angles",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cRopeImropeH128), NOTUNE,
+  nullptr, nullptr, r3d_rad_rope_imrope_h128, nullptr, nullptr, nullptr, r3d_shape_rope },
 
 
 /* ------------------------------------------------------------------ the vision tower (W10-lite)
