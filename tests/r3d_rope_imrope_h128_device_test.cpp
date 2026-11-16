@@ -412,6 +412,12 @@ TEST(rope_imrope_h128_matches_libref) {
         /* A different section split, to show the interleaved component map is the reference's. */
         { "sections_8_12_12", 4, 0, POS_COMP_MAJOR, 0, false, false, 0, 0, 0, 0, 1.0, "8 12 12",
           false },
+        /* Sections past the rotary width and a trailing separator: ref clamps nothing but the
+         * predicate never reaches the excess, and the shim's clamp must keep that truth. */
+        { "sections_huge", 4, 0, POS_COMP_MAJOR, 0, false, false, 0, 0, 0, 0, 1.0,
+          "10000000000 10000000000 10000000000", false },
+        { "sections_trailing_space", 4, 0, POS_COMP_MAJOR, 0, false, false, 0, 0, 0, 0, 1.0,
+          "11 11 10 ", false },
         /* The production capacity: M = 4096 at the band's geometry. */
         { "m_4096", 4096, 0, POS_RANK1, 0, false, false, 0, 0, 0, 0, 1.0, "11 11 10", false },
     };

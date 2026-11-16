@@ -49,11 +49,11 @@ __device__ __forceinline__ uint16_t ldg_u16_at(const uint16_t* p, int i) {
     return (uint16_t)ldg_u16(p + i);
 }
 
-/* imrope's component for frequency i (Qwen3-VL). Sections past the rotary width do not change the
- * predicate: i < 3*s is false there for either component. */
+/* imrope's component for frequency i (Qwen3-VL). A section past the rotary width covers every
+ * frequency below rot/2, so the shim clamps each section to rot/2 and the product stays exact. */
 __device__ __forceinline__ int rope_imrope_comp(int i, int s1, int s2) {
-    if (i % 3 == 1 && i < 3 * s1) return 1;
-    if (i % 3 == 2 && i < 3 * s2) return 2;
+    if (i % 3 == 1 && (long long)i < 3LL * (long long)s1) return 1;
+    if (i % 3 == 2 && (long long)i < 3LL * (long long)s2) return 2;
     return 0;
 }
 
@@ -131,14 +131,20 @@ extern "C" int r3d_rad_rope_imrope_h128(const RadArgs* a, RadStream s) {
         for (const char* p = sec; *p; ) {
             char* end = nullptr;
             const long long x = std::strtoll(p, &end, 10);
-            if (end == p) return R3D_NO(RAD_E_SHAPE);
-            if (x <= 0 || n_sec >= 3) return R3D_NO(RAD_E_SHAPE);
-            v[n_sec++] = x;
+            if (end == p) break;                /* trailing text ends the list, as ref does */
+            if (x <= 0) return R3D_NO(RAD_E_SHAPE);
+            if (n_sec < 3) v[n_sec++] = x;      /* imrope reads only the first three */
             p = end;
         }
         if (n_sec != 3) return R3D_NO(RAD_E_SHAPE);
         s1 = v[1];
         s2 = v[2];
+        /* `i < 3*s` for i < rot/2 is true for every s >= rot/2. Clamping there keeps the
+         * predicate exact and the section product inside int; a section past the width is not an
+         * error (ref's imrope test simply never reaches it). */
+        const long long half = rot / 2;
+        if (s1 > half) s1 = half;
+        if (s2 > half) s2 = half;
     }
 
     /* Positions: [M] is one component per token; [M, 3] is token-major and [3, M] is
