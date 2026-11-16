@@ -249,6 +249,16 @@ gemm_w2a8_kernel(const int8_t* __restrict__ a, const float* __restrict__ sa, int
 
 int mt_for(int M) { return M <= 1 ? 1 : M <= 2 ? 2 : M <= 4 ? 4 : M <= 8 ? 8 : kMTMax; }
 
+/* The k-chunk is 2048/MT codes, so a K that is not a multiple of it cannot be tiled at that MT.
+ * M=1 at K=2560 is such a case (chunk 2048 against 2560): the row used to pick MT from M alone and
+ * refuse, which aborted the MTP draft head's first pass. Take the smallest MT at or above M whose
+ * chunk divides K; MT=16 (chunk 128) always does when K is a multiple of the group. */
+int mt_for_k(int M, int K) {
+    for (int mt = mt_for(M); mt <= kMTMax; mt <<= 1)
+        if (K % (2048 / mt) == 0) return mt;
+    return 0;
+}
+
 }   // namespace
 
 /* ================================================================== the launcher
@@ -298,6 +308,22 @@ extern "C" int r3d_w2a8_probe_launch(const int8_t* a, const uint8_t* codes, floa
     return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
+/* Where the (scale, zero) pair sits in the joined weight, from the layout rule alone. The header
+ * is not read: a weight the op runs on the card lives in VRAM and has no host mapping, so a shim
+ * that dereferences it at issue faults (W25). rad_planes_plan lays out header + two entries, the
+ * f16 scale plane, then the u8 zero plane, every start rounded to RAD_PLANES_ALIGN; the layout
+ * hook has already checked the plane roles and dtypes at load. */
+static inline void r3d_w2a8_scale_zero(long long N, long long G, long long base,
+                                       long long* sp, long long* zp, int* srb, int* zrb)
+{
+    const long long off = rad_planes_round((long long)sizeof(RadPlanesHeader) +
+                                           2 * (long long)sizeof(RadPlanesEntry));
+    *sp = base + off;
+    *srb = (int)rad_dtype_bytes(RAD_F16, G);
+    *zrb = (int)rad_dtype_bytes(RAD_U8, G);
+    *zp = base + rad_planes_round(off + N * (long long)*srb);
+}
+
 extern "C" int r3d_gemm_nt_q_w2a8(long a, long a_scale, long b, long b_scale, long a_sum, long y,
                                   int M, int N, int K, int group, int a_ld, int y_ld, int nt,
                                   long stream)
@@ -309,7 +335,8 @@ extern "C" int r3d_gemm_nt_q_w2a8(long a, long a_scale, long b, long b_scale, lo
     if (group != kGroup) return -2;                   /* chunk = 128*16/MT */
     if (K % kGroup) return -2;
     if (K % 16) return -2;                            /* the step order is a 16-byte step */
-    const int mt = mt_for(M);
+    const int mt = mt_for_k(M, K);
+    if (!mt) return -2;                               /* no chunk divides K at or above M */
     const int chunk = 2048 / mt;
     if (K % chunk) return -2;                         /* ragged chunk: the tile would read past K */
     const int G = K / group;
@@ -319,24 +346,18 @@ extern "C" int r3d_gemm_nt_q_w2a8(long a, long a_scale, long b, long b_scale, lo
     if (a_ld % 4) return -3;                          /* four codes per dword, staged whole */
     if (((uintptr_t)b & 15u) || ((uintptr_t)a & 3u)) return -3;
 
-    const RadPlanesHeader* h = rad_planes_header((const void*)(uintptr_t)b_scale);
-    if (!h) return -2;                                /* not the joined form: rad.planes is expected */
-    const RadPlanesEntry* es = nullptr;
-    const RadPlanesEntry* ez = nullptr;
-    const void* sp = rad_planes_find((const void*)(uintptr_t)b_scale, "scale", &es);
-    const void* zp = rad_planes_find((const void*)(uintptr_t)b_scale, "zero", &ez);
-    if (!sp || !zp || !es || !ez) return -2;
-    if (es->dtype != RAD_F16) return -2;              /* this kernel reads an f16 scale */
-    if (ez->dtype != RAD_U8) return -2;               /* ...and a byte-wide zero; see the header */
-    if (es->rows != N || es->cols != G || ez->rows != N || ez->cols != G) return -2;
-    if ((es->row_bytes & 1) || es->row_bytes < 2 * G || ez->row_bytes < G) return -3;
+    long long sp64 = 0, zp64 = 0;
+    int srb = 0, zrb = 0;
+    r3d_w2a8_scale_zero(N, G, b_scale, &sp64, &zp64, &srb, &zrb);
+    const void* sp = (const void*)(uintptr_t)sp64;
+    const void* zp = (const void*)(uintptr_t)zp64;
 
 #define R3D_W2A8_LAUNCH(MT)                                                                          \
     do {                                                                                             \
         const dim3 grid((N + kWaves - 1) / kWaves), block(kBlockThreads);                             \
         R3D_KLAUNCH(R3D_KNAME((gemm_w2a8_kernel<MT>)), grid, block, (hipStream_t)stream,             \
                     (const int8_t*)a, (const float*)a_scale, 1, (const uint8_t*)b,                   \
-                    (const uint16_t*)sp, (int)es->row_bytes, (const uint8_t*)zp, (int)ez->row_bytes, \
+                    (const uint16_t*)sp, srb, (const uint8_t*)zp, zrb,                               \
                     (const float*)a_sum, kMpad, (uint16_t*)y, M, N, K, chunk, a_ld, y_ld);           \
     } while (0)
 
@@ -399,19 +420,10 @@ extern "C" int r3d_rad_gemm_nt_q_w2a8(const RadArgs* a, RadStream s)
     if (yp < N) return R3D_NO(RAD_E_STRIDE);
     if (!r3d_contig(ASUM)) return R3D_NO(RAD_E_STRIDE);
 
-    const RadPlanesHeader* h = rad_planes_header(r3d_p(BS));
-    if (!h) return R3D_NO(RAD_E_DTYPE);                       /* the joined form is the operand */
-    const RadPlanesEntry* es = nullptr;
-    const RadPlanesEntry* ez = nullptr;
-    const void* sp = rad_planes_find(r3d_p(BS), "scale", &es);
-    const void* zp = rad_planes_find(r3d_p(BS), "zero", &ez);
-    if (!sp || !zp || !es || !ez) return R3D_NO(RAD_E_DTYPE);
-    if (es->dtype != RAD_F16) return R3D_NO(RAD_E_DTYPE);
-    if (ez->dtype != RAD_U8)
-        return R3D_NO(RAD_E_DTYPE);   /* declined: a sub-byte zero plane needs the bit-extract
-                                       * path (rad_load_bits). U8 is w2a8's form. */
-    if (es->rows != N || es->cols != G || ez->rows != N || ez->cols != G) return R3D_NO(RAD_E_SHAPE);
-    if ((es->row_bytes & 1) || es->row_bytes < 2 * G || ez->row_bytes < G) return R3D_NO(RAD_E_STRIDE);
+    /* The joined (scale, zero) weight: its layout is checked at load by
+     * r3d_layout_gemm_nt_q_w2a8, and its header is not read here — the weight can live in VRAM,
+     * where a host dereference faults. The launcher derives the plane offsets from the layout rule. */
+    if (BS->dtype != RAD_F16) return R3D_NO(RAD_E_DTYPE);
 
     if (!r3d_aligned(r3d_p(A), 4) || !r3d_aligned(r3d_p(B), 16)) return R3D_NO(RAD_E_ALIGN);
 
@@ -512,8 +524,9 @@ extern "C" int r3d_layout_gemm_nt_q_w2a8(const RadParam* p, int n_p, int operand
             if (t.dtype != RAD_F16) return r3d_layout_trace("r3d_layout_gemm_nt_q_w2a8", operand, r3d_pgets(p, n_p, "dtype"), n, RAD_E_DTYPE);               /* the scale is f16 */
         } else {
             const uint32_t zd = t.dtype;
-            const bool ok = zd == RAD_U8 || zd == RAD_U2 || zd == RAD_U4 || zd == RAD_U5;
-            if (!ok) return r3d_layout_trace("r3d_layout_gemm_nt_q_w2a8", operand, r3d_pgets(p, n_p, "dtype"), n, RAD_E_DTYPE);                              /* zero_dt: never signed */
+            /* Both packed grids read the zero as a byte: the tiled arm names a sub-byte zero a
+             * refusal, and this row's kernel does the same. */
+            if (zd != RAD_U8) return r3d_layout_trace("r3d_layout_gemm_nt_q_w2a8", operand, r3d_pgets(p, n_p, "dtype"), n, RAD_E_DTYPE);
         }
     }
     return r3d_layout_trace("r3d_layout_gemm_nt_q_w2a8", operand, r3d_pgets(p, n_p, "dtype"), n, rad_planes_layout(enc, sel, planes, n, out));
