@@ -20,6 +20,7 @@
  */
 #include "rad_test.h"
 #include "kfixture.h"
+#include "format/encoding.h"
 #include "opshapes.h"
 #include "rad_plugin.h"
 #include "rad_sample.h"
@@ -930,6 +931,127 @@ TEST(the_reference_reads_a_scale_times_the_level_above_it) {
     CHECK(why.find("does not cover") != std::string::npos);
 }
 
+/* An IQR weight: a trellis (codes, a 65536-state table, its mad constants) under a row scale and a
+ * 128-column block factor. The declaration takes the codes view (three of the encoding's five
+ * planes) and the scale view (the other two); neither decodes alone with enc_selection_logical,
+ * which the reference rows work around. */
+static RadEncoding iqr_encoding() {
+    RadEncoding e;
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "trellis");
+    rad_enc_copy_str(e.transform, "fwht128");
+    rad_enc_add_plane(&e, "codes", RAD_U4, 1, 1);
+    rad_enc_add_plane(&e, "scale", RAD_F32, 1, 0);
+    const int tp = rad_enc_add_table(&e, "trellis", RAD_I8, 65536, 1);
+    e.plane[tp].block[0] = 16;                  /* a run of 16 rows, one scale a row */
+    e.plane[tp].block[1] = 1;
+    rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+    rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
+    return e;
+}
+
+static KfOperand iqr_view(const RadEncoding& e, std::vector<const char*> roles, uint32_t dt,
+                          int64_t rows, int64_t cols) {
+    KfOperand d;
+    d.role = RAD_OPD_WEIGHT;
+    d.has_enc = true;
+    d.enc = e;
+    d.dtype = dt;
+    select_planes(&d, rows, cols, roles);
+    d.shape = { rows, cols };
+    return d;
+}
+
+/* The quantiser the test registers in place of libquant's, so the codes view's plane completion
+ * can be checked without loading the plugin: it records how many planes it was handed and whether
+ * the transform reached it, and decodes to a constant. */
+static int g_iqr_planes = 0;
+static bool g_iqr_transform = false;
+static int fake_iqr_decode(const RadEncoding* e, const RadQuantWeight* w,
+                           const void* const* planes, int64_t row0, int64_t rows, float* out) {
+    if (!rad_enc_is(e, "trellis")) return RAD_E_UNSUPPORTED;
+    if (!w || w->cols <= 0) return RAD_E_SHAPE;
+    g_iqr_planes = 0;
+    for (int i = 0; i < e->n_planes; ++i) g_iqr_planes += planes[i] != nullptr;
+    g_iqr_transform = e->transform[0] != '\0';
+    (void)row0;
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < w->cols; ++c) out[r * w->cols + c] = 7.0f;
+    return RAD_OK;
+}
+
+/* The reference reads the codes view as the weight's integer values: the core refuses three of
+ * five planes, and applying the encoding's transform would rotate what the IQR rows decode as it
+ * stands. The scale planes are not part of this operand, and are completed at 1. */
+TEST(the_reference_reads_an_iqr_codes_view_without_its_scale) {
+    const int64_t R = 32, C = 256;
+    const RadEncoding e = iqr_encoding();
+    REQUIRE(rad_enc_valid(&e));
+    const KfOperand d = iqr_view(e, { "codes", "trellis", "trellis.mad" }, RAD_F32, R, C);
+    REQUIRE_EQ(d.sel.size(), (size_t)3);
+
+    std::vector<std::vector<uint8_t>> pl;
+    kf_draw_planes(d, 5, &pl);
+    REQUIRE_EQ(pl.size(), (size_t)3);
+    const void* raw[RAD_ENC_MAX_PLANES] = { pl[0].data(), pl[1].data(),
+                                            pl[2].data() };
+    std::vector<uint8_t> direct((size_t)rad_dtype_bytes(d.dtype, R * C));
+    std::string why;
+    CHECK_EQ(enc_selection_logical(d.enc, d.sel.data(), (int)d.sel.size(), d.sel_rows.data(),
+                                   d.sel_cols.data(), raw, d.dtype, R * C, direct.data(), &why),
+             RAD_E_SHAPE);
+
+    KfOperand full;
+    REQUIRE(kf_operand_full(d, &full));
+    REQUIRE_EQ(full.sel.size(), (size_t)5);
+    for (int i = 0; i < 5; ++i) CHECK_EQ(full.sel[(size_t)i], i);
+    KfOperand scale = iqr_view(e, { "scale", "scale.col" }, RAD_BF16, R, C);
+    CHECK(!kf_operand_full(scale, &full));      /* a scale view is not the whole weight */
+
+    enc_add_decoder(fake_iqr_decode);
+    std::vector<uint8_t> out;
+    const int rc = kf_planes_logical(d, pl, &out, &why);
+    enc_remove_decoder(fake_iqr_decode);
+    REQUIRE_EQ(rc, RAD_OK);
+    CHECK_EQ(g_iqr_planes, 5);                  /* scale and scale.col completed at 1 */
+    CHECK(!g_iqr_transform);                    /* the activation's rotation is not applied */
+    REQUIRE_EQ(out.size(), (size_t)(R * C * 4));
+    CHECK_EQ(((const float*)out.data())[0], 7.0f);
+}
+
+/* The reference reads the IQR scale view as its product per (row, 128 of K), the grid the grouped
+ * GEMMs describe; the core's scale chain expects the finer level to cover whole first-level
+ * blocks and refuses this one. */
+TEST(the_reference_reads_an_iqr_scale_as_the_row_and_block_product) {
+    const int64_t R = 16, C = 256, G = C / 128;
+    const RadEncoding e = iqr_encoding();
+    REQUIRE(rad_enc_valid(&e));
+    const KfOperand d = iqr_view(e, { "scale", "scale.col" }, RAD_BF16, R, C);
+    KfOperand ds = d;
+    ds.shape = { R, G };
+    REQUIRE_EQ(d.sel.size(), (size_t)2);
+    REQUIRE_EQ(d.sel_rows[0], R);
+    REQUIRE_EQ(d.sel_cols[0], (int64_t)1);
+    REQUIRE_EQ(d.sel_rows[1], (int64_t)1);
+    REQUIRE_EQ(d.sel_cols[1], G);
+    std::vector<std::vector<uint8_t>> pl;
+    kf_draw_planes(ds, 9, &pl);
+    REQUIRE_EQ(pl.size(), (size_t)2);
+    std::vector<uint8_t> out;
+    std::string why;
+    REQUIRE_EQ(kf_planes_logical(ds, pl, &out, &why), RAD_OK);
+    REQUIRE_EQ(out.size(), (size_t)(R * G * 2));
+    for (int64_t r = 0; r < R; ++r)
+        for (int64_t g = 0; g < G; ++g) {
+            const float want = rad_load_f32(pl[0].data(), RAD_F32, r) *
+                               rad_load_f32(pl[1].data(), RAD_F32, g);
+            uint8_t one[4];
+            rad_store_f32(one, RAD_BF16, 0, want);
+            CHECK_EQ(rad_load_f32(out.data(), RAD_BF16, r * G + g),
+                     rad_load_f32(one, RAD_BF16, 0));
+        }
+}
+
 namespace {
 
 int lay_identity(const RadParam*, int, int, const RadEncoding*, const int*, const RadTensor*, int,
@@ -1289,6 +1411,33 @@ TEST(a_weight_tables_experts_are_each_laid_out_by_the_kernel) {
         return (int)RAD_OK;
     };
     CHECK_EQ(kf_lay_table(&ki, nullptr, 0, 2, codes, drawn, &lay, &out), RAD_E_SHAPE);
+}
+
+/* The engine hands a kernel one pointer an expert; each points at that expert's own laid-out
+ * entry. kf_lay_entries makes that form, and every entry has the same size and dtype. */
+TEST(a_weight_tables_experts_are_laid_out_one_entry_each) {
+    KfOperand codes = fp8_weight(128, 256, { "codes" });
+    codes.role = RAD_OPD_WTAB;
+    codes.shape.insert(codes.shape.begin(), 3);
+    const KfEntryPlanes drawn = [&](int64_t e, std::vector<std::vector<uint8_t>>* pl) {
+        kf_draw_entry_planes(codes, 2, e, pl);
+        return (int)RAD_OK;
+    };
+    RadKernelInfo ki{};
+    ki.layout = lay_reverse;
+    ki.relayout = relay_reverse;
+    RadLayout lay{};
+    std::vector<std::vector<uint8_t>> entries;
+    REQUIRE_EQ(kf_lay_entries(&ki, nullptr, 0, 2, codes, drawn, &lay, &entries), RAD_OK);
+    const size_t per = (size_t)128 * 256;
+    REQUIRE_EQ(entries.size(), (size_t)3);
+    CHECK_EQ(lay.bytes, (int64_t)per);
+    std::vector<std::vector<uint8_t>> pl;
+    for (int64_t e = 0; e < 3; ++e) {
+        REQUIRE_EQ(entries[(size_t)e].size(), per);
+        kf_draw_entry_planes(codes, 2, e, &pl);
+        CHECK(std::equal(entries[(size_t)e].begin(), entries[(size_t)e].end(), pl[0].rbegin()));
+    }
 }
 
 /* ================================================================== routing */

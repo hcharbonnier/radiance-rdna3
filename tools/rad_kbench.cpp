@@ -781,7 +781,7 @@ bool guarded_alloc(DevBuf& d, int64_t bytes, RadStream stream) {
 void check_margins(const std::vector<DevBuf>& dev, const DevBuf& scratch,
                    const RadOpSchema* schema, const std::string& op, const std::string& who,
                    const Geometry& g, RadStream stream, std::map<std::string, int>* overruns,
-                   Stats* st) {
+                   Stats* st, const std::vector<DevBuf>* extra = nullptr) {
     auto check = [&](const DevBuf& d, const std::string& what) {
         if (!d.on) return;
         uint8_t lo[RED_BYTES], hi[RED_BYTES];
@@ -802,6 +802,11 @@ void check_margins(const std::vector<DevBuf>& dev, const DevBuf& scratch,
     for (size_t k = 0; k < dev.size(); ++k)
         check(dev[k], std::string("operand '") +
                       (schema->operands[k].name ? schema->operands[k].name : "?") + "'");
+    if (extra)
+        for (size_t k = 0; k < extra->size(); ++k)
+            check((*extra)[k], std::string("the pointer table of operand '") +
+                                   (schema->operands[k].name ? schema->operands[k].name : "?") +
+                                   "'");
     check(scratch, "its own scratch");
     ++st->guarded;
 }
@@ -824,6 +829,65 @@ RadTensor host_tensor(const KfOperand& d, const void* data) {
     for (size_t i = 0; i < d.shape.size() && i < RAD_MAX_RANK; ++i) x.shape[i] = d.shape[i];
     rad_tensor_pack(&x);
     return x;
+}
+
+/* The operand's selected planes from container entry `e`, each checked against the extent the
+ * declaration reads. False with a description when a plane is not the size the view needs. */
+static bool read_operand_planes(const RadFile& f, const RadFileEntry& e, const KfOperand& d,
+                                std::vector<std::vector<uint8_t>>* pl, std::string* why) {
+    pl->clear();
+    for (size_t j = 0; j < d.sel.size(); ++j) {
+        const RadEncPlane& p = d.enc.plane[d.sel[(size_t)j]];
+        const RadFilePlane& fp = f.plane(e, d.sel[(size_t)j]);
+        const int64_t want = d.sel_rows[j] * rad_enc_row_bytes(p.dtype, d.sel_cols[j]);
+        if ((int64_t)fp.bytes != want) {
+            *why = fmt("plane '%s' holds %lld bytes and the declaration reads %lld", p.role,
+                       (long long)fp.bytes, (long long)want);
+            return false;
+        }
+        const uint8_t* src = f.data(fp);
+        pl->emplace_back(src, src + fp.bytes);
+    }
+    return true;
+}
+
+/* A weight table as the engine hands it to a kernel: a host array of one pointer an expert, each
+ * pointing at that expert's laid-out entry in one allocation. `desc` describes the operand
+ * (stride[0] == 0 marks the pointer form); `stride` is the byte offset between entries. */
+struct TablePointers {
+    bool               active = false;
+    int64_t            stride = 0;
+    std::vector<void*> host;
+    RadTensor          desc{};
+};
+
+/* Lay every entry of `d` out and pack them, pointers included. RAD_E_UNSUPPORTED: the row reads
+ * the table as decoded; another refusal with `why`. */
+static int layout_table_pointers(const RadKernelInfo* info, const RadParam* p, int n_p,
+                                 int operand, const KfOperand& d, const KfEntryPlanes& planes,
+                                 std::vector<uint8_t>* slab, TablePointers* tp,
+                                 std::string* why) {
+    RadLayout lay{};
+    std::vector<std::vector<uint8_t>> entries;
+    const int rc = kf_lay_entries(info, p, n_p, operand, d, planes, &lay, &entries);
+    if (rc != RAD_OK) {
+        if (rc != RAD_E_UNSUPPORTED) *why = rad_strerror(rc);
+        return rc;
+    }
+    const int64_t align = lay.align > 0 ? lay.align : 1;
+    const int64_t stride = (lay.bytes + align - 1) / align * align;
+    slab->assign((size_t)(stride * d.shape[0]), 0);
+    tp->host.resize((size_t)d.shape[0]);
+    for (int64_t e = 0; e < d.shape[0]; ++e) {
+        std::memcpy(slab->data() + stride * e, entries[(size_t)e].data(),
+                    entries[(size_t)e].size());
+        tp->host[(size_t)e] = slab->data() + stride * e;
+    }
+    kf_describe_laid(d, lay, nullptr, &tp->desc);
+    tp->desc.stride[0] = 0;
+    tp->stride = stride;
+    tp->active = true;
+    return RAD_OK;
 }
 
 /* The library the others are checked against: the one --ref names (it must be loaded, see
@@ -984,7 +1048,7 @@ private:
     bool lay_out(const KfCase& c, size_t k, const RadOpSchema* schema, const Run& run,
                  const Drawn& d, Bytes* laid, RadTensor* desc);
     bool lay_out_table(const KfCase& c, size_t k, const RadOpSchema* schema, const Run& run,
-                       Bytes* laid, RadTensor* desc);
+                       Bytes* laid, RadTensor* desc, TablePointers* tp);
     int  record_case(const KfCase& base, KfCase* out, std::string* why);
     int  rerecord();
     int  record_rows();
@@ -1411,30 +1475,31 @@ bool Replay::lay_out(const KfCase& c, size_t k, const RadOpSchema* schema, const
 }
 
 /* The same for a weight table whose kernel lays out each expert: the experts' planes as the draw
- * made them (kf_draw_entry_planes), each laid out, stacked. `laid` empty: the row reads the table
- * as decoded. */
+ * made them (kf_draw_entry_planes), each laid out, and the pointer table the engine hands a
+ * kernel. `laid` empty: the row reads the table as decoded. */
 bool Replay::lay_out_table(const KfCase& c, size_t k, const RadOpSchema* schema, const Run& run,
-                           Bytes* laid, RadTensor* desc) {
+                           Bytes* laid, RadTensor* desc, TablePointers* tp) {
     PhaseTimer pt(&ph_, kb::PH_LAYOUT);
     laid->clear();
+    *tp = TablePointers{};
     const KfOperand& d = c.opd[k];
     if (!d.has_enc || d.undrawn) return true;
-    RadLayout lay{};
-    const int lrc = kf_lay_table(run.row->info, run.g.params(), run.g.n_params(), (int)k, d,
-                                 [&](int64_t e, std::vector<Bytes>* pl) {
-                                     kf_draw_entry_planes(d, k, e, pl);
-                                     return (int)RAD_OK;
-                                 },
-                                 &lay, laid);
-    if (lrc == RAD_E_UNSUPPORTED) { laid->clear(); return true; }
+    std::string why;
+    const int lrc = layout_table_pointers(
+        run.row->info, run.g.params(), run.g.n_params(), (int)k, d,
+        [&](int64_t e, std::vector<Bytes>* pl) {
+            kf_draw_entry_planes(d, k, e, pl);
+            return (int)RAD_OK;
+        },
+        laid, tp, &why);
+    if (lrc == RAD_E_UNSUPPORTED) { laid->clear(); *tp = TablePointers{}; return true; }
     if (lrc < 0) {
         const char* opd_name = schema->operands[k].name ? schema->operands[k].name : "?";
         nm_.skipped[c.op + "  (" + run.lib + "/" + run.row->info->name + " cannot lay out the " +
-                    "table '" + opd_name + "' from " + enc_name(d.enc) + ": " +
-                    rad_strerror(lrc) + ")"]++;
+                    "table '" + opd_name + "' from " + enc_name(d.enc) + ": " + why + ")"]++;
         return false;
     }
-    kf_describe_laid(d, lay, laid->data(), desc);
+    *desc = tp->desc;
     return true;
 }
 
@@ -1472,7 +1537,9 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
 
     std::vector<Bytes> own(n_opd);           /* written operands; laid weights */
     std::vector<RadTensor> t(n_opd);
+    std::vector<TablePointers> tabs(n_opd);
     std::vector<DevBuf> dev(n_opd);
+    std::vector<DevBuf> tabhead(n_opd);
     DevBuf scr;
     RadStream stream = nullptr;
     std::vector<uint8_t> host_scratch;
@@ -1484,6 +1551,7 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
     auto release = [&]() {
         if (stream) (void)rad_stream_sync(stream);
         for (auto& d : dev) if (d.base && d.owned) rad_dev_free(d.base, RAD_MEM_DEVICE);
+        for (auto& d : tabhead) if (d.base && d.owned) rad_dev_free(d.base, RAD_MEM_DEVICE);
         if (scr.base) rad_dev_free(scr.base, RAD_MEM_DEVICE);
     };
 
@@ -1537,7 +1605,7 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
                 }
                 Bytes laid;
                 if (c.opd[k].role == RAD_OPD_WTAB &&
-                    !lay_out_table(c, k, schema, run, &laid, &t[k])) {
+                    !lay_out_table(c, k, schema, run, &laid, &t[k], &tabs[k])) {
                     ++st_.skipped; release(); return;
                 }
                 const Bytes& up = laid.empty() ? src : laid;
@@ -1550,6 +1618,16 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
                     ++st_.skipped; release(); return;
                 }
                 t[k].data = dev[k].p;
+                if (tabs[k].active) {
+                    std::vector<void*> ptrs(tabs[k].host.size());
+                    for (size_t e = 0; e < ptrs.size(); ++e)
+                        ptrs[e] = (uint8_t*)dev[k].p + (int64_t)e * tabs[k].stride;
+                    if (!guarded_alloc(tabhead[k], (int64_t)(ptrs.size() * sizeof(void*)), stream) ||
+                        rad_memcpy_async(tabhead[k].p, ptrs.data(), tabhead[k].bytes, stream) < 0) {
+                        ++st_.skipped; release(); return;
+                    }
+                    t[k].data = tabhead[k].p;
+                }
             }
             if (rad_stream_sync(stream) < 0) { ++st_.skipped; release(); return; }
         } else {
@@ -1560,9 +1638,14 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
                     Bytes laid;
                     const bool ok = c.opd[k].role == RAD_OPD_WEIGHT
                                         ? lay_out(c, k, schema, run, in[k], &laid, &t[k])
-                                        : lay_out_table(c, k, schema, run, &laid, &t[k]);
+                                        : lay_out_table(c, k, schema, run, &laid, &t[k],
+                                                        &tabs[k]);
                     if (!ok) { ++st_.skipped; return; }
-                    if (!laid.empty()) { own[k].swap(laid); t[k].data = own[k].data(); }
+                    if (!laid.empty()) {
+                        own[k].swap(laid);
+                        t[k].data = tabs[k].active ? (void*)tabs[k].host.data()
+                                                   : (void*)own[k].data();
+                    }
                     continue;
                 }
                 if (written(k)) {
@@ -1630,7 +1713,7 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
             }
             rad_stream_sync(stream);
             check_margins(dev, scr, schema, c.op, lib + "/" + row->info->name, g, stream,
-                          &nm_.overruns, &st_);
+                          &nm_.overruns, &st_, &tabhead);
         }
         /* A host kernel was handed the shared inputs; one that changed any of them is wrong, and
          * would hand every later library a different case. */
@@ -1770,6 +1853,13 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
                 d.bytes = dom == RAD_DOMAIN_DEVICE ? dev[k].bytes
                                                    : (int64_t)(own[k].empty() ? in[k].bytes->size()
                                                                               : own[k].size());
+                if (tabs[k].active) {
+                    d.bytes = (int64_t)(tabs[k].host.size() * sizeof(void*));
+                    d.slab = dom == RAD_DOMAIN_DEVICE ? dev[k].p : own[k].data();
+                    d.slab_bytes = dom == RAD_DOMAIN_DEVICE ? dev[k].bytes
+                                                            : (int64_t)own[k].size();
+                    d.entry_stride = tabs[k].stride;
+                }
                 if (d.role == RAD_OPD_INOUT) d.pristine = in[k].bytes->data();
                 if (d.role == RAD_OPD_IN)
                     kb::timing_input(c.opd[k], g, kf_operand_seed(c.seed, (int)k) ^ kTimingSalt,
@@ -1781,6 +1871,12 @@ void Replay::run_one(size_t fi, const KfCase& c, const RadOpSchema* schema,
             tc.scratch = scr.p;
             tc.scratch_bytes = scr.bytes;
             for (DevBuf& d : dev) {
+                if (!d.base || !d.owned) continue;
+                tc.frees.push_back(d.base);
+                tc.held += d.bytes + 2 * RED_BYTES;
+                d.owned = false;
+            }
+            for (DevBuf& d : tabhead) {
                 if (!d.base || !d.owned) continue;
                 tc.frees.push_back(d.base);
                 tc.held += d.bytes + 2 * RED_BYTES;
@@ -2832,6 +2928,18 @@ int main(int argc, char** argv) {
                 int shst = oracle ? rad_operand_shapes_hook(oracle->info, hgeom,
                                                             o.schema->n_operands, &sh)
                                   : RAD_E_UNSUPPORTED;
+                /* A reference with an operand description of its own that declines this case
+                 * (libref's gemm_nt_q_gated describes fp8a8 and not i8a8h) does not implement it;
+                 * describing the operands from the device row would hand the reference tensors it
+                 * reads as another scheme. The kernel's description is a fallback only for a
+                 * reference that has none (and no comparison is made in --timing-only). */
+                if (oracle && !ro.timing_only && oracle->info->opd_shape &&
+                    shst == RAD_E_UNSUPPORTED) {
+                    skipped_ops[o.op + "  (" + ref_name + " describes the operands itself and "
+                                "declines this case)"]++;
+                    ++st.skipped;
+                    continue;
+                }
                 if (shst < 0)
                     shst = rad_operand_shapes_hook(r.row->info, hgeom, o.schema->n_operands, &sh);
                 if (shst < 0)
@@ -2942,6 +3050,7 @@ int main(int argc, char** argv) {
 
                 std::vector<std::vector<uint8_t>> bufs(sh.size()), ref_out(sh.size());
                 std::vector<RadTensor> t_test(sh.size()), t_ref(sh.size());
+                std::vector<TablePointers> tabs(sh.size());
                 int wk = 0;
                 bool from_container = false, unusable = false;
                 PhaseTimer draw_t(&ph, kb::PH_DRAW);
@@ -3000,32 +3109,18 @@ int main(int argc, char** argv) {
                         kf_operand_enc(*wi, &kop[k]);
                         const RadFileEntry* e = recording ? nullptr : f.find(wi->source);
                         std::vector<std::vector<uint8_t>> pl;
+                        std::string why;
                         if (!e) {
                             kf_draw_planes(kop[k], kf_weight_seed(kop[k], k), &pl);
                         } else {
                             /* One rank of one: each selected plane is the whole plane. */
-                            for (int j = 0; j < wi->n_sel; ++j) {
-                                const RadFilePlane& fp = f.plane(*e, wi->sel[j]);
-                                const int64_t want =
-                                    wi->sel_rows[j] *
-                                    rad_enc_row_bytes(wi->enc.plane[wi->sel[j]].dtype,
-                                                      wi->sel_cols[j]);
-                                if ((int64_t)fp.bytes != want) {
-                                    skipped_ops[o.op + "  ('" + wi->source + "' plane '" +
-                                                wi->enc.plane[wi->sel[j]].role + "' holds " +
-                                                std::to_string(fp.bytes) + " bytes and the "
-                                                "declaration reads " + std::to_string(want) +
-                                                ")"]++;
-                                    unusable = true;
-                                    break;
-                                }
-                                const uint8_t* src = (const uint8_t*)f.data(fp);
-                                pl.emplace_back(src, src + fp.bytes);
+                            if (!read_operand_planes(f, *e, kop[k], &pl, &why)) {
+                                skipped_ops[o.op + "  ('" + wi->source + "' " + why + ")"]++;
+                                unusable = true;
+                                break;
                             }
-                            if (unusable) break;
                             from_container = true;
                         }
-                        std::string why;
                         if (kf_planes_logical(kop[k], pl, &ref_out[k], &why) != RAD_OK) {
                             skipped_ops[o.op + "  ('" + wi->source + "' as " +
                                         enc_name(wi->enc) + " does not make the operand '" +
@@ -3069,21 +3164,22 @@ int main(int argc, char** argv) {
                                     (int64_t)run.size() == kop[k].shape[0];
                         const int64_t per = read ? rad_dtype_bytes(kop[k].dtype, n / kop[k].shape[0])
                                                  : 0;
+                        /* Every expert has the same selection; the reference reads the logical
+                         * table from it. */
+                        KfOperand entry = kf_table_entry(kop[k]);
                         for (size_t e = 0; read && e < run.size(); ++e) {
                             const WeightInfo* wi = run[e] ? &prog.weights[run[e]] : nullptr;
                             const RadFileEntry* fe = wi ? f.find(wi->source) : nullptr;
                             if (!fe) { read = false; break; }
-                            std::vector<std::vector<uint8_t>> pl;
-                            for (int j = 0; j < wi->n_sel && read; ++j) {
-                                const RadFilePlane& fp = f.plane(*fe, wi->sel[j]);
-                                const uint8_t* src = (const uint8_t*)f.data(fp);
-                                pl.emplace_back(src, src + fp.bytes);
-                            }
-                            KfOperand one = kop[k];
+                            KfOperand one = entry;
                             kf_operand_enc(*wi, &one);
-                            one.shape.assign(kop[k].shape.begin() + 1, kop[k].shape.end());
-                            std::vector<uint8_t> logical;
+                            std::vector<std::vector<uint8_t>> pl;
                             std::string why;
+                            if (!read_operand_planes(f, *fe, one, &pl, &why)) {
+                                read = false;
+                                break;
+                            }
+                            std::vector<uint8_t> logical;
                             if (kf_planes_logical(one, pl, &logical, &why) != RAD_OK ||
                                 (int64_t)logical.size() != per) {
                                 read = false;
@@ -3094,12 +3190,13 @@ int main(int argc, char** argv) {
                         }
                         if (read) from_container = true;
                         else kf_draw(kop, k, M, kf_vocab_rows(kop), 0, &bufs[k]);
-                        /* A kernel that lays its experts out (libr4d's 4-bit ones) reads each
-                         * expert's arrangement of the same planes, stacked; the oracle reads the
-                         * table they decode to. */
+                        /* A kernel that lays its experts out reads each expert's arrangement of
+                         * the same planes through the engine's pointer table (stride[0] == 0):
+                         * one entry an expert. The oracle reads the table they decode to. */
                         if (kop[k].has_enc && !kop[k].undrawn) {
                             const char* opd_name = o.schema->operands[k].name
                                                        ? o.schema->operands[k].name : "?";
+                            std::string plane_why;
                             auto planes = [&](int64_t e, std::vector<std::vector<uint8_t>>* pl) {
                                 if (!read) {
                                     kf_draw_entry_planes(kop[k], k, e, pl);
@@ -3108,30 +3205,32 @@ int main(int argc, char** argv) {
                                 const WeightInfo& wi = prog.weights[run[(size_t)e]];
                                 const RadFileEntry* fe = f.find(wi.source);
                                 if (!fe) return (int)RAD_E_NOTFOUND;
-                                pl->clear();
-                                for (int j = 0; j < wi.n_sel; ++j) {
-                                    const RadFilePlane& fp = f.plane(*fe, wi.sel[j]);
-                                    const uint8_t* src = (const uint8_t*)f.data(fp);
-                                    pl->emplace_back(src, src + fp.bytes);
-                                }
+                                KfOperand one = entry;
+                                kf_operand_enc(wi, &one);
+                                if (!read_operand_planes(f, *fe, one, pl, &plane_why))
+                                    return (int)RAD_E_SHAPE;
                                 return (int)RAD_OK;
                             };
-                            RadLayout lay{};
                             std::vector<uint8_t> laid;
-                            const int lrc = kf_lay_table(r.row->info, g.params(), g.n_params(),
-                                                         (int)k, kop[k], planes, &lay, &laid);
+                            TablePointers tp;
+                            std::string lwhat;
+                            const int lrc = layout_table_pointers(
+                                r.row->info, g.params(), g.n_params(), (int)k, kop[k], planes,
+                                &laid, &tp, &lwhat);
                             if (lrc == RAD_OK) {
                                 ref_out[k] = bufs[k];
                                 t_ref[k] = mk(ref_out[k]);
                                 bufs[k].swap(laid);
-                                kf_describe_laid(kop[k], lay, bufs[k].data(), &t_test[k]);
+                                tabs[k] = std::move(tp);
+                                t_test[k] = tabs[k].desc;
+                                t_test[k].data = tabs[k].host.data();
                                 continue;
                             }
                             if (lrc != RAD_E_UNSUPPORTED) {
                                 skipped_ops[o.op + "  (" + std::string(r.row->info->name) +
                                             " cannot lay out the table '" + opd_name +
-                                            "' from " +
-                                            enc_name(kop[k].enc) + ": " + rad_strerror(lrc) +
+                                            "' from " + enc_name(kop[k].enc) + ": " + lwhat +
+                                            (plane_why.empty() ? "" : " (" + plane_why + ")") +
                                             ")"]++;
                                 unusable = true;
                                 break;
@@ -3170,6 +3269,7 @@ int main(int argc, char** argv) {
                  * the comparison reads. Both sides see identical input bytes. */
                 /* Every device allocation is guarded (see "red zones"). */
                 std::vector<DevBuf> dev(sh.size());
+                std::vector<DevBuf> tabhead(sh.size());
                 DevBuf dev_scratch;
                 RadStream stream = nullptr;
                 bool dev_ok = true;
@@ -3183,6 +3283,20 @@ int main(int argc, char** argv) {
                         if (rad_memcpy_async(dev[k].p, bufs[k].data(), dev[k].bytes, stream) < 0)
                             dev_ok = false;
                         t_test[k].data = dev[k].p;
+                        if (tabs[k].active) {
+                            /* The table operand is a device array of pointers into the slab, as
+                             * the engine hands it (stride[0] == 0). */
+                            std::vector<void*> ptrs(tabs[k].host.size());
+                            for (size_t e = 0; e < ptrs.size(); ++e)
+                                ptrs[e] = (uint8_t*)dev[k].p + (int64_t)e * tabs[k].stride;
+                            if (!guarded_alloc(tabhead[k],
+                                               (int64_t)(ptrs.size() * sizeof(void*)), stream) ||
+                                rad_memcpy_async(tabhead[k].p, ptrs.data(),
+                                                 tabhead[k].bytes, stream) < 0) {
+                                dev_ok = false; break;
+                            }
+                            t_test[k].data = tabhead[k].p;
+                        }
                     }
                     if (dev_ok && rad_stream_sync(stream) < 0) dev_ok = false;
                 }
@@ -3204,6 +3318,8 @@ int main(int argc, char** argv) {
                 auto dev_release = [&]() {
                     if (stream) (void)rad_stream_sync(stream);
                     for (auto& d : dev) if (d.base && d.owned) rad_dev_free(d.base, RAD_MEM_DEVICE);
+                    for (auto& d : tabhead)
+                        if (d.base && d.owned) rad_dev_free(d.base, RAD_MEM_DEVICE);
                     if (dev_scratch.base) rad_dev_free(dev_scratch.base, RAD_MEM_DEVICE);
                 };
 
@@ -3265,7 +3381,14 @@ int main(int argc, char** argv) {
                     ph.launch_by_lib[r.row->plugin] += sec;
                 }
                 if (record_only)
-                    for (size_t k = 0; k < sh.size(); ++k) bufs[k] = ref_out[k];
+                    for (size_t k = 0; k < sh.size(); ++k) {
+                        bufs[k] = ref_out[k];
+                        /* The reference reads the decoded operand; a table laid out for the
+                         * device row (or its pointer array) would point into the replaced
+                         * buffer. */
+                        tabs[k] = TablePointers{};
+                        t_test[k] = t_ref[k];
+                    }
 
                 /* Copy the checked outputs back before timing: in-place ops (`rope`,
                  * `gdn_conv_update`) would otherwise be applied once per timed launch and fail
@@ -3284,7 +3407,7 @@ int main(int argc, char** argv) {
                  * checked launch. */
                 if (dom == RAD_DOMAIN_DEVICE && s_test >= 0 && !timing_only && !record_only)
                     check_margins(dev, dev_scratch, o.schema, o.op, r.row->info->name, g, stream,
-                                  &overruns, &st);
+                                  &overruns, &st, &tabhead);
 
                 /* ================================================== the fusion oracle
                  *
@@ -3527,6 +3650,12 @@ int main(int argc, char** argv) {
                         if (!sh[k].absent && t_test[k].data) {
                             d.bytes = dom == RAD_DOMAIN_DEVICE ? dev[k].bytes
                                                                : (int64_t)bufs[k].size();
+                            if (tabs[k].active) {
+                                d.bytes = (int64_t)(tabs[k].host.size() * sizeof(void*));
+                                d.slab = dom == RAD_DOMAIN_DEVICE ? dev[k].p : bufs[k].data();
+                                d.slab_bytes = (int64_t)bufs[k].size();
+                                d.entry_stride = tabs[k].stride;
+                            }
                             if (d.role == RAD_OPD_INOUT && k < inout0.size() && !inout0[k].empty())
                                 d.pristine = inout0[k].data();
                             if (d.role == RAD_OPD_IN)
@@ -3540,6 +3669,12 @@ int main(int argc, char** argv) {
                         tc.scratch = dev_scratch.p;
                         tc.scratch_bytes = dev_scratch.bytes;
                         for (DevBuf& d : dev) {
+                            if (!d.base || !d.owned) continue;
+                            tc.frees.push_back(d.base);
+                            tc.held += d.bytes + 2 * RED_BYTES;
+                            d.owned = false;
+                        }
+                        for (DevBuf& d : tabhead) {
                             if (!d.base || !d.owned) continue;
                             tc.frees.push_back(d.base);
                             tc.held += d.bytes + 2 * RED_BYTES;
@@ -3577,7 +3712,10 @@ int main(int argc, char** argv) {
                  * is domain-independent. */
                 if (dom == RAD_DOMAIN_DEVICE && s_test >= 0 && !record_only)
                     for (size_t k = 0; k < sh.size(); ++k)
-                        if (dev[k].p) t_test[k].data = bufs[k].data();
+                        if (dev[k].p)
+                            t_test[k].data = tabs[k].active
+                                                 ? (void*)tabs[k].host.data()
+                                                 : (void*)bufs[k].data();
                 dev_release();
 
                 /* A fusion-only case has no reference; the chain comparison was its verdict. */

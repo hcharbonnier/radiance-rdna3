@@ -110,7 +110,8 @@ RadArgs args_of(const TimedCase& c, std::vector<RadTensor>& t) {
 
 /* Which operands rotate and how, shared by the device and host halves. */
 struct RotPlan {
-    std::vector<size_t> ops;      /* operand indices */
+    std::vector<size_t> ops;      /* operand indices, one buffer each */
+    std::vector<size_t> tables;   /* pointer-array tables: their slab rotates, heads regenerate */
     int64_t R = 1;                /* copies */
 };
 
@@ -121,11 +122,17 @@ RotPlan plan_rotation(const TimedCase& c, int64_t footprint) {
     int64_t per = 0;
     for (size_t k = 0; k < c.opd.size(); ++k) {
         const TimedOperand& d = c.opd[k];
-        if (!d.t.data || d.bytes <= 0 || !rotated(d.role, d.bytes, big)) continue;
-        p.ops.push_back(k);
-        per += rotation_stride(d.bytes);
+        const bool ptr = d.role == RAD_OPD_WTAB && d.t.stride[0] == 0 && d.slab &&
+                         d.slab_bytes > 0 && d.entry_stride > 0;
+        const int64_t span = ptr ? d.slab_bytes : d.bytes;
+        if (!d.t.data || span <= 0 || !rotated(d.role, span, big)) continue;
+        if (ptr)
+            p.tables.push_back(k);
+        else
+            p.ops.push_back(k);
+        per += rotation_stride(span);
     }
-    if (!p.ops.empty()) p.R = rotation_copies(per, footprint);
+    if (!p.ops.empty() || !p.tables.empty()) p.R = rotation_copies(per, footprint);
     return p;
 }
 
@@ -563,6 +570,46 @@ bool DeviceTimer::prepare(Held& h, Prepared* p, std::string* why) {
             p->rot.push_back({ k, arena, stride });
         }
     }
+    for (size_t k : plan.tables) {
+        const TimedOperand& d = c.opd[k];
+        if (p->R <= 1) continue;          /* the original head already names the slab */
+        const int64_t span = d.slab_bytes;
+        const int64_t stride = rotation_stride(span);
+        const uint8_t* base = (const uint8_t*)d.slab;
+        uint8_t* arena = (uint8_t*)rad_dev_alloc(p->R * stride, RAD_MEM_DEVICE);
+        if (!arena) {
+            *why = "no device memory for " + std::to_string(p->R) + " rotated copies of " +
+                   humanb(span);
+            return false;
+        }
+        p->frees.push_back(arena);
+        int rc = rad_memcpy_async(arena, base, span, s_);
+        for (int64_t have = 1; have < p->R && rc >= 0; have *= 2)
+            rc = rad_memcpy_async(arena + have * stride, arena,
+                                  std::min(have, p->R - have) * stride, s_);
+        if (rc < 0) { *why = "the rotated copies could not be written"; return false; }
+        const int64_t n = d.t.shape[0], entry = d.entry_stride;
+        const int64_t count = table_count(p->R);
+        std::vector<uint64_t> bases;
+        for (int64_t r = 0; r < p->R; ++r)
+            bases.push_back((uint64_t)(uintptr_t)(arena + r * stride));
+        std::vector<uint64_t> ptr;
+        ptr.reserve((size_t)(count * n));
+        for (int64_t l = 0; l < count; ++l) table_pointers(bases, n, entry, c.seed, l, &ptr);
+        uint8_t* tables = (uint8_t*)rad_dev_alloc(count * n * 8, RAD_MEM_DEVICE);
+        if (!tables) {
+            *why = "no device memory for the weight table's pointer tables";
+            return false;
+        }
+        p->frees.push_back(tables);
+        if (rad_memcpy_async(tables, ptr.data(), count * n * 8, s_) < 0 ||
+            rad_stream_sync(s_) < 0) {
+            *why = "the pointer tables could not be written";
+            return false;
+        }
+        p->t[k].stride[0] = 0;
+        p->tab.push_back({ k, tables, n, count });
+    }
     if (rad_stream_sync(s_) < 0) { *why = std::string("setup failed: ") + rad_dev_last_error(); return false; }
     return true;
 }
@@ -835,6 +882,36 @@ Timing time_host(const TimedCase& c, const TimerOpts& o, int64_t footprint, doub
         } else if (arena) {
             rot.push_back({ k, arena, stride });
         }
+    }
+    for (size_t k : plan.tables) {
+        const TimedOperand& d = sized.opd[k];
+        if (plan.R <= 1) continue;          /* the original head already names the slab */
+        const int64_t span = d.slab_bytes;
+        const int64_t stride = rotation_stride(span);
+        const uint8_t* base = (const uint8_t*)d.slab;
+        const size_t alloc = (size_t)((plan.R * stride + 4095) & ~(int64_t)4095);
+        uint8_t* arena = (uint8_t*)std::aligned_alloc(4096, alloc);
+        if (!arena) {
+            out.note = "no memory for " + std::to_string(plan.R) + " rotated copies of " +
+                       humanb(span);
+            return out;
+        }
+        owned.p.push_back(arena);
+        std::memcpy(arena, base, (size_t)span);
+        for (int64_t have = 1; have < plan.R; have *= 2)
+            std::memcpy(arena + have * stride, arena,
+                        (size_t)(std::min(have, plan.R - have) * stride));
+        Tab b;
+        b.k = k;
+        b.n = d.t.shape[0];
+        b.count = table_count(plan.R);
+        std::vector<uint64_t> bases;
+        for (int64_t r = 0; r < plan.R; ++r)
+            bases.push_back((uint64_t)(uintptr_t)(arena + r * stride));
+        for (int64_t l = 0; l < b.count; ++l)
+            table_pointers(bases, b.n, d.entry_stride, c.seed, l, &b.ptr);
+        t[k].stride[0] = 0;
+        tab.push_back(std::move(b));
     }
 
     int64_t next = 0;

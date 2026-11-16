@@ -55,6 +55,12 @@ struct TimedOperand {
     RadTensor t{};                   /* device pointers for a device row */
     int       role = 0;
     int64_t   bytes = 0;             /* the buffer t.data points at */
+    /* A weight table handed as a pointer array (stride[0] == 0): the entries the pointers name,
+     * in one allocation, and the byte step between entries. `bytes` above is the pointer array
+     * itself. 0 for every other operand. */
+    const void* slab = nullptr;
+    int64_t   slab_bytes = 0;
+    int64_t   entry_stride = 0;
     /* An in-place operand's bytes before the checked launch, host memory, read during add() or
      * time_host only. */
     const uint8_t* pristine = nullptr;
