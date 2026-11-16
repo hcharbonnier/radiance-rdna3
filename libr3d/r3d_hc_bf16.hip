@@ -441,6 +441,26 @@ extern "C" int r3d_rad_layout_hc_mix(const RadParam* p, int n_p, int operand,
                                      const RadEncoding* enc, const int* sel, const RadTensor* pl,
                                      int n, RadLayout* out) {
     if (operand != 2 && operand != 3) return RAD_E_UNSUPPORTED;
+    if (r3d_trace_on()) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            std::fprintf(stderr, "[r3d] layout hc mix operand=%d n=%d np=%d scheme=%s", operand, n,
+                         enc ? enc->n_planes : -1, enc ? enc->scheme : "(none)");
+            for (int i = 0; i < (enc ? enc->n_planes : 0); ++i)
+                std::fprintf(stderr, " p%d=%s/%u/k%u/b%lld,%lld", i, enc->plane[i].role,
+                             enc->plane[i].dtype, enc->plane[i].kind,
+                             (long long)enc->plane[i].block[0], (long long)enc->plane[i].block[1]);
+            std::fprintf(stderr, " sel=[%d,%d]", sel ? sel[0] : -9, sel ? sel[1] : -9);
+            if (pl) for (int i = 0; i < 2; ++i)
+                std::fprintf(stderr, " pl%d=[%lld,%lld]dt%u", i, (long long)pl[i].shape[0],
+                             (long long)pl[i].shape[1], pl[i].dtype);
+            std::fprintf(stderr, " params n=%lld hc=%lld lr=%lld\n",
+                         (long long)rad_param_geti(p, n_p, "n", 0),
+                         (long long)rad_param_geti(p, n_p, "hc", 0),
+                         (long long)rad_param_geti(p, n_p, "lowrank", 0));
+        }
+    }
     HcGeom g;
     if (!hc_mix_geom(p, n_p, operand, enc, sel, pl, n, &g)) return RAD_E_DTYPE;
     const long long stride = ((g.K + 4 * (g.K / g.G)) + 15) / 16 * 16;
@@ -548,10 +568,14 @@ extern "C" int r3d_rad_hc_read(const RadArgs* a, RadStream s) {
     long long down_ld = HN, down_stride = 0, down_G = 0;
     if (mix_e4m3) {
         if (!r3d_is_e4m3(down) || !r3d_is_e4m3(up)) return R3D_NO(RAD_E_DTYPE);
+        /* The core binds a re-laid weight with its declared (logical) shape: the joined row
+         * stride is the kernel's, from n/hc/lowrank, and the load's layout tag holds the bytes to
+         * it. Numel would be the declared codes count, not the joined row, so the geometry test is
+         * the declared mix-matrix extent. */
+        if (!hc_dims(down, lr, HN) || !hc_dims(up, HN, lr)) return R3D_NO(RAD_E_SHAPE);
         if (HN % 128 || lr % 64) return R3D_NO(RAD_E_SHAPE);
         down_G = 128;
         down_stride = (int)(((HN + 4 * (HN / 128)) + 15) / 16 * 16);
-        if (r3d_numel(down) < lr * down_stride) return R3D_NO(RAD_E_SHAPE);
     } else {
         if (!r3d_is_bf16(down) || !r3d_is_bf16(up)) return R3D_NO(RAD_E_DTYPE);
         if (!r3d_contig(down) || !r3d_contig(up)) return R3D_NO(RAD_E_STRIDE);
@@ -563,7 +587,6 @@ extern "C" int r3d_rad_hc_read(const RadArgs* a, RadStream s) {
     if (mix_e4m3) {
         up_G = (int)(lr / 4);
         up_stride = (int)(((lr + 4 * (lr / up_G)) + 15) / 16 * 16);
-        if (r3d_numel(up) < HN * up_stride) return R3D_NO(RAD_E_SHAPE);
     } else {
         long long ur = 0;
         up_ld = (int)r3d_rows_pitch(up, lr, &ur);

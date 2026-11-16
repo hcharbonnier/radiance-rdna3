@@ -116,10 +116,16 @@ int r3d_rad_moe_gather(const RadArgs* a, RadStream s)
     if (ew->dtype != RAD_BF16 && ew->dtype != RAD_F32) return R3D_NO(RAD_E_DTYPE);
     if (sorted->dtype != RAD_I32) return R3D_NO(RAD_E_DTYPE);
 
-    const long long M = r3d_geti_or(a, "M", 0), n = r3d_geti_or(a, "n", 0),
+    const long long bandM = r3d_geti_or(a, "M", 0), n = r3d_geti_or(a, "n", 0),
                     top_k = r3d_geti_or(a, "top_k", 0);
-    if (M <= 0 || n <= 0 || top_k <= 0) return R3D_NO(RAD_E_SHAPE);
+    if (bandM <= 0 || n <= 0 || top_k <= 0) return R3D_NO(RAD_E_SHAPE);
     if (top_k > kGatherSlots) return R3D_NO(RAD_E_SHAPE);   // the LDS-cached form only
+
+    /* `M` is the band's extent; the activation carries the step's rows. Gather only the rows
+     * bound, and read the sorted list with that row count. */
+    long long M = 0, ycols = 0;
+    if (r3d_rows_of(y, &M, &ycols) != RAD_OK || ycols != n) return R3D_NO(RAD_E_SHAPE);
+    if (bandM < M) return R3D_NO(RAD_E_SHAPE);
 
     // Row pitches are the tensors' own strides: a view's rows can be wider than its shape.
     const uint32_t ye_ld = (uint32_t)ye->stride[0];
@@ -170,10 +176,15 @@ int r3d_rad_moe_gather_inv(const RadArgs* a, RadStream s)
     if (ew->dtype != RAD_BF16 && ew->dtype != RAD_F32) return R3D_NO(RAD_E_DTYPE);
     if (inv->dtype != RAD_I32) return R3D_NO(RAD_E_DTYPE);
 
-    const long long M = r3d_geti_or(a, "M", 0), n = r3d_geti_or(a, "n", 0),
+    const long long bandM = r3d_geti_or(a, "M", 0), n = r3d_geti_or(a, "n", 0),
                     top_k = r3d_geti_or(a, "top_k", 0);
-    if (M <= 0 || n <= 0 || top_k <= 0) return R3D_NO(RAD_E_SHAPE);
+    if (bandM <= 0 || n <= 0 || top_k <= 0) return R3D_NO(RAD_E_SHAPE);
     if (top_k > kGatherSlots) return R3D_NO(RAD_E_SHAPE);   // the LDS-cached form only
+
+    /* Same band-versus-step rule as moe_gather: the rows gathered are the output's. */
+    long long M = 0, ycols = 0;
+    if (r3d_rows_of(y, &M, &ycols) != RAD_OK || ycols != n) return R3D_NO(RAD_E_SHAPE);
+    if (bandM < M) return R3D_NO(RAD_E_SHAPE);
 
     // Row pitches are the tensors' own strides: a view's rows can be wider than its shape.
     const uint32_t ye_ld = (uint32_t)ye->stride[0];

@@ -472,8 +472,12 @@ extern "C" int r3d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s)
     long long M = 0, K = 0;
     if (r3d_rows_of(x, &M, &K) != RAD_OK) return R3D_NO(RAD_E_SHAPE);
     if (M < 1 || M > 64) return R3D_NO(RAD_E_SHAPE);
-    /* The selection reads `M` from the parameters; it must be the rows the GEMM will write. */
-    if (r3d_geti_or(a, "M", M) != M) return R3D_NO(RAD_E_SHAPE);
+    /* `M` is the band's geometry, not necessarily this step's rows: a declare binds the band's
+     * upper bound while the activation carries the step's shape. The selection reads `M` and
+     * writes that many rows, so hand it the rows the GEMM will actually write; a band that does
+     * not even cover the step is a shape this row cannot serve. */
+    const long long bandM = r3d_geti_or(a, "M", M);
+    if (bandM < M) return R3D_NO(RAD_E_SHAPE);
     if (r3d_geti_or(a, "K", K) != K) return R3D_NO(RAD_E_SHAPE);
     if (r3d_dim(wr, 0) != ne || r3d_dim(wr, 1) != K) return R3D_NO(RAD_E_SHAPE);
     /* The activation may be a row slice of a wider buffer, so take its pitch as the m16 and tiled
@@ -515,12 +519,26 @@ extern "C" int r3d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s)
     }
 
     /* 3) The selection and the sort, the device row itself; every parameter it reads is a
-     * parameter of this op under the same name. */
+     * parameter of this op under the same name, except `M` which becomes the step's rows. */
     RadTensor t6[6] = { *lg, *ids, *w, *st, *off, *cnt };
+    constexpr int kMaxParams = 32;   /* the schema's nine plus the tuning axes; no heap in a launch */
+    RadParam pc[kMaxParams];
+    int n_pc = 0;
+    if (a->p && a->n_p > 0) {
+        if (a->n_p > kMaxParams) return R3D_NO(RAD_E_UNSUPPORTED);
+        std::memcpy(pc, a->p, (size_t)a->n_p * sizeof(RadParam));
+        n_pc = a->n_p;
+    }
+    bool m_set = false;
+    for (int i = 0; i < n_pc; ++i)
+        if (pc[i].key && !std::strcmp(pc[i].key, "M") && pc[i].kind == RAD_P_INT) {
+            pc[i].ival = M; m_set = true;
+        }
+    if (!m_set) pc[n_pc++] = RadParam{ "M", RAD_P_INT, (long long)M, 0, nullptr, 0.0 };
     RadArgs fa;
     std::memset(&fa, 0, sizeof fa);
     fa.t = t6; fa.n_t = 6;
-    fa.p = a->p; fa.n_p = a->n_p;
+    fa.p = pc; fa.n_p = n_pc;
     fa.rank = a->rank; fa.world_size = a->world_size;
     return r3d_rad_router_topk_scatter(&fa, s);
 }

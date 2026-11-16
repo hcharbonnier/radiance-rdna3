@@ -408,6 +408,9 @@ extern "C" int r3d_rad_moe_gemm_iqr(const RadArgs* a, RadStream s) {
         return R3D_NO(RAD_E_UNSUPPORTED);
 
     R3dMoeTabs tw;
+    /* The tables travel to the kernel by value, padding included; the engine compares a recorded
+     * launch's argument bytes, so the tail of each R3dTab must not carry this frame's stack. */
+    std::memset(&tw, 0, sizeof tw);
     rc = r3d_moe_q_tabs(c, c.w->dtype, (int)f.bits, c.w_scale->dtype, 32, 1, 1, &tw);
     if (rc != RAD_OK) return rc;
 
