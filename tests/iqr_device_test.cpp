@@ -1133,10 +1133,18 @@ constexpr float kLogitAtol = 5e-3f, kLogitRtol = 2e-4f;
 
 /* `row_counts` defaults to four equal classes; a class's ids keep their own contiguous range, and
  * the output window drops `voff` ids at each end, so the caller can also give the classes unequal
- * row counts (the one launch's empty-block path). */
+ * row counts (the one launch's empty-block path).
+ *
+ * `declared_M`, when non-zero, is the capacity the launch arguments declare while the activation
+ * still carries `M` rows: the engine's condition, where the ranged parameter is the band's upper
+ * bound (max_logit_rows) and the step is narrower. The output buffer is then that much larger and
+ * its rows past `M` are left as NaN: a kernel that writes them has taken the capacity for a row
+ * count and is failed here. */
 bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bits = nullptr,
-               const int64_t* row_counts = nullptr, Kind kind = kTrellisMad) {
+               const int64_t* row_counts = nullptr, Kind kind = kTrellisMad,
+               int64_t declared_M = 0) {
     const int64_t K = 512, voff = 128;
+    const int64_t cap = declared_M > 0 ? declared_M : M;
     int64_t rows[4] = { 256, 256, 256, 256 };
     for (int i = 0; i < 4; ++i)
         if (row_counts) rows[i] = row_counts[i];
@@ -1162,8 +1170,12 @@ bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bit
     void *dx = nullptr, *dl = nullptr, *db[4] = {}, *ds[4] = {}, *di[4] = {};
     hipMalloc(&dx, xb.size() * 2);
     hipMemcpy(dx, xb.data(), xb.size() * 2, hipMemcpyHostToDevice);
-    hipMalloc(&dl, logits.size() * 4);
-    hipMemset(dl, 0, logits.size() * 4);
+    /* The output buffer is declared at its capacity, not at this step's extent (the engine's
+     * buffers are max_logit_rows rows), and its rows past M start as NaN: the kernel must leave
+     * them alone. */
+    const size_t cap_elems = (size_t)(cap * n_vocab);
+    hipMalloc(&dl, cap_elems * 4);
+    hipMemset(dl, 0xFF, cap_elems * 4);
     for (int i = 0; i < 4; ++i) {
         hipMalloc(&db[i], cls[i].b.size());
         hipMalloc(&ds[i], cls[i].s.size());
@@ -1174,7 +1186,7 @@ bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bit
     }
     RadTensor ta{}, tl{}, tw[4]{}, ts[4]{}, ti[4]{}, tv{};
     ta.data = dx; ta.dtype = RAD_BF16; ta.rank = 2; ta.shape[0] = M; ta.shape[1] = K;
-    tl.data = dl; tl.dtype = RAD_F32; tl.rank = 2; tl.shape[0] = M; tl.shape[1] = n_vocab;
+    tl.data = dl; tl.dtype = RAD_F32; tl.rank = 2; tl.shape[0] = cap; tl.shape[1] = n_vocab;
     for (int i = 0; i < 4; ++i) {
         tw[i].data = db[i]; tw[i].dtype = cls[i].L.dtype; tw[i].rank = 2;
         tw[i].shape[0] = rows[i]; tw[i].shape[1] = K;
@@ -1187,7 +1199,7 @@ bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bit
         rad_tensor_pack(p);
     RadTensor ops[15] = { ta, tw[0], ts[0], ti[0], tw[1], ts[1], ti[1], tw[2], ts[2], ti[2],
                           tw[3], ts[3], ti[3], tv, tl };
-    const RadParam params[] = { pint("M", M), pint("n_vocab", n_vocab), pint("n_embd", K),
+    const RadParam params[] = { pint("M", cap), pint("n_vocab", n_vocab), pint("n_embd", K),
                                 pstr("dtype", "bf16"), pint("vocab_offset", voff),
                                 pint("rows0", rows[0]), pint("rows1", rows[1]),
                                 pint("rows2", rows[2]), pint("rows3", rows[3]) };
@@ -1203,7 +1215,18 @@ bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bit
         std::fprintf(stderr, "vocab M=%lld launch rc=%d\n", (long long)M, rc);
         return false;
     }
-    hipMemcpy(logits.data(), dl, logits.size() * 4, hipMemcpyDeviceToHost);
+    std::vector<float> full(cap_elems, 0.0f);
+    hipMemcpy(full.data(), dl, cap_elems * 4, hipMemcpyDeviceToHost);
+    /* Rows past the step: written means the capacity was read as a row count. */
+    for (size_t i = logits.size(); i < full.size(); ++i) {
+        if (full[i] == full[i]) {
+            std::fprintf(stderr, "vocab M=%lld cap=%lld: the launch wrote row %zu of the "
+                                 "capacity, past the step\n",
+                         (long long)M, (long long)cap, i / (size_t)n_vocab);
+            return false;
+        }
+    }
+    std::copy(full.begin(), full.begin() + (ptrdiff_t)logits.size(), logits.begin());
     if (out) *out = logits;
 
     /* The f32 reference's rotated activation comes from the same bf16 values the kernel reads. */
@@ -1411,6 +1434,29 @@ TEST(iqr_vocab_head_matches_its_reference) {
      * classes' blocks past their rows must return without touching the tile or the logits. */
     const int64_t uneven[4] = { 256, 512, 768, 256 };
     CHECK(run_vocab(2, nullptr, nullptr, uneven));
+}
+
+/* A step narrower than the band it runs in: the engine declares the head at max_logit_rows
+ * (max-num-seqs x (1 + speculation)) and issues a decode step of one row inside that band, so the
+ * ranged parameter is a capacity. The row must read the extent from the activation (libr4d's
+ * reference row does: g->M = x->shape[0]) and must not write the capacity's rows. This is the
+ * engine's shape at SEQS > 1 and the one no case in rad-kbench produced, since a case derives its
+ * operands and its parameters from one geometry. */
+TEST(iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band) {
+    if (!lib().ok() || !lib().logits || !lib().logits_scratch) return;
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) return;
+    CHECK(run_vocab(1, nullptr, nullptr, nullptr, kTrellisMad, 4));
+    CHECK(run_vocab(3, nullptr, nullptr, nullptr, kTrellisMad, 4));
+    const uint32_t mixed[4] = { 2, 3, 5, 7 };
+    CHECK(run_vocab(2, nullptr, mixed, nullptr, kTrellisMad, 8));
+    /* One row in a capacity of eight repeats M = 1's answer bit for bit: the band's width may not
+     * change what the step computes. */
+    std::vector<float> one, one_wide;
+    CHECK(run_vocab(1, &one));
+    CHECK(run_vocab(1, &one_wide, nullptr, nullptr, kTrellisMad, 8));
+    CHECK(one.size() == one_wide.size() &&
+          std::memcmp(one.data(), one_wide.data(), one.size() * sizeof(float)) == 0);
 }
 
 /* The head's other form: four classes of the rotated int8 grid (kSigned, 8 bits, bf16 scale).

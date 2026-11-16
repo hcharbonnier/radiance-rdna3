@@ -2246,6 +2246,11 @@ void usage() {
         "                     filter does not change any other case's inputs\n"
         "      --tol X        override every tolerance with X (for bisecting, not for passing)\n"
         "      --max-tok N    the max_tok declare is run at (default 512; small on purpose)\n"
+        "      --band-capacity  issue each case with the ranged parameter at its band's upper\n"
+        "                     bound, as the engine does, while the operands keep the point's\n"
+        "                     size: a step narrower than its band. A row that reads that\n"
+        "                     parameter as the row count passes the default cases and fails here\n"
+        "                     (container pass; a fixture carries its own geometry)\n"
         "      --mm-max-patches N  the encoder pass declare is run at, so a media tower's\n"
         "                     kernels are in the graph: default 2048 (rounded to whole output\n"
         "                     rows) when the container carries an encoder, 0 to leave it out\n"
@@ -2306,6 +2311,13 @@ int main(int argc, char** argv) {
     uint64_t seed = 20260904;
     double   tol_override = -1;
     int64_t  max_tok = 512;
+    /* --band-capacity: issue every case with the ranged parameter at its band's upper bound while
+     * the operands keep the point's size. That is the engine's condition -- a step narrower than
+     * its band (a one-row decode inside a max_logit_rows band) -- and the one no default case
+     * produces, because a case derives its operands and its parameters from the same geometry. A
+     * row that reads the ranged parameter as the row count instead of as a capacity passes here
+     * and fails in the engine; this mode is what makes that class of bug visible. */
+    bool     band_capacity = false;
     /* Encoder pass size for declare, so a media tower's kernels are in the graph. -1 is auto: a
      * pass smaller than a serve's when the container carries an encoder (radiance.encoder). */
     int64_t  mm_max_patches = -1;
@@ -2368,6 +2380,7 @@ int main(int argc, char** argv) {
         else if (a == "--seed")    seed = (uint64_t)std::strtoull(next("--seed"), nullptr, 10);
         else if (a == "--tol")     tol_override = std::strtod(next("--tol"), nullptr);
         else if (a == "--max-tok") max_tok = std::atoll(next("--max-tok"));
+        else if (a == "--band-capacity") band_capacity = true;
         else if (a == "--max-ctx") max_ctx_flag = std::atoll(next("--max-ctx"));
         else if (a == "--mm-max-patches") mm_max_patches = std::atoll(next("--mm-max-patches"));
         else if (a == "--kv-cache-dtype") {
@@ -2759,6 +2772,27 @@ int main(int argc, char** argv) {
                 Geometry g = r.geom;
                 if (!o.ranged_key.empty()) g.set_i(o.ranged_key, M);
 
+                /* --band-capacity: the launch arguments carry the band's upper bound, as the
+                 * engine's prepared IssuePlan does, while `g` keeps the point's M for the shape
+                 * hooks and operand sizes. The reference reads its extents from the tensors
+                 * (libref derives M from the output), so both sides see the engine's condition. */
+                Geometry ga = g;
+                if (band_capacity && !o.ranged_key.empty()) {
+                    /* The engine's prepared args carry the selector's resolution, so take the
+                     * capacity from `r.geom` (the band's upper bound) rather than recomputing it
+                     * from the band table. */
+                    long long bandM = 0;
+                    if (!r.geom.get_i(o.ranged_key, &bandM) || bandM <= 0) {
+                        bandM = o.bands[b].hi;
+                        if (bandM <= 0 || bandM > (1 << 20)) bandM = max_tok;
+                        bandM = std::min<int64_t>(bandM, max_tok);
+                    }
+                    if (bandM > M) ga.set_i(o.ranged_key, (int64_t)bandM);
+                }
+                /* The report's geometry carries the distinction: the same shapes at a different
+                 * declared capacity are a different case. */
+                const std::string gstr = band_capacity ? g.str() + " args@band" : g.str();
+
                 const KernelRow* oracle = ref_for(o.op, g);
                 /* Without an oracle, a fused kernel that declares `replaces` is still checked,
                  * byte for byte against its own plugin's chain. A timing-only run times device
@@ -2778,7 +2812,7 @@ int main(int argc, char** argv) {
                 if (max_cases > 0) {
                     const std::string gk = o.op + "\x1f" + r.row->info->name + "\x1f" +
                                            r.row->plugin + "\x1f" + std::to_string(dom) + "\x1f" +
-                                           g.str() + "\x1f" + r.choice + "\x1f" +
+                                           gstr + "\x1f" + r.choice + "\x1f" +
                                            std::to_string(pt.ctx);
                     if (++group_seen[gk] > max_cases) { ++st.capped; continue; }
                 }
@@ -3125,7 +3159,7 @@ int main(int argc, char** argv) {
                 std::vector<uint8_t> scratch_a, scratch_b;
                 auto launch = [&](const KernelRow* row, std::vector<RadTensor>& tv,
                                   std::vector<uint8_t>& scratch) {
-                    RadArgs a = case_args(tv, g);
+                    RadArgs a = case_args(tv, ga);
                     if (row->info->scratch) {
                         const int64_t need = row->info->scratch(&a);
                         if (need > 0) { scratch.assign((size_t)need, 0);
@@ -3188,7 +3222,7 @@ int main(int argc, char** argv) {
 
                 /* Device launch, with device scratch. */
                 auto launch_dev = [&](const KernelRow* row, std::vector<RadTensor>& tv) -> int {
-                    RadArgs a = case_args(tv, g);
+                    RadArgs a = case_args(tv, ga);
                     if (row->info->scratch) {
                         const int64_t need = row->info->scratch(&a);
                         if (need > 0) {
@@ -3573,7 +3607,7 @@ int main(int argc, char** argv) {
                     rw.op = o.op;
                     rw.kernel = r.row->info->name;
                     rw.plugin = r.row->plugin;
-                    rw.geom = g.str();
+                    rw.geom = gstr;
                     rw.domain = domain_name(dom);
                     rw.choice = r.choice;
                     rw.verdict = "timed";
@@ -3692,7 +3726,7 @@ int main(int argc, char** argv) {
                     rw.op = o.op;
                     rw.kernel = r.row->info->name;
                     rw.plugin = r.row->plugin;
-                    rw.geom = g.str();
+                    rw.geom = gstr;
                     rw.domain = domain_name(dom);
                     rw.choice = r.choice;
                     rw.verdict = ok ? "ok" : "**FAIL**";

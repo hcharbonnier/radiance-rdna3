@@ -358,8 +358,14 @@ int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream stream) {
     if (n_embd <= 0 || n_embd % 128 || n_vocab <= 0 || voff < 0) return R3D_NO(RAD_E_SHAPE);
 
     long long M = 0, x_ld = 0;
+    /* `M` is the band's capacity, not the step's row count: the engine issues a one-row decode
+     * step inside a band declared at max_logit_rows (core/build rad_builder bands, docs/OPS.md)
+     * and passes the band's upper bound, with the step's extent on the tensors themselves. The
+     * reference row does the same (libr4d/r4d_logits_vocab.hip: g->M = x->shape[0]). So the extent
+     * is read from `x` and only a capacity below it is a caller bug. */
+    const long long band_M = r3d_geti_or(a, "M", 0);
     x_ld = r3d_rows_pitch(x, n_embd, &M);
-    if (x_ld < n_embd || M <= 0 || M != r3d_geti_or(a, "M", M)) return R3D_NO(RAD_E_SHAPE);
+    if (x_ld < n_embd || M <= 0 || band_M < M) return R3D_NO(RAD_E_SHAPE);
     long long lrows = 0;
     const long long ld = r3d_rows_pitch(lg, n_vocab, &lrows);
     if (ld < n_vocab || lrows < M) return R3D_NO(RAD_E_SHAPE);

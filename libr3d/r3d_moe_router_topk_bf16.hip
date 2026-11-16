@@ -243,17 +243,23 @@ int r3d_rad_moe_scatter(const RadArgs*, RadStream);
 int r3d_rad_moe_router_topk_bf16(const RadArgs* a, RadStream s)
 {
     if (!a || a->n_t < 3) return R3D_NO(RAD_E_INVAL);
-    const long long M = r3d_geti_or(a, "M", 0), ne = r3d_geti_or(a, "n_expert", 0),
-                    tk = r3d_geti_or(a, "top_k", 0);
+    const long long ne = r3d_geti_or(a, "n_expert", 0), tk = r3d_geti_or(a, "top_k", 0);
     const long long norm_ll = r3d_geti_or(a, "norm", 0);
     const int norm = (int)norm_ll;
-    if (M <= 0 || ne <= 0 || tk <= 0 || tk > kW) return R3D_NO(RAD_E_SHAPE);
+    if (ne <= 0 || tk <= 0 || tk > kW) return R3D_NO(RAD_E_SHAPE);
     if (ne > (long long)16 * kW) return R3D_NO(RAD_E_SHAPE);   // MAXOWN=16 for this row
     const RadTensor* L = r3d_opt(a, 0), *I = r3d_opt(a, 1), *W = r3d_opt(a, 2);
     if (!r3d_p(L) || !r3d_wp(I) || !r3d_wp(W)) return R3D_NO(RAD_E_INVAL);
     if (L->dtype != RAD_BF16) return R3D_NO(RAD_E_DTYPE);
     const uint32_t lg_ld = (uint32_t)r3d_row_pitch(L);
     if (lg_ld < ne) return R3D_NO(RAD_E_SHAPE);
+    /* The rows are the step's, not the band's: a declare binds `M` to the band's upper bound while
+     * the activations carry the step's shape (the same rule the scatter phase at the bottom of this
+     * file follows). Reading the capacity here would run, read and write rows the step does not
+     * have. */
+    const long long M = (long long)r3d_dim(L, 0);
+    if (M < 1 || r3d_geti_or(a, "M", M) < M) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(I) < M * tk || r3d_numel(W) < M * tk) return R3D_NO(RAD_E_SHAPE);
 
     dim3 grid((unsigned)M), blk(kW);           // one block (one wave) per row
     const unsigned short* lg = (const unsigned short*)r3d_p(L);
@@ -278,10 +284,10 @@ int r3d_rad_moe_router_topk_bf16(const RadArgs* a, RadStream s)
 int r3d_rad_router_topk_scatter(const RadArgs* a, RadStream s)
 {
     if (!a || a->n_t < 6) return R3D_NO(RAD_E_INVAL);
-    const long long M = r3d_geti_or(a, "M", 0), ne = r3d_geti_or(a, "n_expert", 0),
-                    tk = r3d_geti_or(a, "top_k", 0), nl = r3d_geti_or(a, "n_local", ne);
+    const long long ne = r3d_geti_or(a, "n_expert", 0), tk = r3d_geti_or(a, "top_k", 0),
+                    nl = r3d_geti_or(a, "n_local", ne);
     const int norm = (int)r3d_geti_or(a, "norm", 0);
-    if (M <= 0 || ne <= 0 || tk <= 0 || tk > (long long)kW || tk > ne) return R3D_NO(RAD_E_SHAPE);
+    if (ne <= 0 || tk <= 0 || tk > (long long)kW || tk > ne) return R3D_NO(RAD_E_SHAPE);
     if (nl <= 0 || nl > ne) return R3D_NO(RAD_E_SHAPE);
     if (ne > (long long)16 * kW) return R3D_NO(RAD_E_SHAPE);
 
@@ -292,6 +298,12 @@ int r3d_rad_router_topk_scatter(const RadArgs* a, RadStream s)
     if (L->dtype != RAD_BF16) return R3D_NO(RAD_E_DTYPE);
     const uint32_t lg_ld = (uint32_t)r3d_row_pitch(L);
     if (lg_ld < ne) return R3D_NO(RAD_E_SHAPE);
+    /* The step's rows, not the band's capacity: a decode step of one row inside a band declared at
+     * max_seqs would otherwise run, read and write rows it does not have. */
+    const long long M = (long long)r3d_dim(L, 0);
+    if (M < 1 || r3d_geti_or(a, "M", M) < M) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(I) < M * tk || r3d_numel(W) < M * tk || r3d_numel(ST) < M * tk)
+        return R3D_NO(RAD_E_SHAPE);
 
     // Phase 1: the top-k selection (the router_topk kernel, over the whole n_expert).
     dim3 grid((unsigned)M), blk(kW);
@@ -328,12 +340,11 @@ int r3d_rad_router_topk_scatter(const RadArgs* a, RadStream s)
 int r3d_rad_router_sigmoid_topk(const RadArgs* a, RadStream s)
 {
     if (!a || a->n_t < 4) return R3D_NO(RAD_E_INVAL);
-    const long long M = r3d_geti_or(a, "M", 0), ne = r3d_geti_or(a, "n_expert", 0),
-                    tk = r3d_geti_or(a, "top_k", 0);
+    const long long ne = r3d_geti_or(a, "n_expert", 0), tk = r3d_geti_or(a, "top_k", 0);
     const int norm = (int)r3d_geti_or(a, "norm", 0);
     const double scale_d = r3d_getf(a, "route_scale", 0.0);
     const float scale = (float)scale_d;
-    if (M <= 0 || ne <= 0 || tk <= 0 || tk > (long long)kW || tk > ne) return R3D_NO(RAD_E_SHAPE);
+    if (ne <= 0 || tk <= 0 || tk > (long long)kW || tk > ne) return R3D_NO(RAD_E_SHAPE);
     if (ne > (long long)16 * kW) return R3D_NO(RAD_E_SHAPE);
     if (scale <= 0.0f) return R3D_NO(RAD_E_SHAPE);
 
@@ -342,6 +353,11 @@ int r3d_rad_router_sigmoid_topk(const RadArgs* a, RadStream s)
     if (L->dtype != RAD_BF16 || B->dtype != RAD_F32) return R3D_NO(RAD_E_DTYPE);
     const uint32_t lg_ld = (uint32_t)r3d_row_pitch(L);
     if (lg_ld < ne) return R3D_NO(RAD_E_SHAPE);
+    /* The step's rows, not the band's capacity (see the note in the scatter phase below). */
+    const long long M = (long long)r3d_dim(L, 0);
+    if (M < 1 || r3d_geti_or(a, "M", M) < M) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(I) < M * tk || r3d_numel(W) < M * tk || r3d_numel(B) < M)
+        return R3D_NO(RAD_E_SHAPE);
 
     dim3 grid((unsigned)M), blk(kW);
     const unsigned short* lg = (const unsigned short*)r3d_p(L);
