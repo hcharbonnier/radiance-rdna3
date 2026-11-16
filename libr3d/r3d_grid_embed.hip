@@ -67,10 +67,10 @@ __global__ __launch_bounds__(kThr) void grid_embed_kernel(
     const int r = (int)blockIdx.x;
     if (r >= M) return;
     if (threadIdx.x == 0) {
-        const int gr = coord[0 * ccs + (long)r * cms];
-        const int gc = coord[1 * ccs + (long)r * cms];
-        const int gh = coord[2 * ccs + (long)r * cms];
-        const int gw = coord[3 * ccs + (long)r * cms];
+        const int gr = coord[0 * (long)ccs + (long)r * cms];
+        const int gc = coord[1 * (long)ccs + (long)r * cms];
+        const int gh = coord[2 * (long)ccs + (long)r * cms];
+        const int gw = coord[3 * (long)ccs + (long)r * cms];
         ge_axis(gr, gh, side, th, wh);
         ge_axis(gc, gw, side, tw, ww);
     }
@@ -78,10 +78,10 @@ __global__ __launch_bounds__(kThr) void grid_embed_kernel(
 
     const float w00 = wh[0] * ww[0], w01 = wh[0] * ww[1];
     const float w10 = wh[1] * ww[0], w11 = wh[1] * ww[1];
-    const uint16_t* r00 = table + (size_t)(th[0] * side + tw[0]) * t_ld;
-    const uint16_t* r01 = table + (size_t)(th[0] * side + tw[1]) * t_ld;
-    const uint16_t* r10 = table + (size_t)(th[1] * side + tw[0]) * t_ld;
-    const uint16_t* r11 = table + (size_t)(th[1] * side + tw[1]) * t_ld;
+    const uint16_t* r00 = table + (size_t)((long)th[0] * side + tw[0]) * t_ld;
+    const uint16_t* r01 = table + (size_t)((long)th[0] * side + tw[1]) * t_ld;
+    const uint16_t* r10 = table + (size_t)((long)th[1] * side + tw[0]) * t_ld;
+    const uint16_t* r11 = table + (size_t)((long)th[1] * side + tw[1]) * t_ld;
     uint16_t* xr = x + (size_t)r * x_ld;
 
     for (int i = (int)threadIdx.x; i < n; i += kThr) {
@@ -119,6 +119,11 @@ enum { G_X = 0, G_TAB, G_CRD };
 
 #define R3D_NEED(x) do { const int _s = (x); if (_s != RAD_OK) return R3D_NO(_s); } while (0)
 
+/* `r3d_rows_pitch` checks the last axis for rank >= 2; a rank-1 plane needs the same promise. */
+static int last_stride_1(const RadTensor* t) {
+    return t && t->rank >= 1 && r3d_stride(t, (int)t->rank - 1) == 1 ? RAD_OK : RAD_E_STRIDE;
+}
+
 extern "C" int r3d_rad_grid_embed(const RadArgs* a, RadStream s) {
     const RadTensor* X = r3d_opt(a, G_X);
     const RadTensor* T = r3d_opt(a, G_TAB);
@@ -127,6 +132,8 @@ extern "C" int r3d_rad_grid_embed(const RadArgs* a, RadStream s) {
     R3D_NEED(r3d_is_bf16(X) ? RAD_OK : RAD_E_DTYPE);
     R3D_NEED(r3d_is_bf16(T) ? RAD_OK : RAD_E_DTYPE);
     R3D_NEED(r3d_is_i32(C) ? RAD_OK : RAD_E_DTYPE);
+    R3D_NEED(last_stride_1(X));
+    R3D_NEED(last_stride_1(T));
 
     if (const char* nm = r3d_gets(a, "dtype"))
         if (std::strcmp(nm, "bf16")) return R3D_NO(RAD_E_UNSUPPORTED);

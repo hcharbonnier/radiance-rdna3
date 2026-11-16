@@ -161,9 +161,10 @@ extern "C" int r3d_gemm_nt_bias_bf16(long a, long b, long bias, long res, long y
     if (!a || !b || !bias || !y) return -1;
     if (M < 1 || N < 1 || K < 1 || act < 0 || act > 2) return -2;
     if (a_ld < K || b_ld < K || y_ld < N || (res && res_ld < N)) return -3;
-    const int tiles_m = (M + kMT - 1) / kMT, tiles_n = (N + kNT - 1) / kNT;
+    const long long tiles_m = ((long long)M + kMT - 1) / kMT;
+    const long long tiles_n = ((long long)N + kNT - 1) / kNT;
     /* gfx11 caps grid y and z at 65535; x is 2^31. */
-    if (tiles_n > 0x7fffffff || tiles_m > 65535) return -2;
+    if (tiles_n > 0x7fffffffLL || tiles_m > 65535LL) return -2;
     R3D_KLAUNCH(gemm_nt_bias_kernel, dim3((uint32_t)tiles_n, (uint32_t)tiles_m),
                 dim3(kThr), (hipStream_t)(uintptr_t)stream, (const uint16_t*)(uintptr_t)a,
                 (const uint16_t*)(uintptr_t)b, (const uint16_t*)(uintptr_t)bias,
@@ -182,6 +183,12 @@ enum { G_A = 0, G_B, G_BIAS, G_RES, G_Y };
 
 static int dt_bf16(const RadTensor* t) { return r3d_is_bf16(t) ? RAD_OK : RAD_E_DTYPE; }
 
+/* A rows view reads the last axis one element apart. `r3d_rows_pitch` checks it for rank >= 2;
+ * the rank-1 planes (a bias, a whole activation) need the same promise. */
+static int last_stride_1(const RadTensor* t) {
+    return t && t->rank >= 1 && r3d_stride(t, (int)t->rank - 1) == 1 ? RAD_OK : RAD_E_STRIDE;
+}
+
 extern "C" int r3d_rad_gemm_nt_bias(const RadArgs* a, RadStream s) {
     const RadTensor* A = r3d_opt(a, G_A);
     const RadTensor* B = r3d_opt(a, G_B);
@@ -194,6 +201,11 @@ extern "C" int r3d_rad_gemm_nt_bias(const RadArgs* a, RadStream s) {
     R3D_NEED(dt_bf16(bias));
     R3D_NEED(dt_bf16(Y));
     if (res) R3D_NEED(dt_bf16(res));
+    R3D_NEED(last_stride_1(A));
+    R3D_NEED(last_stride_1(B));
+    R3D_NEED(last_stride_1(bias));
+    R3D_NEED(last_stride_1(Y));
+    if (res) R3D_NEED(last_stride_1(res));
 
     if (const char* nm = r3d_gets(a, "dtype"))
         if (std::strcmp(nm, "bf16")) return R3D_NO(RAD_E_UNSUPPORTED);

@@ -554,6 +554,10 @@ TEST(vision_rows_refuse_unsupported_calls) {
         std::vector<RadParam> p{ pi("M", 2), pi("N", 3), pi("K", 4), ps("dtype", "bf16"),
                                  ps("act", "gelu_quick") };
         CHECK_EQ(run(kg, t, p), RAD_E_UNSUPPORTED);
+        /* A bias whose last axis is not one element apart would be read as a different plane. */
+        t[2] = ten(dbias.p, RAD_BF16, { 3 });
+        t[2].stride[0] = 2;
+        CHECK_EQ(run(kg, t, p), RAD_E_STRIDE);
     }
 
     /* grid_embed with a table too short for its side, a coordinate plane of the wrong rank, and
@@ -580,6 +584,10 @@ TEST(vision_rows_refuse_unsupported_calls) {
         t[2] = ten(dcrd.p, RAD_I32, { 4, 3 });
         t[0] = ten(dx.p, RAD_F32, { 3, 4 });
         CHECK_EQ(run(kx, t, p), RAD_E_DTYPE);
+        /* The last axis of x must be one element apart. */
+        t[0] = ten(dx.p, RAD_BF16, { 3, 4 });
+        t[0].stride[1] = 2;
+        CHECK_EQ(run(kx, t, p), RAD_E_STRIDE);
     }
 }
 
