@@ -200,6 +200,8 @@ int r3d_rad_ple_conv(const RadArgs* a, RadStream s);
  * decode against the paged state cache, in either state form (per_candidate or anchor). */
 extern "C" int r3dh_rad_gdn_recurrent_update(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s);
+/* The same fold with had_quant_act_i8g's codes of `o` in its epilogue (gdn_conv_recurrent_update_had). */
+extern "C" int r3dh_rad_gdn_conv_recurrent_update_had(const RadArgs* a, RadStream s);
 
 /* --- r3d_kda_update.hip: GLM's per-channel KDA recurrence at decode and prefill, over the
  * paged f32 state cache, with the speculative candidate snapshots. */

@@ -567,6 +567,34 @@ static const RadOperandSpec oGdnConvRecurrent[] = { { "x", RAD_OPD_IN, 0 },
                                                    { "o_q", RAD_OPD_OUT, 1 },
                                                    { "o_scale", RAD_OPD_OUT, 1 } };
 
+/* gdn_conv_recurrent_update_had: the same operands, `o_q` / `o_scale` required (they are
+ * had_quant_act_i8g's codes of `o`), and the codes' scale group. */
+static const RadParamSpec pGdnConvRecurrentHad[] = {
+                                                   P_INT("q_len"), P_INT("head_k"), P_INT("head_v"),
+                                                   P_INT("conv_width"), P_INTO("n_head_v"),
+                                                   P_F64O("scale"), P_F64O("eps"), P_F64O("l2_eps"),
+                                                   P_F64O("softplus_thr"), P_STRO("act"),
+                                                   P_INTO("state_fp16"), P_STRO("state_form"),
+                                                   P_INTO("group") };
+static const RadOperandSpec oGdnConvRecurrentHad[] = { { "x", RAD_OPD_IN, 0 },
+                                                   { "conv_w", RAD_OPD_WEIGHT, 0 },
+                                                   { "conv_b", RAD_OPD_WEIGHT, 1 },
+                                                   { "conv_state", RAD_OPD_INOUT, 0 },
+                                                   { "conv_idx", RAD_OPD_IN, 0 },
+                                                   { "a", RAD_OPD_IN, 0 },
+                                                   { "b", RAD_OPD_IN, 0 },
+                                                   { "A_log", RAD_OPD_WEIGHT, 0 },
+                                                   { "dt_bias", RAD_OPD_WEIGHT, 0 },
+                                                   { "state", RAD_OPD_INOUT, 0 },
+                                                   { "state_idx", RAD_OPD_IN, 0 },
+                                                   { "num_accepted", RAD_OPD_IN, 0 },
+                                                   { "cu", RAD_OPD_IN, 0 },
+                                                   { "z", RAD_OPD_IN, 0 },
+                                                   { "norm_w", RAD_OPD_WEIGHT, 0 },
+                                                   { "o", RAD_OPD_OUT, 0 },
+                                                   { "o_q", RAD_OPD_OUT, 0 },
+                                                   { "o_scale", RAD_OPD_OUT, 0 } };
+
 
 /* ================================================================== the vocab and the sampler
  *
@@ -1046,6 +1074,12 @@ static const RadOpSchema kSchemas[] = {
             "gdn_conv_update followed by gdn_recurrent_update, with q, k and v never written: the "
             "operands are the convolution's (`conv_idx` is its state_idx) and then the recurrence's "
             "without those three."),
+    SCHEMA("gdn_conv_recurrent_update_had", pGdnConvRecurrentHad, oGdnConvRecurrentHad,
+            "gdn_conv_recurrent_update whose `o_q` / `o_scale` are had_quant_act_i8g's codes of "
+            "`o` (int8, a 128-wide Hadamard before the per-(token, head) amax), for an out "
+            "projection stored rotated (i8a8h). Byte-identical to gdn_conv_recurrent_update "
+            "followed by had_quant_act_i8g. `group` 256 is IQ8R's: one scale per two value heads "
+            "(`o_scale` [tokens, n_head_v / 2]), each head still rotated on its own."),
     SCHEMA("expert_scale", pExpertScale, oExpertScale,
            "Each routing weight times its expert's own per-expert scale, in place: the router's "
            "renormalised top-k weight scaled by the [n_expert] table, an out-of-table id reading "
@@ -3221,6 +3255,24 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cGdnConvRecurrent), NOTUNE,
   nullptr, nullptr, r3dh_rad_gdn_conv_recurrent_update,
+  nullptr, nullptr, nullptr,
+  nullptr, nullptr },
+
+{ "gdn_conv_recurrent_update_had_k128_v128", "gdn_conv_recurrent_update_had", "gdn",
+  "The gated-delta-net decode step and had_quant_act_i8g's codes of its output in one kernel: "
+  "the conv fold and recurrent update of gdn_conv_recurrent_update, then the epilogue's int8 "
+  "codes (a 128-wide Hadamard before the amax), for an out projection stored rotated (i8a8h)",
+  "head_k 128, head_v 128, conv width 4, group 128 (one scale a value head) or 256 (IQ8R: one "
+  "scale a pair of value heads); the speculative window (state_len_max - 2) must fit the register "
+  "buffer; the gated RMS norm is folded in (z and norm_w are required); the state cache is f32 or "
+  "f16. o_q (int8) and o_scale (f32) are required; other groups, an fp8 o_q, and head or conv "
+  "widths off the band are refused",
+  "bf16 x and o, f32 a, b, A_log, dt_bias and norm_w, the conv state and conv weight bf16, the "
+  "state f32 or f16; int8 codes row-major, f32 scale per (token, group). Byte-identical to "
+  "gdn_conv_recurrent_update followed by had_quant_act_i8g",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cGdnConvRecurrent), NOTUNE,
+  nullptr, nullptr, r3dh_rad_gdn_conv_recurrent_update_had,
   nullptr, nullptr, nullptr,
   nullptr, nullptr },
 

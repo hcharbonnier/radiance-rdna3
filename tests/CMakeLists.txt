@@ -182,7 +182,8 @@ if(TARGET libr3d AND RAD_HIP_FOUND)
                                 qsa_score_device_test qsa_select_device_test qsa_work_device_test
                                 moe_iqr_device_test moe_iqr_test kv_store_b4_device_test
                                 r3d_rope_imrope_h128_device_test router_fused_device_test
-                                gemv_n1_device_test vision_rows_device_test)
+                                gemv_n1_device_test vision_rows_device_test
+                                gdn_conv_recurrent_had_device_test)
   set(RAD_TESTS_WITH_R3D_HOST hc_layout_test)
 else()
   list(FILTER RAD_TESTS EXCLUDE REGEX "/iqr_device_test\\.cpp$")
@@ -194,6 +195,7 @@ else()
   list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_work_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/r3d_rope_imrope_h128_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/vision_rows_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/gdn_conv_recurrent_had_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/moe_iqr_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/kv_store_b4_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/router_fused_device_test\\.cpp$")
@@ -388,7 +390,7 @@ if(RAD_HIP_FOUND)
   foreach(n iqr_device_test ple_hc_device_test qsa_block_key_device_test qsa_score_device_test
             qsa_select_device_test qsa_work_device_test moe_iqr_device_test moe_iqr_test
             kv_store_b4_device_test r3d_rope_imrope_h128_device_test router_fused_device_test
-            gemv_n1_device_test vision_rows_device_test)
+            gemv_n1_device_test vision_rows_device_test gdn_conv_recurrent_had_device_test)
     if(TARGET ${n})
       add_test(NAME ${n}_card COMMAND ${n})
       set_tests_properties(${n}_card PROPERTIES
