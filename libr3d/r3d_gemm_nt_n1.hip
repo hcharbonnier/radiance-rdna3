@@ -161,6 +161,7 @@ extern "C" int r3d_rad_gemm_nt_bf16_n1(const RadArgs* a, RadStream s)
     if (a_ld < 0 || y_ld < 0) return R3D_NO(RAD_E_STRIDE);
     if (arows < M || yrows < M) return R3D_NO(RAD_E_SHAPE);
     if (a_ld < K || y_ld < N) return R3D_NO(RAD_E_STRIDE);
+    if (a_ld > 0x7fffffffLL || y_ld > 0x7fffffffLL) return R3D_NO(RAD_E_SHAPE);
     /* The weight is dense: the dot reads b[0][k] at k. */
     if (!r3d_contig(B)) return R3D_NO(RAD_E_STRIDE);
     /* 16-byte loads at a row base, and a tile base a multiple of eight elements. */
