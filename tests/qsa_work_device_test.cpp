@@ -559,6 +559,60 @@ TEST(qsa_work_ratio_two_matches_libref) {
     CHECK_EQ(d.stage[(size_t)(in.ratio * 2) * in.n + 0], 0xA5A5u);
 }
 
+/* The check rad-kbench makes, without its machinery: an output (or inout) both libraries
+ * implement must be described with one dtype and one shape. The geometries are the ones kbench
+ * draws on Flash-Next: M 1..512, seqs 8, work 136, blocks 65536. */
+TEST(qsa_output_descriptions_match_libref) {
+    if (!ready()) return;
+    auto compare = [&](const char* op, const std::vector<RadParam>& p,
+                       std::initializer_list<int> outs, long long M) {
+        const RadKernelInfo* kd = g_r3d.find(op, RAD_DOMAIN_DEVICE, nullptr);
+        const RadKernelInfo* kr = g_ref.find(op, RAD_DOMAIN_HOST, "ref_");
+        CHECK(kd && kr);
+        if (!kd || !kr || !kd->opd_shape || !kr->opd_shape) return;
+        for (int oi : outs) {
+            RadOpdDesc a{}, b{};
+            const int ra = kr->opd_shape(p.data(), (int)p.size(), oi, &a);
+            const int rb = kd->opd_shape(p.data(), (int)p.size(), oi, &b);
+            CHECK_EQ(ra, RAD_OK);
+            CHECK_EQ(rb, RAD_OK);
+            if (ra != RAD_OK || rb != RAD_OK) continue;
+            if ((a.flags & RAD_OPD_F_ABSENT) || (b.flags & RAD_OPD_F_ABSENT)) continue;
+            bool same = a.dtype == b.dtype && a.rank == b.rank;
+            for (uint32_t d = 0; same && d < a.rank; ++d)
+                same = a.shape[d] == b.shape[d];
+            if (!same) {
+                std::fprintf(stderr,
+                             "%s M=%lld operand %d: libref dtype %u rank %u, libr3d dtype %u "
+                             "rank %u\n", op, M, oi, a.dtype, a.rank, b.dtype, b.rank);
+                CHECK(same);
+            }
+        }
+    };
+    static const long long Ms[] = { 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 };
+    for (long long M : Ms) {
+        compare("qsa_tail_store",
+                { pi("M", M), pi("n", 128), pi("ratio", 4), pi("ring", 7), pi("seqs", 8),
+                  ps("dtype", "bf16") },
+                { 3 }, M);
+        compare("qsa_block_key",
+                { pi("M", M), pi("n", 128), pi("ratio", 4), pi("rotary_dim", 64),
+                  pi("block_size", 4), ps("dtype", "bf16") },
+                { 2, 3, 4 }, M);
+        compare("qsa_score",
+                { pi("M", M), pi("n", 128), pi("heads", 4), pi("blocks", 65536), pi("seqs", 8),
+                  ps("dtype", "bf16") },
+                { 5 }, M);
+        compare("qsa_select",
+                { pi("M", M), pi("blocks", 65536), pi("topk", 512), pi("ratio", 4), pi("seqs", 8) },
+                { 5, 6, 7 }, M);
+        compare("qsa_work",
+                { pi("M", M), pi("n", 128), pi("ratio", 4), pi("ring", 7), pi("seqs", 8),
+                  pi("work", 136), ps("dtype", "bf16") },
+                { 7, 8, 9, 10 }, M);
+    }
+}
+
 }  // namespace
 
 RAD_TEST_MAIN()

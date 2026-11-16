@@ -453,9 +453,11 @@ int r3d_shape_kv_len_trim(const RadParam* p, int n_p, int operand, RadOpdDesc* o
 int r3d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const int64_t ring = gi(p, n_p, "ring", 0), seqs = gi(p, n_p, "seqs", 0);
+    /* The described tail gives every token its own slot, as libref's does: the state's leading
+     * extent is M, not the number of sequences, and a tool draws the same case for both. */
     const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, n), opd((uint32_t)RAD_I32, M, 1),
                                 opd((uint32_t)RAD_I32, seqs + 1, 1),
-                                opd((uint32_t)RAD_BF16, seqs, 1, ring, n),
+                                opd((uint32_t)RAD_BF16, M, 1, ring, n),
                                 opd((uint32_t)RAD_I32, seqs, 1) };
     R3D_PICK(list);
 }
@@ -493,6 +495,15 @@ int r3d_shape_qsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     R3D_PICK(list);
 }
 
+/* The number of sequences a description can hold: every sequence needs at least one row. This is
+ * libref's qsa_seqs, so a geometry stating more sequences than tokens describes the same case for
+ * both libraries. */
+int64_t qsa_seqs(const RadParam* p, int n_p, int64_t M) {
+    const int64_t s = gi(p, n_p, "seqs", 1);
+    const int64_t m = s < M ? s : M;
+    return m > 1 ? m : 1;
+}
+
 /* The QSA selection: score [M, blocks] f32, the sequence's table [seqs, blocks] i32, the live
  * count [seqs], each query's position [M], the join [seqs+1], and the table [M, topk+1] with its
  * two per-query scalars. The table is filled with page 0 (every block live) and `nc` with the
@@ -511,8 +522,8 @@ int r3d_shape_qsa_select(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
         opd_idx(M, 0, blocks * ratio - 1),                       /* pos: the last block boundary */
         opd_idx(seqs + 1, 0, 0),                                 /* cu: every row in sequence 0 */
         opd((uint32_t)RAD_I32, M, topk + 1),                     /* sel */
-        opd((uint32_t)RAD_I32, M, 1),                            /* nsel */
-        opd((uint32_t)RAD_I32, M, 1)                             /* seqused */
+        opd((uint32_t)RAD_I32, M),                               /* nsel */
+        opd((uint32_t)RAD_I32, M)                                /* seqused */
     };
     R3D_PICK(list);
 }
@@ -527,18 +538,23 @@ int r3d_shape_qsa_work(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
     const int64_t seqs = gi(p, n_p, "seqs", 0), work = gi(p, n_p, "work", 0);
     if (M <= 0 || n <= 0 || ratio <= 0 || ring < ratio || seqs <= 0 || work <= 0)
         return RAD_E_UNSUPPORTED;
+    /* The sequence count the work list can address: libref's clamp to M, and no more than the
+     * block bound. Everything with a sequence extent uses it, so `nc` is exactly the count the
+     * kernel derives from `cu`'s extent. */
+    const int64_t s = qsa_seqs(p, n_p, M);
+    const int64_t S = s < work ? s : work;
     const RadOpdDesc list[] = {
         opd((uint32_t)RAD_BF16, M, n),                       /* k */
         opd_idx(M, 1, 0),                                    /* positions */
-        opd_idx(seqs + 1, 1, 0, RAD_OPD_F_IDX_CU),           /* cu_seqlens */
-        opd((uint32_t)RAD_BF16, seqs, 1, ring, n),           /* the tail state */
-        opd_idx(seqs, 1, 0, 0, 1),                           /* the state row, column 0 */
-        opd_idx(seqs, work, 0, 0, work),                     /* the block-key table */
+        opd_idx(S + 1, 1, 0, RAD_OPD_F_IDX_CU),              /* cu_seqlens */
+        opd((uint32_t)RAD_BF16, S, 1, ring, n),              /* the tail state */
+        opd_idx(S, 1, 0, 0, 1),                              /* the state row, column 0 */
+        opd_idx(S, work, 0, 0, work),                        /* the block-key table */
         opd_none(),                                          /* rope: the one-component form */
         opd((uint32_t)RAD_BF16, work * ratio, n),            /* stage */
         opd((uint32_t)RAD_I32, work),                        /* page */
         opd((uint32_t)RAD_I32, work),                        /* bpos */
-        opd((uint32_t)RAD_I32, seqs)                         /* nc */
+        opd((uint32_t)RAD_I32, S)                            /* nc */
     };
     R3D_PICK(list);
 }
