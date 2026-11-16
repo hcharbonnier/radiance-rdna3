@@ -98,11 +98,22 @@ Lecture : premier **bring-up fonctionnel** du 121 GB, tous les ops résolus en
 device (0 bande device manquante sur 5 074 questions). Le décodage à 4 tok/s
 reflète le tiering des experts (SSD/host), l'absence de MTP et un premier chemin
 sans optimisation ; le préfill tient 42 tok/s jusqu'à 4 570 tokens.
-`kbench` sur ce conteneur : 1 743/1 749 cas corrects, **6 FAIL
-`logits_gemm_bf16`** (rel_l2 ≈ 0,5) et **22 divergences de forme QSA** — corrigés
-en W17. Les timings par row de ce run kbench ne sont **pas exploitables** : la
+`kbench` sur ce conteneur : après W17, **856/856 cas corrects, 0 échec,
+0 divergence** (`--kernels libr3d:libref`, pire rel_l2 1,2e-2). Les deux défauts
+trouvés par le premier run sont corrigés : la tête `logits_gemm_bf16` indexait
+son échelle par ligne (1×128) comme une grille 128×128 (rel_l2 0,53 → 1,7e-3),
+et trois sorties QSA divergeaient de libref. Robustesse : un prompt de
+12 001 tokens est refusé proprement (HTTP 400, message explicite) et le serveur
+reste vivant ; les redémarrages sont propres.
+
+Contrôle final de non-régression 27B sur la pointe W17 : préfill **303,3 tok/s**
+à 819 tokens (médiane de 3), décodage **28,6 tok/s** à 16 tokens et **21,4** à
+819, sorties identiques — les rows ajoutées ne changent pas le chemin dense.
+
+Les timings par row du premier run kbench ne sont **pas exploitables** : la
 carte a throttlé (PPT0/PPT1) pendant les 8 minutes de mesure ; HC/PLE restent à
-mesurer sur carte froide.
+mesurer sur carte froide. Les 78 cas non couverts par kbench sont hors v1 :
+MTP 48 (`mtp.draft_head`, `blk.48`), `ngram_hint` sans oracle libref.
 
 ## Lecture
 

@@ -1,10 +1,10 @@
 # Checklist de clôture — RDNA3 / Qwen3.8 Flash-Next IQR-V4
 
-État au 2026-11-16, branche `rdna3-iqr`, pointe `12de89d` (W14 et W15 fusionnés,
-`moe_gemm_w4nl` inclus ; bring-up Flash-Next en cours). Sert à suivre l'avancement ; cocher au fur et à
+État au 2026-11-16, branche `rdna3-iqr`, pointe de code `a772d70` (W14–W17
+fusionnés ; Flash-Next servi, kbench 856/856). Sert à suivre l'avancement ; cocher au fur et à
 mesure et dater la ligne. Le détail des décisions et mesures est dans
 `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md`, `SUIVI_LOTS_RDNA3.md`,
-`HANDOVER_RDNA3_PHASE6.md` et `FLASH_NEXT_AUDIT.md`.
+`HANDOVER_RDNA3_PHASE7.md` et `FLASH_NEXT_AUDIT.md`.
 
 Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 
@@ -113,11 +113,10 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
       (numel remplacé par la forme logique), ainsi que `moe_gather`,
       `moe_iqr`, le router et la tête vocabulaire (plan du déclaratif au lieu
       d'un peek VRAM). Flash-Next sert le texte.
-- [~] 4bis.2c `kbench` de contrôle sur le conteneur : 1 743/1 749 cas corrects,
-      **6 FAIL `logits_gemm_bf16`** (rel_l2 ≈ 0,5, M=1..32) et **22
-      divergences de forme QSA** (`qsa_select.nsel`, `qsa_work.nc`,
-      `qsa_tail_store.state`). Deux agents W17 corrigent ; re-vérifier 0 FAIL
-      et 0 divergence.
+- [x] 4bis.2c `kbench` de contrôle après W17 : **856/856 cas, 0 échec,
+      0 divergence** (pire rel_l2 1,2e-2). Tête bf16 corrigée (échelle 1×128,
+      rel_l2 0,53 → 1,7e-3) et trois formes QSA alignées. Les 78 cas non
+      couverts sont hors v1 (MTP 48, `ngram_hint` sans oracle).
 - [~] 4bis.3 Configuration v1 : `num-speculative-tokens: 0` (MTP hors v1),
       `placement: expert_tiered`, `host-pool-mib: 43000`, KV i8,
       **`max_mixed_tok ≤ 2048`** (le plan `score` fait 512 MiB à 2048 lignes,
@@ -125,9 +124,10 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 - [x] 4bis.4 Texte : 1 séquence (30 / 2290 / 4570 tokens) et 4 séquences
       concurrentes servies ; préfill 42 tok/s, décodage 4,0–4,6 tok/s.
 - [ ] 4bis.5 Image / vision si le conteneur la sert (dépend de 4.6).
-- [ ] 4bis.6 Robustesse : formes refusées, erreurs de plan, arrêt propre,
-      reprise après redémarrage.
-- [ ] 4bis.7 Aucun nouvel avertissement au démarrage ; rapport de startup relu.
+- [x] 4bis.6 Robustesse : prompt de 12 001 tokens refusé proprement (HTTP 400,
+      message explicite) et serveur toujours vivant ; redémarrages propres.
+- [x] 4bis.7 Aucun nouvel avertissement au démarrage ; les avertissements
+      présents (PCIe sous max, swap, governor) sont ceux de l'hôte.
 - [ ] 4bis.8 Démo reproductible (script, prompts, lots) et documentation.
 - [ ] 4bis.9 Mise à jour de `SUIVI_LOTS_RDNA3.md` (M2→M6) et du journal.
 
@@ -167,14 +167,17 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 
 ## 8. Critères de clôture du projet
 
-- [ ] 8.1 `r3d_selftest` **159/0/15** (144 + QSA/MoE + W15), `iqr_device_test`,
-      `moe_iqr_test` et les quatre tests QSA verts sur la pointe.
-- [ ] 8.2 Flash-Next démarre et génère (texte, 1 et 4 séquences, préfills
+- [x] 8.1 `r3d_selftest` **159/0/15**, `iqr_device_test`, `logits_bf16_device_test`,
+      `moe_iqr_test`, `moe_w4nl` et les quatre tests QSA verts ; kbench
+      Flash-Next **856/856, 0 échec, 0 divergence**.
+- [x] 8.2 Flash-Next démarre et génère (texte, 1 et 4 séquences, préfills
       2048/4096) sans fallback ni avertissement nouveau.
-- [ ] 8.3 MoE conforme (treillis + `w4nl` + bf16 protégé, écart borné documenté)
-      et **η lien ≥ 80 %** en préfill.
-- [ ] 8.4 QSA identique à la référence et égal au dense sous le seuil.
-- [ ] 8.5 Tableau réel/idéal complet, écarts expliqués, RAPPORT à jour.
+- [~] 8.3 MoE conforme (treillis + `w4nl` + bf16 protégé, écart borné documenté)
+      ; le **η lien ≥ 80 %** reste à mesurer (kbench throttlé).
+- [x] 8.4 QSA identique à la référence et égal au dense sous le seuil (781/819
+      checks, kbench 0 divergence).
+- [~] 8.5 Tableau réel/idéal complet, écarts expliqués, RAPPORT à jour :
+      Flash-Next et kbench faits ; HC/PLE et η lien en attente d'une carte froide.
 - [ ] 8.6 Documentation des rows, architectures, limites et perf à jour.
 - [ ] 8.7 Handover final (phase suivante) et journal à la date de clôture.
 

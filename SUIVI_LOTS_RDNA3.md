@@ -25,7 +25,7 @@
 | W14 — audit et rows | **terminé** | 1 sem | audit Flash-Next ; 4 ops QSA ; MoE treillis + référence ; formes denses table/grille |
 | W15 — rows Flash-Next | **terminé** | 2 sem | `kSigned` 8, `gdn_conv_recurrent_update_had`, `kv_store` b4, `rope` h128, router fusionné, `gemm_nt` N=1, rows vision, `moe_gemm_w4nl` ; **159 rows / 0 échec / 15 skips** |
 | W16 — bring-up Flash-Next | **terminé (2026-11-16)** | 1 sem | serveur 121 GB servi : préfill 42 tok/s, décodage 4,0–4,6 tok/s, 4 séquences ; 0 bande device manquante |
-| W17 — corrections kbench | **en cours (2 agents)** | 1 sem | `logits_gemm_bf16` (6 FAIL) et 3 formes QSA divergentes |
+| W17 — corrections kbench | **terminé (2026-11-16)** | 1 sem | `logits_gemm_bf16` corrigé (échelle 1×128), 3 formes QSA alignées ; kbench **856/856, 0 échec, 0 divergence** |
 | M0 — Go/No-Go | **GO (2026-11-15)** | fin S3 | `MEMO_M0_RDNA3.md` |
 | M1 — dense IQR | **atteint et dépassé : 27B texte, décodage 28,4 tok/s (16 tok) / 21,2 (819), préfill 301 tok/s à 819** | fin S8 | W15 : WMMA, occupation gated, mesure M=16384 |
 
@@ -77,14 +77,12 @@
 - **R16** — *résolu* : Flash-Next sert le texte. Les refus runtime (`hc_read`
   M=5, `moe_gather`, `moe_iqr`, router, tête vocabulaire) sont corrigés et le
   serveur répond sur 30/2290/4570 tokens et 4 séquences.
-- **R17** — `logits_gemm_bf16` échoue sur les formes Flash-Next
-  (`n_vocab=248320 n_embd=2560`, M=1..32) : 6 cas kbench, rel_l2 ≈ 0,5. Agent
-  W17 : reproduire, corriger le chemin bf16 (le chemin quantifié et la tête IQR
-  ne doivent pas changer), test de non-régression.
-- **R18** — Trois descriptions de sortie QSA divergent de libref
-  (`qsa_select.nsel` rang 2 au lieu de 1, `qsa_work.nc` `[8]` au lieu de
-  `[seqs]`, `qsa_tail_store.state` `[8,…]` au lieu de `[M,…]`). Agent W17 :
-  corriger et vérifier toutes les sorties QSA.
+- **R17** — *résolu* : la tête `logits_gemm_bf16` indexait l'échelle par ligne
+  (1×128) comme une grille 128×128 ; `HeadPlan`/`HeadQ` portent maintenant
+  `(sbr, sbc)`, rel_l2 0,53 → 1,7e-3, test `logits_bf16_device_test` ajouté.
+- **R18** — *résolu* : `qsa_select.nsel`/`seqused` en rang 1, `qsa_work.nc` en
+  `[S]`, `qsa_tail_store.state` en `[M,1,ring,n]` ; kbench 0 divergence.
 - **R19** — Les timings par row du kbench Flash-Next ne sont pas exploitables :
-  la carte a throttlé (PPT0/PPT1) pendant les 8 minutes. HC/PLE et MoE/QSA
-  restent à mesurer sur carte froide (`--kernels libr3d:libref`, petits lots).
+  la carte a throttlé (PPT0/PPT1) pendant les 8 minutes. HC/PLE, MoE/QSA et
+  η lien restent à mesurer sur carte froide (`--kernels libr3d:libref`,
+  petits lots).

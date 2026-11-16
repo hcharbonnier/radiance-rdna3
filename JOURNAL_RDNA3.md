@@ -611,6 +611,31 @@ de `[M,…]`). Les timings par row ne sont pas exploitables : la carte a throttl
 Deux agents W17 corrigent la tête bf16 et les formes QSA ; re-vérification
 kbench attendue à 0 FAIL et 0 divergence.
 
+## 2026-11-16 — W17 : corrections kbench, Flash-Next conforme
+
+- **`logits_gemm_bf16`** : la tête Flash-Next stocke une échelle par ligne et
+  128 de K (`i8*bf16[1x128]`) ; le chemin du plan l'indexait comme une grille
+  128×128, donc toutes les lignes au-delà de 128 empruntaient les échelles d'un
+  autre bloc (rel_l2 0,50–0,53). `HeadPlan`/`HeadQ` portent désormais
+  `(sbr, sbc)`, les têtes 128×128 gardent leur indexation exacte, et les blocs
+  non positifs ou K non multiple de 128 sont refusés. Nouveau
+  `tests/logits_bf16_device_test.cpp` (M=1/2/8/16/32, forme à blocs, tête bf16
+  simple, refus). rel_l2 retombé à **1,7e-3**.
+- **QSA** : `nsel`/`seqused` en rang 1, `qsa_work.nc` en `[S]`,
+  `qsa_tail_store.state` en `[M,1,ring,n]` ; le test QSA compare maintenant
+  toutes les descriptions à libref.
+- **kbench final** (arbre fusionné, `--kernels libr3d:libref`) :
+  **856/856 cas, 0 échec, 0 divergence**, pire rel_l2 1,2e-2.
+- **Robustesse** : un prompt de 12 001 tokens est refusé avec un HTTP 400 clair
+  et le serveur reste vivant ; les redémarrages sont propres.
+- **Validation** : `r3d_selftest` 159/0/15, `iqr_device_test`,
+  `logits_bf16_device_test`, les quatre tests QSA, `moe_iqr_test` et
+  `moe_w4nl` verts.
+
+Reste non mesuré : HC/PLE, MoE/QSA par row et η lien, à prendre sur carte froide
+(le kbench de 8 min throttle en PPT0/PPT1).
+
+
 
 
 
