@@ -745,23 +745,28 @@ TEST(moe_iqr_on_the_card_matches_the_host_reference) {
      * activation are drawn on any host. A data/kernels*.rkb case is not recorded here: rad-kbench's
      * --record-rows takes its answers from libref, which has no IQR MoE row, and data/kernels_moe.rkb
      * was recorded from a non-IQR expert layer. Once the row lands, this list is the set a recording
-     * should cover. */
+     * should cover.
+     *
+     * Every card plan states equal classes (N_odd = N, K_odd = K). libr3d's routed rows serve one
+     * geometry for both parities and refuse a narrower odd class by name (r3d_moe_tab.h,
+     * libr3d/README.md); the host cases above keep the reference's wider contract, including the
+     * narrower class's zero fill, without asking the card row for behaviour it declines. */
     static const Plan kPlans[] = {
-        { "decode top_k 1, E 4, M 1", 4, 1, 1, 1, { 256, 512 }, { 256, 128 }, false, 0, false, false,
+        { "decode top_k 1, E 4, M 1", 4, 1, 1, 1, { 256, 256 }, { 256, 256 }, false, 0, false, false,
           0x1111u },
-        { "decode top_k 2, E 4, M 1", 4, 2, 1, 1, { 256, 512 }, { 256, 128 }, false, 0, false, false,
+        { "decode top_k 2, E 4, M 1", 4, 2, 1, 1, { 256, 256 }, { 256, 256 }, false, 0, false, false,
           0x2222u },
-        { "decode run of 8, E 8, M 8", 8, 1, 8, 1, { 256, 512 }, { 256, 128 }, false, 0, false, true,
+        { "decode run of 8, E 8, M 8", 8, 1, 8, 1, { 256, 256 }, { 256, 256 }, false, 0, false, true,
           0x3333u },
-        { "map top_k 2, E 4, M 16", 4, 2, 16, 1, { 256, 512 }, { 256, 128 }, false, 0, false, false,
+        { "map top_k 2, E 4, M 16", 4, 2, 16, 1, { 256, 256 }, { 256, 256 }, false, 0, false, false,
           0x4444u },
-        { "map top_k 4, E 4, M 33", 4, 4, 33, 1, { 256, 512 }, { 256, 128 }, false, 0, false, false,
+        { "map top_k 4, E 4, M 33", 4, 4, 33, 1, { 256, 256 }, { 256, 256 }, false, 0, false, false,
           0x5555u },
-        { "map zero rows and drops, E 8", 8, 2, 16, 1, { 256, 512 }, { 256, 128 }, false, 5, true,
+        { "map zero rows and drops, E 8", 8, 2, 16, 1, { 256, 256 }, { 256, 256 }, false, 5, true,
           false, 0x6666u },
-        { "map top_k 1, E 8, M 33", 8, 1, 33, 1, { 256, 512 }, { 256, 128 }, false, 0, false, false,
+        { "map top_k 1, E 8, M 33", 8, 1, 33, 1, { 256, 256 }, { 256, 256 }, false, 0, false, false,
           0x7777u },
-        { "map sorted activation, E 4", 4, 2, 16, 1, { 256, 512 }, { 256, 128 }, true, 0, false,
+        { "map sorted activation, E 4", 4, 2, 16, 1, { 256, 256 }, { 256, 256 }, true, 0, false,
           false, 0x8888u },
         { "parts 2, E 4, M 16", 4, 2, 16, 2, { 512, 512 }, { 256, 256 }, false, 0, false, false,
           0x9999u },
