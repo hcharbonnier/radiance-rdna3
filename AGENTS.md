@@ -52,9 +52,13 @@
 - **Optimisation noyau** : ne pas démarrer de travail d'optimisation sans feu
   vert explicite de l'utilisateur. Une correction de bug de contrat (comme R24)
   n'est pas de l'optimisation et peut être faite sans attendre.
-- **Commit** : seulement sur demande explicite, en séparant code et docs
-  (style du dépôt : `libr3d: ...`, `docs: ...`), sans `.gitignore` ni documents
-  hors dépôt. Jamais de push sans demande.
+- **Commit** : commiter **systématiquement** les modifications **relues et
+  validées** (relecture faite, build + tests + kbench quand applicable), sans
+  attendre une demande ; une modification non relue ou non validée reste dans
+  l'arbre de travail. Séparer code et docs (style du dépôt : `libr3d: ...`,
+  `docs: ...`), sans `.gitignore` ni documents hors dépôt. Un worktree Agent
+  Manager validé est fusionné puis commité dans la foulée. Jamais de push sans
+  demande.
 - **Mesures** : donner le chiffre, la commande et l'état de la carte ; un chiffre
   throttlé (PPT0/PPT1) est invalide. Comparer à la borne (plancher de lancement,
   débit mémoire) et pas seulement entre versions.
