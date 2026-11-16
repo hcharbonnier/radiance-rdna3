@@ -361,3 +361,157 @@ int r3d_rad_router_sigmoid_topk(const RadArgs* a, RadStream s)
 }
 
 }  // extern "C"
+
+
+/* ------------------------------------------------------- router_gemm_topk_scatter
+ *
+ * The router's GEMM, its top-k and the counting sort as the one op docs/OPS.md declares, plus the
+ * shared expert's one-column gate when the caller brings `gate_b` and `gate`. libr3d serves it by
+ * composing the *device* launches it stands in for, in order:
+ *
+ *   1. `gemm_nt` of a [M,K] against the router b [n_expert,K] into logits -- the same skinny row
+ *      the unfused router resolves to: gemm_nt_bf16_m16 at M <= 16 (split-K as its law picks) and
+ *      gemm_nt_bf16_tiled above, so the bytes are the pair's;
+ *   2. the shared gate at N = 1 over the same a, in 16-row chunks through the m16 row (its own
+ *      band is M <= 16, and a row of the product depends on no other, so chunking is exact);
+ *   3. `router_topk_scatter` over those logits, the device row itself.
+ *
+ * It is therefore not a single-launch fusion: the arrival-counter form is libr4d's, and the
+ * selection still waits on a stream barrier. It exists so the op resolves in device instead of
+ * falling back to the host `avx_router_gemm_topk_scatter`, and every output is what the separate
+ * launches would write. Scratch is the m16 router's f32 partial arena; the tiled band asks for
+ * none. A tuned point for the unfused router's gemm_nt would reach it where the pair's tuning
+ * differs; no shipped configuration tunes these GEMMs (docs/OPS.md). */
+
+extern "C" {
+int r3d_rad_gemm_nt_bf16_m16(const RadArgs*, RadStream);
+int r3d_rad_gemm_nt_bf16_tiled(const RadArgs*, RadStream);
+}
+
+namespace {
+
+/* r3d_gemm_bf16_nt_m16.hip's split law: the largest ladder step whose slab is whole 8-k steps. */
+int rg_pick_sk(long long K, int maxsk) {
+    static const int ladder[] = { 16, 8, 4, 2, 1 };
+    for (int s : ladder)
+        if (s <= maxsk && K % ((long long)s * 8) == 0) return s;
+    return 1;
+}
+
+/* One gemm_nt launch over a triple of the fused op's operands, with the same split/impl the
+ * unfused row reads (the fused op carries no tune keys, so the row defaults). */
+int rg_gemm(const RadArgs* a, RadStream s, const RadTensor& x, const RadTensor& w,
+            const RadTensor& y, long long N, long long K, bool m16) {
+    RadTensor t[3] = { x, w, y };
+    RadParam p[3] = { RAD_INT("N", N), RAD_INT("K", K), RAD_STR("dtype", "bf16") };
+    RadArgs ga;
+    std::memset(&ga, 0, sizeof ga);
+    ga.t = t; ga.n_t = 3;
+    ga.p = p; ga.n_p = 3;
+    ga.scratch = a->scratch;
+    ga.scratch_bytes = a->scratch_bytes;
+    ga.rank = a->rank;
+    ga.world_size = a->world_size;
+    return m16 ? r3d_rad_gemm_nt_bf16_m16(&ga, s) : r3d_rad_gemm_nt_bf16_tiled(&ga, s);
+}
+
+/* The shared expert's gate: a [M,K] x gate_b [1,K]^T -> gate [M,1] through the m16 row, whose
+ * band is 16 rows, one chunk at a time. A row of the product reads only its own activation row,
+ * so the chunking changes no bit. `nt` is the m16 row's default (non-temporal weight streaming). */
+int rg_gate(const RadArgs* a, RadStream s, const RadTensor& x, const RadTensor& gb,
+            const RadTensor& y, long long M, long long K) {
+    const int sk = rg_pick_sk(K, 16);
+    if (sk > 1 && (!a->scratch || a->scratch_bytes < (long long)sk * 16 * 4))
+        return R3D_NO(RAD_E_SCRATCH);
+    const unsigned short* xp = (const unsigned short*)r3d_p(&x);
+    unsigned short* yp = (unsigned short*)r3d_wp(&y);
+    for (long long i = 0; i < M; i += 16) {
+        const int mc = (int)((M - i) < 16 ? (M - i) : 16);
+        const int e = r3d_gemm_nt_bf16_m16(
+            (long)(uintptr_t)(xp + (size_t)i * (size_t)K), (long)r3d_addr(&gb),
+            (long)(uintptr_t)(yp + i), mc, 1, (int)K, (int)K, 1, sk, 8, 1,
+            (long)(uintptr_t)(sk > 1 ? a->scratch : nullptr), (long)(uintptr_t)s);
+        if (e != 0)
+            return R3D_NO(e == -1 ? RAD_E_INVAL : e == -2 ? RAD_E_SHAPE
+                             : e == -3 ? RAD_E_STRIDE : RAD_E_DEVICE);
+    }
+    return RAD_OK;
+}
+
+}  // namespace
+
+extern "C" int r3d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s)
+{
+    if (!a || a->n_t < 9) return R3D_NO(RAD_E_INVAL);
+    const RadTensor* x = r3d_opt(a, 0), *wr = r3d_opt(a, 1), *wg = r3d_opt(a, 2),
+                    *lg = r3d_opt(a, 3), *ids = r3d_opt(a, 4), *w = r3d_opt(a, 5),
+                    *st = r3d_opt(a, 6), *off = r3d_opt(a, 7), *cnt = r3d_opt(a, 8);
+    const RadTensor* gate = r3d_opt(a, 9);   /* absent slot has null data */
+    if (!r3d_p(x) || !r3d_p(wr) || !r3d_wp(lg) || !r3d_wp(ids) || !r3d_wp(w) || !r3d_wp(st) ||
+        !r3d_wp(off) || !r3d_wp(cnt))
+        return R3D_NO(RAD_E_INVAL);
+    /* The gate weight and its output come together or not at all, as the reference states. */
+    if (r3d_has(wg) != r3d_has(gate)) return R3D_NO(RAD_E_INVAL);
+
+    const long long ne = r3d_geti_or(a, "n_expert", 0);
+    const long long tk = r3d_geti_or(a, "top_k", 0);
+    const long long nl = r3d_geti_or(a, "n_local", ne);
+    const long long norm = r3d_geti_or(a, "norm", 0);
+    (void)norm;
+    if (ne <= 0 || ne > 512 || tk <= 0 || tk > kW || tk > ne) return R3D_NO(RAD_E_SHAPE);
+    if (nl <= 0 || nl > ne) return R3D_NO(RAD_E_SHAPE);
+
+    if (x->dtype != RAD_BF16 || wr->dtype != RAD_BF16 || lg->dtype != RAD_BF16 ||
+        w->dtype != RAD_BF16)
+        return R3D_NO(RAD_E_DTYPE);
+    if (wg && (wg->dtype != RAD_BF16 || gate->dtype != RAD_BF16)) return R3D_NO(RAD_E_DTYPE);
+    if (ids->dtype != RAD_I32 || st->dtype != RAD_I32 || off->dtype != RAD_I32 ||
+        cnt->dtype != RAD_I32)
+        return R3D_NO(RAD_E_DTYPE);
+
+    long long M = 0, K = 0;
+    if (r3d_rows_of(x, &M, &K) != RAD_OK) return R3D_NO(RAD_E_SHAPE);
+    if (M < 1 || M > 64) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_geti_or(a, "K", K) != K) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_dim(wr, 0) != ne || r3d_dim(wr, 1) != K) return R3D_NO(RAD_E_SHAPE);
+    /* The GEMM reads contiguous rows; the pair's tiled band wants K on its 32-code chunk. */
+    if (!r3d_contig(x) || !r3d_contig(wr) || !r3d_contig(lg)) return R3D_NO(RAD_E_STRIDE);
+    if (K % 32) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(lg) < M * ne) return R3D_NO(RAD_E_SHAPE);
+
+    const long long T = M * tk;
+    if (T > 1024) return R3D_NO(RAD_E_SHAPE);            /* the sort's one-workgroup form */
+    if (!r3d_contig(ids) || !r3d_contig(w) || !r3d_contig(st) || !r3d_contig(off) ||
+        !r3d_contig(cnt))
+        return R3D_NO(RAD_E_STRIDE);
+    if (r3d_numel(ids) < T || r3d_numel(w) < T || r3d_numel(st) < T) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(off) < nl + 1 || r3d_numel(cnt) < nl) return R3D_NO(RAD_E_SHAPE);
+    if (wg) {
+        if (r3d_dim(wg, 0) != 1 || r3d_dim(wg, 1) != K) return R3D_NO(RAD_E_SHAPE);
+        if (!r3d_contig(wg) || !r3d_contig(gate)) return R3D_NO(RAD_E_STRIDE);
+        if (r3d_numel(gate) < M) return R3D_NO(RAD_E_SHAPE);
+    }
+    if (!r3d_aligned(r3d_p(x), 16) || !r3d_aligned(r3d_p(wr), 16))
+        return R3D_NO(RAD_E_ALIGN);
+
+    /* 1) The router GEMM: the same row the unfused router resolves to, m16 at decode heights and
+     * the tiled row above. */
+    int rc = rg_gemm(a, s, *x, *wr, *lg, ne, K, M <= 16);
+    if (rc != RAD_OK) return rc;
+
+    /* 2) The shared expert's gate, at N = 1 over the same activation. */
+    if (wg) {
+        rc = rg_gate(a, s, *x, *wg, *gate, M, K);
+        if (rc != RAD_OK) return rc;
+    }
+
+    /* 3) The selection and the sort, the device row itself; every parameter it reads is a
+     * parameter of this op under the same name. */
+    RadTensor t6[6] = { *lg, *ids, *w, *st, *off, *cnt };
+    RadArgs fa;
+    std::memset(&fa, 0, sizeof fa);
+    fa.t = t6; fa.n_t = 6;
+    fa.p = a->p; fa.n_p = a->n_p;
+    fa.rank = a->rank; fa.world_size = a->world_size;
+    return r3d_rad_router_topk_scatter(&fa, s);
+}

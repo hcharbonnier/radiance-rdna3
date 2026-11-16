@@ -213,6 +213,24 @@ static const RadParamSpec pRouterTopkScatter[] = { P_INT("M"), P_INT("n_expert")
                                                    P_INT("top_k"), P_INT("norm"), P_STR("dtype"),
                                                    P_INTO("expert_base"), P_STRO("protect") };
 
+ /* router_gemm_topk_scatter: the router GEMM, the pair, and -- when gate_b and gate come together
+  * -- the shared expert's one-column gate. The union of the three operand lists, `logits` named
+  * once as the GEMM's output, as libref's schema. */
+static const RadOperandSpec oRouterGemmTopkScatter[] = { { "a", RAD_OPD_IN, 0 },
+                                                         { "b", RAD_OPD_WEIGHT, 0 },
+                                                         { "gate_b", RAD_OPD_WEIGHT, 1 },
+                                                         { "logits", RAD_OPD_OUT, 0 },
+                                                         { "expert_ids", RAD_OPD_OUT, 0 },
+                                                         { "expert_w", RAD_OPD_OUT, 0 },
+                                                         { "sorted_tok", RAD_OPD_OUT, 0 },
+                                                         { "expert_offset", RAD_OPD_OUT, 0 },
+                                                         { "expert_count", RAD_OPD_OUT, 0 },
+                                                         { "gate", RAD_OPD_OUT, 1 } };
+static const RadParamSpec pRouterGemmTopkScatter[] = { P_INT("M"), P_INT("K"), P_INT("n_expert"),
+                                                       P_INTO("n_local"), P_INT("top_k"),
+                                                       P_INT("norm"), P_STR("dtype"),
+                                                       P_INTO("expert_base"), P_STRO("protect") };
+
  /* router_sigmoid_topk: the GLM-style router -- logits, the per-expert correction bias, and the
   * selection (expert_ids, expert_w). */
 static const RadOperandSpec oRouterSigmoid[] = { { "logits", RAD_OPD_IN, 0 },
@@ -1030,6 +1048,11 @@ static const RadOpSchema kSchemas[] = {
            "Group-limited sigmoid routing: groups rank by the sum of their two best p + bias, "
            "selection runs over the topk_group best groups; correction bias selects, original "
            "scores weight."),
+    SCHEMA("router_gemm_topk_scatter", pRouterGemmTopkScatter, oRouterGemmTopkScatter,
+            "The router GEMM, its top-k and the counting sort as one op -- `gemm_nt` of `a` "
+            "against the router `b`, then `router_topk_scatter` over those logits -- and, with "
+            "`gate_b`/`gate` present, the shared expert's one-column `gemm_nt` over the same `a`."),
+
     SCHEMA("router_sigmoid_topk", pRouterSigmoid, oRouterSigmoid,
             "The GLM-style router: scores = sigmoid(logits), the selection on scores + bias, the "
             "kept weights the scores scaled by route_scale (renormalised if `norm`). Ties to the "
@@ -1511,6 +1534,22 @@ static int64_t gemm_scratch(const RadParam* p, int n_p) {
     return sk * M * N * 4 + sk * 64;
 }
 
+/* The fused router GEMM's scratch: the m16 arm's f32 partial arena at the band's M, whose split
+ * cap is kSk's top (r3d_gemm_bf16_nt_m16.hip's ladder). The tiled arm above M = 16 asks for none,
+ * and the gate's N = 1 arena is far smaller; the shared arena holds whichever arm the step picks. */
+static int64_t router_fused_scratch(const RadArgs* a) {
+    if (!a) return 0;
+    const long long M = rad_param_getdim(a->p, a->n_p, "M", 0);
+    const long long ne = rad_param_getdim(a->p, a->n_p, "n_expert", 0);
+    const long long sk = kSk[NELEM(kSk) - 1];
+    if (M <= 0 || ne <= 0) return 0;
+    return sk * M * ne * 4 + sk * 64;
+}
+
+/* The fused router row (r3d_moe_router_topk_bf16.hip), declared here because the plugin's own
+ * header is not the ABI. */
+extern "C" int r3d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s);
+
 /* ================================================================== constraints
  *
  * What the kernel cannot do, and what the selector needs. Divisibility follows the unit's lane map:
@@ -1766,6 +1805,14 @@ static const RadConstraint cMoeGather[] = { C_GE("M", 1), C_GE("n", 1), C_GE("to
 static const RadConstraint cRouterTopkScatter[] = { C_GE("M", 1), C_GE("n_expert", 1),
                                                     C_GE("top_k", 1), C_LE("n_expert", 512),
                                                     C_IN("dtype", "bf16") };
+/* The fused router GEMM's decode band: M <= 64 (past it the router is the tiled GEMM the caller
+ * issues separately), K on the 32-code chunk the tiled arm's swizzle needs, and the top-k/sort
+ * bounds of router_topk_scatter. No constraint on n_local, expert_base or protect: all optional. */
+static const RadConstraint cRouterGemmTopkScatter[] = { C_GE("M", 1), C_LE("M", 64),
+                                                        C_GE("K", 1), C_DIV("K", 32),
+                                                        C_GE("n_expert", 1), C_LE("n_expert", 512),
+                                                        C_GE("top_k", 1), C_LE("top_k", 32),
+                                                        C_IN("dtype", "bf16") };
 static const RadConstraint cRouterSigmoid[] = { C_GE("M", 1), C_GE("n_expert", 1),
                                                 C_GE("top_k", 1), C_LE("n_expert", 512),
                                                 C_IN("dtype", "bf16") };
@@ -2801,6 +2848,22 @@ static const RadKernelInfo kKernels[] = {
   ROW(cRouterTopkScatter), NOTUNE,
   nullptr, nullptr, r3d_rad_router_topk_scatter,
   nullptr, nullptr, nullptr,
+  nullptr, nullptr },
+
+ { "moe_router_gemm_topk_scatter", "router_gemm_topk_scatter", "moe",
+  "The router GEMM, its top-k and the counting sort as one device op: gemm_nt of a [M,K] against "
+  "the router b [n_expert,K], then router_topk_scatter over those logits, and the shared expert's "
+  "one-column gate beside them when gate_b/gate are present",
+  "the device launches the pair would run, in order -- gemm_nt_bf16_m16 at M <= 16 and "
+  "gemm_nt_bf16_tiled above (the same split and impl the unfused rows pick), the gate in 16-row "
+  "m16 chunks at N = 1, then moe_router_topk_scatter; not a single-launch fusion",
+  "bf16 a [M,K], router b [ne,K], optional gate_b [1,K]; bf16 logits [M,ne], expert_w [M,k] and "
+  "optional gate [M,1]; i32 expert_ids [M,k], sorted_tok [M*k], expert_offset [nl+1], "
+  "expert_count [nl]; M <= 64, K%32 == 0, n_expert <= 512, top_k <= 32, M*top_k <= 1024",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cRouterGemmTopkScatter), NOTUNE,
+  nullptr, nullptr, r3d_rad_router_gemm_topk_scatter,
+  router_fused_scratch, nullptr, nullptr,
   nullptr, nullptr },
 
  { "moe_router_sigmoid_topk", "router_sigmoid_topk", "moe",
