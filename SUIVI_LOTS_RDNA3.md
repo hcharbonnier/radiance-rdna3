@@ -35,12 +35,12 @@
 | M3 — QSA | **atteint** : équivalent au dense, 103 GFLOP/s à M=512 | fin S10 | `qsa_score` reste le poste QSA à optimiser |
 | M4 — coûts documentés | **atteint** : HC, PLE, QSA par row à froid | fin S10 | MoE par row bloqué (format des tables) |
 | M5 — Flash-Next texte | **atteint** : 1/4/6 séquences, 8k et 16k, robustesse ; **vision livrée** (W26) | fin S12 | image 512²/1024² servie, `capabilities.image=true` |
-| M6 — démo serveur | **atteint avec une limite** | fin S12 | R21 résolu (tier KV actif) ; snapshots absents en rejeu multi-agents (R22) |
+| M6 — démo serveur | **atteint** | fin S12 | R21 (tier KV) et R22 (snapshots courts) résolus ; vision livrée (W26) |
 
 ## Prochains lots (W21–W25)
 
-État : W0–W20 livrés, R21 (la moitié « tier KV » de W22) livré, **W26 (vision)
-livré** ; M0, M1, M3, M4, M5, M6 atteints ; **M2 non tenu** (η lien 1,7 %).
+État : W0–W20 livrés, **W22 (R21 et R22) livré**, **W26 (vision) livré** ;
+M0, M1, M3, M4, M5, M6 atteints ; **M2 non tenu** (η lien 1,7 %).
 **Périmètre révisé le 2026-11-16** (ADR-7) : la vision et le MTP de Flash-Next
 entrent dans la cible ; la vision est faite, l'ADR-6 est supersédé et
 `num-speculative-tokens: 0` n'est plus qu'un repli. L'ordre ci-dessous est
@@ -49,7 +49,7 @@ celui de la valeur décroissante.
 | lot | contenu | entrée | critère de sortie |
 |---|---|---|---|
 | **W21 — `hc_read` (R20)** | profil `--profile-ops true` sur Flash-Next, attribution du coût (lecture relue par ligne ? décodage E4M3 ? latence ?), correction | mesures W18 (1,77 ms à M=1), A/B deux-grilles déjà fait (mêmes temps) | `hc_read` M=1 ramené vers la borne de la row (≈20 µs) ou cause écrite ; décodage Flash-Next ≥ ×2 ; kbench 856/856 |
-| **W22 — cache multi-tour (R21, R22)** | **R21 fait** : rows `gather_rows`/`scatter_rows` device u8 pour les fragments KV opaques (4 128 octets), test `gather_rows_u8_device_test` ; **reste R22** : politique de snapshots en rejeu agent | tier actif sur Flash-Next (2 groupes, 51,38 Kio/entrée) et 27B (516 Kio/entrée), copie + restauration vérifiées ; 0 % en rejeu agent | tier KV actif ; conversation de 3 tours > 0 token servi ; 32k tenu ; `no_snapshot` disparaît |
+| **W22 — cache multi-tour (R21, R22)** — **fait** | R21 : rows u8 `gather_rows`/`scatter_rows` (fragments KV opaques, 4 128 octets), test `gather_rows_u8_device_test` ; R22 : ancre de queue pour un prompt sous le premier intervalle, rejeu 9 tours 24 % → **52,6 %** de tokens servis, `no_snapshot` 6 → 2, checkpoints 1 → 7 | tier actif sur Flash-Next (2 groupes, 51,38 Kio/entrée) et 27B (516 Kio/entrée) ; **0 % en rejeu agent** avant R22 | tier KV actif ; conversation de 3 tours > 0 token servi ; 32k tenu ; `no_snapshot` disparaît (hors premiers tours de sous-agents) |
 | **W23 — MoE mesurable (R23)** | aligner les tags de format conteneur ↔ hook de layout, ou fixture `--record` ; puis temps par row et η lien par noyau | 110 cas `moe_gemm_q` sautés | kbench couvre `moe_gemm_q` sur le conteneur ; η lien MoE calculé ; 2.11/2.12 tranchés |
 | **W24 — QSA et clôture doc** | `qsa_score` à M=512 (3.8), doc des 5 ops QSA (3.9), `docs/OPS.md` + `libr3d/README.md` (1.5/5.7/8.6), `RAPPORT` (5.6), handover final (8.7) | 83,4 ms à M=512 (2 % du pic) | `qsa_score` ≥ 20 % du pic ou cause écrite ; doc publiée ; décision d'ajout du RAPPORT prise |
 | **W25 — MTP Flash-Next (R25, ADR-7)** | rows device `mtp_enter` et `logit_rerank` dans `libr3d` (contrats de `libr4d`), tests device ; puis `num-speculative-tokens > 0` et couverture MTP 48 de kbench | plugin `qwen4exp_fp8` déclare les trois ops MTP à `NS > 0` ; libr3d n'a aucune des deux rows ; 78 cas kbench « Not covered » dont le MTP 48 | MTP servi ; kbench MTP 48 couvert (0 « Not covered » MTP) ; gain de décodage mesuré ; 27B inchangé (`NS=0`) |
@@ -145,11 +145,16 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   0 coupe, avec `RADIANCE_DEBUG_TIER_VERIFY=1` (hash des octets copiés puis
   restaurés). Le test `gather_rows_u8_device_test` couvre les octets opaques
   (toutes les valeurs, indices -1/hors plan, pitches larges, M = 1/8/2 048).
-- **R22** — En rejeu multi-agents (5 tours entrelacés), le cache de préfixe ne
-  sert **rien** (0 %, `no_snapshot` ×4, 1 checkpoint écrit) alors qu'un prompt
-  identique sert 4 096 tokens et qu'une conversation qui grandit sert 2 048 par
-  tour. Politique `geometric-backoff`/snapshots à revoir pour les
-  conversations concurrentes.
+- **R22** — *résolu* : sous `--prefix-resume exact` un prompt plus court qu'un
+  intervalle n'avait ni point de grille ni snapshot, donc le tour suivant ne
+  reprenait aucun état linéaire. Une ancre de queue (dernière frontière de
+  quantum, un quantum plus bas hors grille, dès 256 tokens d'ancre) donne au
+  rejeu 9 tours **52,6 %** de tokens servis (24 % avant), `no_snapshot`
+  6 → 2 et 7 checkpoints écrits (1 avant). Compromis : sous le premier
+  intervalle la reprise est hors grille, comme `nearest`, donc l'accord bit à
+  bit n'est garanti que pour un prompt répété ; au-delà, `exact` reste strict.
+  Les 2 `no_snapshot` restants sont les premiers tours des sous-agents (rien à
+  reprendre avant leur propre ancre).
 - **R23** — `kbench` ne peut pas poser les tables MoE du conteneur (110 cas
   sautés : « container format error » sur le treillis, « shape this kernel does
   not serve » sur `w4nl`), donc le temps par row MoE et η lien par noyau ne

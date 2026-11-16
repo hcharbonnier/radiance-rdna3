@@ -176,13 +176,16 @@ for (op, geom), d in sorted(rows.items()):
 
 ```bash
 flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
+  ./build/tests/sched_test && ./build/tests/engine_e2e_test && \
   ./build/tests/iqr_device_test && ./build/tests/logits_bf16_device_test && \
   ./build/tests/gather_rows_u8_device_test && ./build/tests/vision_rows_device_test && \
   ./build/bin/r3d_selftest ./build/radiance_home/kernels/libr3d.so'
 ```
 
-État de référence de la branche (R21 + R26, commit `7338226`) : **161 rows, 0
-échec, 15 skips** ; `kbench` Flash-Next **856/856** et 27B **605/605**, 0 échec,
+État de référence de la branche (R21 + R22 + R26, merge `68d0e52`) : **161
+rows, 0 échec, 15 skips** ; `sched_test` **548 782 checks, 0 échec** et
+`engine_e2e_test` **909 checks, 0 échec** (3 skips) ; `kbench` Flash-Next
+**856/856** et 27B **605/605**, 0 échec,
 0 divergence, **dans les deux modes** (défaut et `--band-capacity`). Test de
 contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
 `gather_rows_u8_device_test` couvre les rows u8 du tier KV (fragment 4 128 octets,
@@ -219,4 +222,11 @@ est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill ≈ 318 tok/s
   nombre de lignes du pas : l'étendue est sur les tenseurs. Une row qui compare
   les deux casse le multi-séquence du moteur (bug R24, corrigé en W20) ;
   `--band-capacity` couvre cette classe.
+- **`--prefix-resume exact`** : un prompt plus court que le premier intervalle
+  ancre un snapshot de queue hors grille (la dernière frontière de quantum, un
+  quantum plus bas si elle est hors grille), dès 256 tokens d'ancre. La reprise
+  d'un tour appendu court n'est donc plus garantie bit à bit (comme sous
+  `nearest`) ; un prompt répété reste exact et, au-delà de l'intervalle,
+  `exact` reste strict. Ne pas « corriger » cette ancre sans relire R22
+  (`core/sched/scheduler.cpp`, `ChunkGeometry`).
 - Ne pas lancer deux benchmarks ou un benchmark pendant qu'un agent teste.

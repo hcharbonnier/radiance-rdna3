@@ -802,6 +802,58 @@ après scatter) :
 
 Reste de W22 : R22 (snapshots en rejeu multi-agents), inchangé.
 
+## 2026-11-16 — W22b : snapshots des tours courts (R22)
+
+**Cause racine.** Sous `--prefix-resume exact` (défaut), la grille de reprise
+vaut l'intervalle (2 048) à partir de 0. `Scheduler::tail_checkpoint()` ne
+rendait un snapshot que si `grid_floor(target − 1) > intervalle`, donc **tout
+prompt sous 2 048 tokens n'écrivait aucun checkpoint**. Le tour suivant
+matchait ses blocs d'attention mais n'avait pas de slot d'état linéaire
+(`checkpoint_slot < 0`), d'où `reuse = 0` et `HitCut::NoSnapshot`. Ce n'était
+pas la rétention : 1 checkpoint **écrit** pour 9 tours.
+
+**Correctif.** Ancre de queue (branche `rdna3-r22-snapshots`, commit
+`7188fe2`) : pour `target ≤ intervalle`, snapshot à la dernière frontière de
+quantum ; si elle n'est pas une frontière froide (multiple de l'intervalle ou
+point de grille), reculer d'un quantum pour qu'un client qui re-rend les
+derniers tokens reste sur le préfixe haché. Seuil `kShortTailMin = 256` tokens
+d'ancre, seulement si le cache de préfixe est actif. Le préfill froid coupe à
+l'ancre (chunk final court) ; le tour suivant reprend là. Au-delà du premier
+intervalle, `exact` reste strictement sur la grille.
+
+**Mesures** (Flash-Next, `max-model-len 8192`, KV i8, `prefix-cache-mib 1024`,
+`max-num-seqs 1`, GPU sous `flock`, même graine ; rejeu
+`agentreplay.py --parents 1 --turns 5 --system 600 --turn 400,700 --reply 32
+--sub-every 2 --sub-turns 2 --seed 3`, 9 tours / 17 k tokens) :
+
+| | avant (`06226d1`) | après (`7188fe2`) |
+|---|---|---|
+| tokens servis | 4 096 / 17 027 (24 %) | **9 088 / 17 265 (52,6 %)** |
+| préfill recalculé | 12 931 | 8 177 (−37 %) |
+| `no_snapshot` | 6 | **2** |
+| checkpoints écrits | 1 | **7** |
+| TTFT parent / après sous-agent / sous-agent suivant | 31,8 / 51,6 / 32,7 s | 22,9 / 28,9 / 10,6 s |
+
+Les 2 `no_snapshot` restants sont les premiers tours des sous-agents (rien à
+reprendre avant leur propre ancre) ; leurs tours suivants servent 960 et 896
+tokens.
+
+**Validation.** `sched_test` 548 782 checks / 196 cas, 0 échec ;
+`engine_e2e_test` complet 0 échec ; `iqr_device_test`,
+`logits_bf16_device_test`, `gather_rows_u8_device_test`,
+`vision_rows_device_test` et `r3d_selftest` (161/0/15) verts. Tests ajoutés :
+ancre planifiée sous `exact` et `nearest`, reprise sans arrondi à la grille,
+propriété « tout checkpoint au-delà du premier intervalle est un début de
+chunk froid », et un test e2e de trois tours de 600 tokens dont le tour 2
+sert ≥ 256 tokens avec `no_snapshot = 0` (vérifié rouge sans le correctif).
+
+**Compromis et reste.** Tout prompt de 256…2 048 tokens paie un snapshot et
+souvent un chunk final court ; sous le premier intervalle la reprise est hors
+grille (comme `nearest`), donc l'accord bit à bit n'est plus garanti pour un
+tour appendu court — un prompt répété reste exact, et au-delà de l'intervalle
+`exact` reste strict. Non couvert : premier tour d'un sous-agent (pas d'ancre
+partagée), tours réécrits dont la divergence précède l'ancre.
+
 ## 2026-11-16 — décision de périmètre : vision et MTP de Flash-Next dans la v1
 
 Décision utilisateur, consignée dans **`docs/adr/ADR-0007-v1-vision-and-mtp.md`**

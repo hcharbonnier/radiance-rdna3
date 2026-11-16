@@ -1409,6 +1409,14 @@ its tail in other chunks than a cold prefill can flip a near-tie in greedy text.
   chunk starts, a boundary the chunk already ends on, so it costs a copy and no step. An exact
   repeat re-prefills the cold run's last chunk; an appended turn re-prefills that chunk and what
   the turn added.
+  One exception: a prompt **shorter than its first checkpoint interval** has no grid position to
+  resume at, so it anchors a tail snapshot one quantum below its last boundary, once that anchor
+  reaches 256 tokens (`Scheduler::kShortTailMin`). Without it an agent conversation whose turns
+  stay under an interval would reuse no linear state at all and re-prefill the whole transcript
+  every turn.
+  The cost is one snapshot and a short final chunk, and the next turn recomputes that interval's
+  end in a shorter chunk: the trade `nearest` already makes at every tail, so a near-tie in
+  greedy text below the first interval can follow the resumed chunking rather than a cold run's.
 - `nearest`: a hit resumes at the deepest snapshot or block, and a prompt's tail snapshot is at
   its last quantum boundary. A turn re-prefills up to one chunk less than under `exact`.
 

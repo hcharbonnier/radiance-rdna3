@@ -28,9 +28,18 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       préfill 2 048 (item 3.8).
 
 **P1 — cache multi-tour, périmètre servi, couverture MoE**
-- [ ] **R22 snapshots multi-agents** — 0 % de cache servi en rejeu agent
-      (`no_snapshot` ×4, 1 checkpoint/5 tours) ; revoir `geometric-backoff` et la
-      rétention des snapshots.
+- [x] **R22 snapshots multi-agents** — cause : sous `--prefix-resume exact`
+      un prompt plus court qu'un intervalle n'avait ni point de grille ni
+      snapshot, donc le tour suivant ne reprenait aucun état linéaire
+      (`no_snapshot`). Correctif : ancre de queue au dernier frontière de
+      quantum (un quantum plus bas hors grille), dès que l'ancre atteint 256
+      tokens. Rejeu de 9 tours : tokens servis 24 % → **52,6 %**, préfill
+      recalculé −37 %, `no_snapshot` 6 → **2** (premiers tours de
+      sous-agents), checkpoints écrits 1 → **7** ; `sched_test` 548 782
+      checks, `engine_e2e_test` et tests device verts. Compromis documenté :
+      sous le premier intervalle, la reprise est hors grille (comme
+      `nearest`), donc l'accord bit à bit n'est plus garanti pour un tour
+      appendu court, seulement pour un prompt répété.
 - [ ] **R23 tables MoE** — kbench ne pose pas les tables du conteneur (110 cas
       sautés) ; aligner les tags de format ou passer par une fixture
       `--record`, puis remplir le temps par row MoE et η lien par noyau.
@@ -97,8 +106,8 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       deux modes et 480/480 cas vision, 0 divergence
 - [x] M3 (QSA) — équivalent au dense, 4 ops device vertes
 - [x] M4 — coûts HC/PLE/QSA documentés (MoE par row bloqué, cf. R23)
-- [x] M5 / M6 — Flash-Next texte 1/4/6 séquences, 8k et 16k, démo et
-      robustesse ; R21 résolu, R22 encore documentée
+- [x] M5 / M6 — Flash-Next texte 1/4/6 séquences, 8k et 16k, démo,
+      robustesse et vision ; R21 et R22 résolus
 - [!] M2 — η lien **1,7 %** contre 80 % : cause mesurée (`hc_read`), lot W21
 
 ## 1. W1/W2 — formes IQR restantes (prérequis MoE)

@@ -474,12 +474,17 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
   fragment 4 128 octets) et passent par les rows u8 dédiées, sans codec E4M3.
   Flash-Next : 2 groupes paginés, 51,38 Kio/entrée ; 27B : 1 groupe,
   516 Kio/entrée. Copie et restauration mesurées (27B : `to_host` 471,
-  `promoted` 245, 0 échec), hash de vérification actif. Reste R22 (snapshots
-  d'état linéaire) pour le rejeu multi-agents.
-- **Snapshots d'état linéaire en rejeu multi-agents (M6)** : 1 seul checkpoint
-  écrit pour 5 tours entrelacés et 0 % de cache servi (`no_snapshot` ×4) ; la
-  politique `geometric-backoff` (4 snapshots pour 8 192 tokens) est à revoir
-  pour les conversations concurrentes.
+  `promoted` 245, 0 échec), hash de vérification actif.
+- **Snapshots d'état linéaire en rejeu multi-agents (M6)** : **résolu en W22b**.
+  Sous `--prefix-resume exact`, un prompt plus court qu'un intervalle n'avait
+  ni point de grille ni snapshot, donc le tour suivant reprenait zéro état
+  linéaire (`no_snapshot`). Il ancre maintenant un snapshot au dernier
+  frontière de quantum (un quantum plus bas hors grille), dès 256 tokens
+  d'ancre. Rejeu 9 tours : tokens servis 24 % → **52,6 %**, préfill recalculé
+  −37 %, `no_snapshot` 6 → 2 (premiers tours de sous-agents), checkpoints
+  écrits 1 → 7. Compromis : sous le premier intervalle la reprise est hors
+  grille, comme `nearest` ; l'accord bit à bit n'y est plus garanti pour un
+  tour appendu (un prompt répété reste exact), au-delà `exact` reste strict.
 - **E4M3/rotated** : aucun modèle non-IQR sur l'hôte.
 
 

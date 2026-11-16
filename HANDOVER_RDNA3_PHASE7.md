@@ -18,9 +18,10 @@ faire (W25). Ce document remplace
 | Contrat capacité (W20) | `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` : rouge sur `a772d70`, vert sur `fae6c44` |
 | R21 tier KV (W22a) | rows u8 `gather_rows`/`scatter_rows` ; Flash-Next **2 groupes, 51,38 Kio/entrée**, 27B **1 groupe, 516 Kio** ; rejeu 27B : `to_host` 471, `promoted` 245, 0 échec (hash de vérification actif) |
 | R26 vision (W26) | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3, ffmpeg 8.0) ; tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16 384 patches ; `capabilities.image=true` ; 512² : 256 tokens image (281 avec le texte), TTFT 8,19 s ; 1024² : 1 024 tokens, TTFT 28,73 s ; 2048² : 4 096 tokens, TTFT 121,5 s ; 3000² redimensionnée ; 18 cas de robustesse (2 images, alpha/JPEG, 4 × 400) sans fuite ; 480/480 cas vision et 856/856 kbench, 0 divergence |
+| R22 snapshots (W22b) | ancre de queue sous le premier intervalle ; rejeu 9 tours : tokens servis 24 % → **52,6 %**, préfill recalculé −37 %, `no_snapshot` 6 → 2, checkpoints 1 → 7 ; `sched_test` 548 782 checks, `engine_e2e_test` et tests device verts |
 | Périmètre v1 (2026-11-16) | vision **livrée** (W26 : image 512²/1024² servie, `capabilities.image=true`) ; MTP Flash-Next **inclus** (ADR-7) et restant à livrer (W25, rows `mtp_enter`/`logit_rerank`) ; le 27B reste à `NS=0` |
 | Mesures à froid W18 (HC/PLE/QSA par row) | 182 + 147 cas, 0 échec ; `hc_read` **1,77 ms à M=1** (η 0,6 %), η lien **1,7 %**, MoE par row bloqué (format du conteneur) |
-| Démo serveur M6 / W19 | préfill 38,7–41,9 tok/s, décodage 4,41 (1 séq.) / 15,5 (4) / 22,1 (6) tok/s ; cache ×12 sur prompt identique, **0 % en rejeu agent** (R22 ouverte) ; 4 décodeurs ×7,0 à côté d'un préfill |
+| Démo serveur M6 / W19 | préfill 38,7–41,9 tok/s, décodage 4,41 (1 séq.) / 15,5 (4) / 22,1 (6) tok/s ; cache ×12 sur prompt identique ; **R22 résolu** : rejeu 9 tours 24 % → 52,6 % de tokens servis, `no_snapshot` 6 → 2 ; 4 décodeurs ×7,0 à côté d'un préfill |
 | Rejeu 27B / W19–W20 | chargement 15,87 GiB en 2,7 s ; `SEQS=1` préfill 318,8 tok/s (844), décodage 23,2 / 29,4 ; **`SEQS=4` corrigé** (W20) : préfill 317,5 tok/s, 4 requêtes à 67,3 tok/s agrégés |
 | Contexte 16k | KV 1,23 GiB (4 × 16 384) ; prompt de 13 421 tokens servi à 40,9 tok/s ; >16k → 400 |
 | 27B texte | décodage 28,4 tok/s (16 tok) / 21,2 (819), préfill 301 tok/s à 819 |
@@ -64,6 +65,18 @@ faire (W25). Ce document remplace
   opaques, indices -1/hors plan, pitches larges, M = 1/8/2 048). Le tier KV
   hôte se configure et déplace réellement des entrées sur Flash-Next et le 27B,
   vérification par hash active.
+- **W22b (R22)** : ancre de queue pour un prompt sous le premier intervalle.
+  Sous `--prefix-resume exact` il n'existait ni point de grille ni snapshot
+  sous l'intervalle, donc un tour d'agent court ne reprenait aucun état
+  linéaire (`no_snapshot`). L'ancre est la dernière frontière de quantum, un
+  quantum plus bas si elle est hors grille, dès 256 tokens d'ancre ; le préfill
+  froid coupe là. Rejeu 9 tours : 24 % → **52,6 %** de tokens servis, préfill
+  recalculé −37 %, `no_snapshot` 6 → 2 (premiers tours de sous-agents),
+  checkpoints 1 → 7. Compromis : sous le premier intervalle la reprise est
+  hors grille, comme `nearest` ; l'accord bit à bit n'y est plus garanti pour
+  un tour appendu (un prompt répété reste exact), et au-delà de l'intervalle
+  `exact` reste strict. `sched_test` 548 782 checks, `engine_e2e_test` et
+  tests device verts.
 - **W26 (R26)** : vision servie. Build `-DRAD_WITH_FFMPEG=ON` (l'hôte a
   libavformat 62.3 / ffmpeg 8.0 ; il exige les paquets `libav*-dev`, `sudo`
   n'est pas accordé à `<gpu-user>`). La tour (856,68 Mio) est en VRAM, le staging
@@ -189,8 +202,10 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
    Une limite restante : le rejeu multi-agents n'a **rien** réutilisé (0 %,
    `no_snapshot` ×4, 1 checkpoint pour 5 tours) alors qu'un prompt identique
    réutilise 4 096 tokens (TTFT 108,4 → 9,0 s) et qu'une conversation qui
-   grandit réutilise 2 048 par tour. **R21 est résolu** (W22a) : le tier KV hôte
-   se configure et déplace des entrées ; R22 reste à traiter.
+   grandit réutilise 2 048 par tour. **R21 et R22 sont résolus** (W22) : le
+   tier KV hôte déplace des entrées et, depuis l'ancre de queue, le rejeu
+   9 tours sert 52,6 % de ses tokens (24 % avant), `no_snapshot` 6 → 2 et
+   7 checkpoints écrits.
    Contention (`fnconc`) : 4 décodeurs 12,6 s seuls → 87,6 s à côté d'un préfill
    de 3 000 tokens (+590 %), préfill 35 tok/s (vs 42 seul).
 4. **R9** : vérifier E4M3/rotated sur un modèle non-IQR (aucun 2B/4B sur
@@ -267,12 +282,9 @@ est donné.
    vert est donné : 1,77 ms à M=1 (η 0,6 %) et 0,23 ms/ligne, ~40 % du décodage
    et 47 % du préfill. Commencer par `--profile-ops true` (temps device par op)
    sur Flash-Next ; la forme deux-grilles et la température sont déjà écartées.
-3. **W22 cache (R22)** — R21 est livré (tier KV actif, copie et restauration
-   vérifiées) ; reste la politique de snapshots en rejeu multi-agents. C'est ce
-   qui débloque le multi-tour long et les conversations entrelacées.
-4. **W23 MoE (R23)** — poser les tables du conteneur dans kbench (tags de format
+3. **W23 MoE (R23)** — poser les tables du conteneur dans kbench (tags de format
    ou fixture `--record`), puis mesurer le temps par row et l'η lien par noyau.
-5. **W24 QSA et doc** — `qsa_score` à M=512, doc OPS/README, décision sur
+4. **W24 QSA et doc** — `qsa_score` à M=512, doc OPS/README, décision sur
    `RAPPORT_RDNA3.md`, handover final.
 
 **Décisions qui appartiennent à l'utilisateur** : (1) feu vert pour
