@@ -12,6 +12,8 @@
 #include "rad_test.h"
 #include "rad_plugin.h"
 
+#include "plugin/registry.h"
+
 #include <dlfcn.h>
 #include <hip/hip_runtime.h>
 
@@ -221,6 +223,27 @@ TEST(gemv_n1_matches_libref) {
         CHECK(run_case(kd, kr, M, K, K, 1, what));
         std::snprintf(what, sizeof what, "pitched M=%d", M);
         CHECK(run_case(kd, kr, M, K, K + 16, 3, what));
+    }
+}
+
+/* The selector's half of the contract: for the gate's band the row outranks the m16 row, which
+ * also matches N = 1 through M <= 16, and is the only device row above that height. */
+TEST(gemv_n1_is_selected_for_the_gate) {
+    if (!ready()) return;
+    rad::Registry r;
+    const int st = r.load_plugin(RAD_R3D_SO, 0);
+    CHECK_EQ(st, RAD_OK);
+    if (st != RAD_OK) return;
+
+    for (long long M : { 1, 16, 2048 }) {
+        rad::Geometry g;
+        g.set_i("M", M);
+        g.set_i("N", 1);
+        g.set_i("K", 2560);
+        g.set_s("dtype", "bf16");
+        const rad::KernelRow* k = r.select("gemm_nt", g, RAD_DOMAIN_DEVICE);
+        CHECK(k != nullptr);
+        if (k) CHECK_EQ(std::string(k->info->name), std::string("gemm_nt_bf16_n1"));
     }
 }
 
