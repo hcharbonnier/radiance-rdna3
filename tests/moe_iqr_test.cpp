@@ -598,7 +598,7 @@ RadTensor dense(void* data, uint32_t dtype, std::vector<int64_t> shape) {
     return t;
 }
 
-bool run_card(const Plan& p, int* worst_out, int64_t* diff_out) {
+bool run_card(const Plan& p, int* worst_out, int64_t* diff_out, int* rc_out = nullptr) {
     Built b;
     if (!build(p, &b)) {
         std::fprintf(stderr, "%s: the fixture did not build\n", p.what);
@@ -689,8 +689,11 @@ bool run_card(const Plan& p, int* worst_out, int64_t* diff_out) {
     }
     const int rc = lib().gemm(&args, (RadStream)0);
     const hipError_t he = hipDeviceSynchronize();
+    if (rc_out) *rc_out = rc;
     if (rc != RAD_OK || he != hipSuccess) {
-        std::fprintf(stderr, "%s: launch rc=%d hip=%d\n", p.what, rc, (int)he);
+        /* A caller that asked for the return code is pinning a refusal, not a product. */
+        if (!rc_out || rc != RAD_E_UNSUPPORTED)
+            std::fprintf(stderr, "%s: launch rc=%d hip=%d\n", p.what, rc, (int)he);
         return false;
     }
     std::vector<uint16_t> y((size_t)(T * Nmax));
@@ -796,6 +799,29 @@ TEST(moe_iqr_on_the_card_matches_the_host_reference) {
     std::printf("moe_gemm_iqr: %zu shapes, worst %d bf16 ulp (tolerance %d), %lld outside\n",
                 sizeof kPlans / sizeof *kPlans, worst_all, kMoeMaxUlps, (long long)bad_all);
     CHECK(bad_all == 0);
+}
+
+/* The host reference carries moe_gemm_q's wider contract (an uneven odd class, zero filled past
+ * its width); libr3d's routed IQR row serves one geometry for both parities and must refuse a
+ * narrower odd class rather than read it at the even class's geometry. Pin that boundary so a
+ * future widening of the row is a deliberate change, not a silent reinterpretation. */
+TEST(moe_iqr_row_refuses_a_narrower_odd_class) {
+    if (!lib().card_ok()) {
+        SKIP("libr3d has no moe_gemm_iqr row yet (r3d_rad_moe_gemm_iqr absent)");
+        return;
+    }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev <= 0) {
+        SKIP("no HIP device for the moe_gemm_iqr refusal case");
+        return;
+    }
+    const Plan p{ "narrower odd class", 4, 2, 8, 1, { 256, 512 }, { 256, 128 }, false, 0,
+                  false, false, 0x1357u };
+    int rc = RAD_OK, worst = 0;
+    int64_t bad = 0;
+    const bool ok = run_card(p, &worst, &bad, &rc);
+    CHECK(!ok);
+    CHECK_EQ(rc, RAD_E_UNSUPPORTED);
 }
 
 }  // namespace
