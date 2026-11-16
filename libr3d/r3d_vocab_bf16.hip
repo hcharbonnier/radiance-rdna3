@@ -62,8 +62,11 @@
  *
  *   r3d_layout_logits_head  (operand 1, as `ref_layout_head` is `layout_scaled(operand, 1, -1, ...)`)
  *       Tag `rad.planes`; codes E4M3 (libref's `scaled_rows` also admits int8) with a bf16, f16 or
- *       f32 scale on a {128, 128} block (`R3D_FP8_BLOCK`); ends in `rad_planes_layout` and moves no
- *       byte. `ref_layout_head` is static inside libref, so it and `layout_scaled`,
+ *       f32 scale on a positive block, as `scaled_rows`'s cover reads it: {128, 128} for the
+ *       block-scaled heads, {1, 128} for Flash-Next's `output.weight` (one scale a row and 128 of
+ *       K); ends in `rad_planes_layout` and moves no byte. The scale plane's K-block must divide
+ *       the decode arm's 128-chunk stride, so a {1, 128} plane serves both arms;
+ *       `ref_layout_head` is static inside libref, so it and `layout_scaled`,
  *       `enc_scaled_rows` and `float_scale_dt` are transcribed here with their checks in order.
  *       `rad_enc_is` compares `scheme`, and `transform` is the optional pre-transform: the encoding
  *       is affine with an empty transform, so a fixture that writes "affine" into `transform` makes
@@ -109,9 +112,10 @@
  *   e5m2 and every other code dtype: no decoder here
  *   a scale plane that is a table, not a tiling
  *   an integer scale (not in float_scale_dt's set)
- *   a scale block that is not 128x128: per-(row, group) scales are gemm_nt_q's grid, and a per-row
- *        scale indexes the plane differently from ScaledRows::cover
- *   planes that do not cover the band (codes N x K, scales ceil(N/128) x ceil(K/128)), or a
+ *   a scale K-block that does not divide 128 (the decode arm's chunk) or a non-positive block:
+ *        per-(row, group) scales are gemm_nt_q's grid, and a scale row block of 1 (a per-row
+ *        group-128 head) is read as `scaled_rows` covers it
+ *   planes that do not cover the band (codes N x K, scales ceil(N/sbr) x ceil(K/sbc)), or a
  *        row_bytes shorter than the row
  * The bf16 branch refuses a plain head that is not bf16, wrong x and y dtypes, bad pitches, a short
  * or non-contiguous head, absurd shapes and misalignment. The launcher refuses a head with
@@ -164,24 +168,30 @@ __device__ __forceinline__ uint4 widen8(uint4 w)
 
 constexpr int kFp8Block = 128;        /* the head's scale block: R3D_FP8_BLOCK, llama_dense_fp8 */
 
-/* The head as the container stores it: E4M3 (or int8) codes with one float scale per 128x128
- * block. Passed by value; the pointers are device addresses the shim resolved out of the joined
- * bytes (rad_planes_find). */
+/* The head as the container stores it: E4M3 (or int8) codes with one float scale per scale cell,
+ * as `scaled_rows`' cover reads it -- a {128, 128} block, or Flash-Next's {1, 128} per-row group.
+ * Passed by value; the pointers are device addresses the shim resolved out of the joined bytes
+ * (rad_planes_find). */
 struct HeadQ {
     const uint8_t* codes;        /* [N][K] */
-    const uint8_t* scale;        /* [ceil(N/128)][ceil(K/128)] */
+    const uint8_t* scale;        /* [ceil(N/sbr)][ceil(K/sbc)] */
     long long code_row;          /* bytes a codes row: the plane's row_bytes, not K's element count */
     long long scale_row;         /* bytes a scale row */
     int sdt;                     /* the scale's dtype: 0 bf16, 1 f16, 2 f32 (float_scale_dt's set) */
     int cdt;                     /* the codes' dtype: 0 E4M3, 1 int8 */
+    int sbr;                     /* logical rows one scale covers: 1 (per row) or 128 */
+    int sbc;                     /* logical columns one scale covers: a multiple of 128 */
 };
 
-/* The scale covering logical (n, k), the reference's `ScaledRows::cover`. The plane is 32 KiB at
- * the band and stays in cache, so the codes are the traffic, not these loads. */
+/* The scale covering logical (n, k), the reference's `ScaledRows::cover`. The scale plane is tiny
+ * against the codes (32 KiB at the band for a {128, 128} head, 9.5 MiB for a per-row one, against
+ * 635 MiB of codes), so the codes are the traffic, not these loads. */
 __device__ __forceinline__ float scale_at(const HeadQ h, int n, int k)
 {
-    const uint8_t* p = h.scale + (long long)(n >> 7) * h.scale_row
-                     + (long long)(k >> 7) * (h.sdt == 2 ? 4 : 2);
+    const int sbr = h.sbr > 0 ? h.sbr : kFp8Block;
+    const int sbc = h.sbc > 0 ? h.sbc : kFp8Block;
+    const uint8_t* p = h.scale + (long long)(n / sbr) * h.scale_row
+                     + (long long)(k / sbc) * (h.sdt == 2 ? 4 : 2);
     if (h.sdt == 2) { float f; __builtin_memcpy(&f, p, 4); return f; }
     const uint16_t u = *(const uint16_t*)p;
     return h.sdt == 1 ? f16_to_f32(u) : bf16_to_f32(u);
@@ -349,8 +359,9 @@ gemm_tiled_kernel(const uint16_t* __restrict__ a, const uint16_t* __restrict__ b
             uint4 staged = make_uint4(0, 0, 0, 0);
             if (n < N && k < K) {
                 if (WQ) {
-                    /* Eight codes, one scale: the staged run lies inside one 128x128 block, and
-                     * the scale is indexed by this staged row n, not the lane's output row. */
+                    /* Eight codes, one scale: the staged run lies inside one scale cell (the
+                     * K-block is a multiple of eight), and the scale is indexed by this staged
+                     * row n through `scale_at`, not the lane's output row. */
                     const uint2 c = *(const uint2*)(h.codes + (long long)n * h.code_row + k);
                     uint32_t w[4];
                     codes8_to_f16x4<ALU>(c, h.cdt, r3d_tbl, w);
@@ -462,8 +473,8 @@ logits_skinny_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict_
         if (live) {
             const uint16_t* wp = wrow + k0;
             const uint8_t* cp = h.codes + (long long)(live ? n : N - 1) * h.code_row + k0;
-            /* One scale a chunk: kChunkK equals the scale block, so a lane's 128 codes share one
-             * (n-block, k-block). */
+            /* One scale a chunk: the launcher requires the scale's K-block to be a multiple of
+             * kChunkK, so a lane's 128 codes share one (n-block, k-block). */
             const float sc = WQ ? scale_at(h, live ? n : N - 1, k0) : 0.0f;
             const int kend = K - k0 < kChunkK ? K - k0 : kChunkK;   /* a multiple of 8: the
                                                                      * launcher takes K % 8 == 0 */
@@ -534,6 +545,10 @@ int gemm_launch(long xv, long wv, long yv, int M, int N, int K, int x_ld, int y_
         h = *hq;
         if (!h.codes || !h.scale) return -1;
         if (h.sdt < 0 || h.sdt > 2 || h.cdt < 0 || h.cdt > 1) return -2;
+        /* `scale_at` walks the plane by the scale's own block, and the decode arm takes one scale
+         * a 128-k chunk: the K-block must be a positive multiple of that chunk. A per-row block
+         * (sbr = 1) is Flash-Next's `output.weight` and is read the same way. */
+        if (h.sbr <= 0 || h.sbc <= 0 || h.sbc % kChunkK) return -2;
         if (h.code_row & 7) return -3;        /* 8-byte code loads, one row a stride */
         if (h.scale_row & (h.sdt == 2 ? 3 : 1))
             return -3;                        /* scale loads are 4 bytes (f32) or 2 (bf16/f16), so a
@@ -641,28 +656,32 @@ static bool head_planes(const void* base, HeadPlanes* out) {
  * is safe (the allocation is the engine's, not the runtime's). */
 struct HeadPlan {
     long long n, k;
-    int       cdt, sdt;
+    int       cdt, sdt, sbr, sbc;
 };
 static std::mutex g_plan_mu;
 static HeadPlan   g_plan[8];
 static int        g_plan_n = 0;
 
-static void head_plan_record(long long n, long long k, int cdt, int sdt) {
+static void head_plan_record(long long n, long long k, int cdt, int sdt, int sbr, int sbc) {
     std::lock_guard<std::mutex> lk(g_plan_mu);
     for (int i = 0; i < g_plan_n; ++i)
         if (g_plan[i].n == n && g_plan[i].k == k && g_plan[i].cdt == cdt) {
             g_plan[i].sdt = sdt;
+            g_plan[i].sbr = sbr;
+            g_plan[i].sbc = sbc;
             return;
         }
     const int at = g_plan_n < 8 ? g_plan_n++ : 7;
-    g_plan[at] = HeadPlan{ n, k, cdt, sdt };
+    g_plan[at] = HeadPlan{ n, k, cdt, sdt, sbr, sbc };
 }
 
-static bool head_plan_get(long long n, long long k, int cdt, int* sdt) {
+static bool head_plan_get(long long n, long long k, int cdt, int* sdt, int* sbr, int* sbc) {
     std::lock_guard<std::mutex> lk(g_plan_mu);
     for (int i = 0; i < g_plan_n; ++i)
         if (g_plan[i].n == n && g_plan[i].k == k && g_plan[i].cdt == cdt) {
             *sdt = g_plan[i].sdt;
+            if (sbr) *sbr = g_plan[i].sbr;
+            if (sbc) *sbc = g_plan[i].sbc;
             return true;
         }
     return false;
@@ -703,17 +722,20 @@ int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, 
         if (!y_is_f32) return R3D_NO(RAD_E_DTYPE);   /* the bf16-y row takes a bf16 head only */
         if (w->dtype != RAD_F8E4M3 && w->dtype != RAD_I8) return R3D_NO(RAD_E_DTYPE);
         const int cdt = w->dtype == RAD_I8 ? 1 : 0;
-        int sdt = -1;
-        if (head_plan_get(N, K, cdt, &sdt)) {
+        int sdt = -1, sbr = 0, sbc = 0;
+        if (head_plan_get(N, K, cdt, &sdt, &sbr, &sbc)) {
+            if (sbr <= 0 || sbc <= 0) return R3D_NO(RAD_E_SHAPE);
             const int64_t off = rad_planes_round((int64_t)sizeof(RadPlanesHeader) +
                                                  2 * (int64_t)sizeof(RadPlanesEntry));
             const uint8_t* wb = (const uint8_t*)r3d_p(w);
             h.codes = wb + off;
             h.scale = wb + rad_planes_round(off + N * K);
             h.code_row = K;   /* one byte a code */
-            h.scale_row = ((K + kFp8Block - 1) / kFp8Block) * (sdt == 2 ? 4 : 2);
+            h.scale_row = ((K + sbc - 1) / sbc) * (sdt == 2 ? 4 : 2);
             h.sdt = sdt;
             h.cdt = cdt;
+            h.sbr = sbr;
+            h.sbc = sbc;
             joined = 1;
         } else {
             /* A direct call (the selftest's) has no declare behind it; the weight is a host
@@ -740,10 +762,9 @@ int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, 
             else if (se->dtype == RAD_F16) h.sdt = 1;
             else if (se->dtype == RAD_F32) h.sdt = 2;
             else return R3D_NO(RAD_E_DTYPE);
-            if (se->block[0] != kFp8Block || se->block[1] != kFp8Block)
-                return R3D_NO(RAD_E_SHAPE);
-            const long long sb_r = (N + kFp8Block - 1) / kFp8Block;
-            const long long sb_c = (K + kFp8Block - 1) / kFp8Block;
+            if (se->block[0] <= 0 || se->block[1] <= 0) return R3D_NO(RAD_E_SHAPE);
+            const long long sb_r = (N + se->block[0] - 1) / se->block[0];
+            const long long sb_c = (K + se->block[1] - 1) / se->block[1];
             if (ce->rows != N || ce->cols != K) return R3D_NO(RAD_E_SHAPE);
             if (se->rows != sb_r || se->cols != sb_c) return R3D_NO(RAD_E_SHAPE);
             const uint8_t* wb = (const uint8_t*)r3d_p(w);
@@ -752,6 +773,8 @@ int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, 
             h.code_row = ce->row_bytes;
             h.scale_row = se->row_bytes;
             h.cdt = ce->dtype == RAD_I8 ? 1 : 0;
+            h.sbr = (int)se->block[0];
+            h.sbc = (int)se->block[1];
             joined = 1;
         }
     }
@@ -767,7 +790,7 @@ int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, 
         /* `scaled_rows`' coverage, on the plan: the planes cover the band, the scale by
          * ceil-divided blocks, so a ragged vocabulary is fine (131 rows need 2 scale rows). The
          * rows are checked at declare, or in the direct-call branch above. */
-        const long long sb_c = (K + kFp8Block - 1) / kFp8Block;
+        const long long sb_c = (K + h.sbc - 1) / h.sbc;
         if (h.code_row < K) return R3D_NO(RAD_E_STRIDE);
         if (h.scale_row < sb_c * (h.sdt == 2 ? 4 : 2)) return R3D_NO(RAD_E_STRIDE);
     }
@@ -897,6 +920,8 @@ extern "C" int r3d_layout_logits_head(const RadParam* p, int n_p, int operand,
     const int cdt = planes[0].dtype == RAD_I8 ? 1 : 0;
     const uint32_t sd = planes[1].dtype;
     const int sdt = sd == RAD_BF16 ? 0 : sd == RAD_F16 ? 1 : sd == RAD_F32 ? 2 : -1;
-    if (N > 0 && K > 0 && sdt >= 0) head_plan_record(N, K, cdt, sdt);
+    const int sbr = (int)enc->plane[sel[1]].block[0];
+    const int sbc = (int)enc->plane[sel[1]].block[1];
+    if (N > 0 && K > 0 && sdt >= 0) head_plan_record(N, K, cdt, sdt, sbr, sbc);
     return rad_planes_layout(enc, sel, planes, n, out);
 }
