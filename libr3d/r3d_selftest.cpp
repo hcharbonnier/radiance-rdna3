@@ -163,7 +163,8 @@ static void check_table() {
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_tiled")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w4a16asym_m64")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w5a16_m64")
-                         || 0 == std::strcmp(k->name, "moe_gemm_w4nl");
+                         || 0 == std::strcmp(k->name, "moe_gemm_w4nl")
+                         || 0 == std::strcmp(k->name, "logit_rerank_i8");
         /* The query and the writer come as a pair, and the pair is the rule: a row with a hook must
          * supply the relayout that produces the form the hook names (abi/rad_abi.h -- a query
          * answering RAD_OK is a promise the loader keeps on the row's word), and no row may carry an
@@ -181,8 +182,12 @@ static void check_table() {
         const bool iqr = !std::strncmp(k->name, "gemm_iqr", 8) ||
                          !std::strncmp(k->name, "moe_gemm_iqr", 12) ||
                          !std::strncmp(k->name, "embed_lookup_iqr", 16) ||
-                         !std::strncmp(k->name, "logits_gemm_vocab_iqr", 21);
-        const bool hc = !std::strncmp(k->name, "hc_read", 7);
+                         !std::strncmp(k->name, "logits_gemm_vocab_iqr", 21) ||
+                         0 == std::strcmp(k->name, "logit_rerank_iqr");
+        /* mtp_enter's E4M3 fc rows join libr4d's `r4d.mtp.e4m3.g128` form, as hc_read's mix does
+         * its own; both keep the tag so an RDNA4-laid weight is read here without a re-pack. */
+        const bool hc = !std::strncmp(k->name, "hc_read", 7) ||
+                        0 == std::strcmp(k->name, "mtp_enter_e4m3");
         if (iqr || hc) {
             if ((k->layout && !k->relayout) || (k->relayout && !k->layout))
                 fail("row '%s' declares a hook without its writer", k->name);

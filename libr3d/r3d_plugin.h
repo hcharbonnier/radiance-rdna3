@@ -540,6 +540,30 @@ int r3d_rad_relayout_hc_mix   (const RadParam*, int, int, const RadEncoding*, co
 int r3d_rad_unrelayout_hc_mix (const RadParam*, int, int, const RadEncoding*, const int*,
                                const void*, int64_t, const RadTensor*, int);
 
+/* --- r3d_mtp_hc_e4m3.hip: mtp_enter with the two square fc matrices stored as E4M3 rows. The
+ * stored form is libr4d's `r4d.mtp.e4m3.g128`, so a container laid out on RDNA4 is read in place
+ * (as hc_read's E4M3 mix already is). --- */
+int r3d_rad_mtp_enter (const RadArgs* a, RadStream s);
+int r3d_rad_layout_mtp_e4m3   (const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, RadLayout*);
+int r3d_rad_relayout_mtp_e4m3 (const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, void*, int64_t);
+int r3d_rad_unrelayout_mtp_e4m3(const RadParam*, int, int, const RadEncoding*, const int*,
+                                const void*, int64_t, const RadTensor*, int);
+
+/* --- r3d_logit_rerank.hip: the exact rescoring of a coarse head's R candidates over the IQR
+ * lm_head rows logits_gemm_iqr stores (r3d_iqr_layout.cpp's lm form). --- */
+int r3d_rad_logit_rerank_iqr (const RadArgs* a, RadStream s);
+int r3d_rad_logit_rerank_i8  (const RadArgs* a, RadStream s);
+int r3d_rad_layout_i8_logits    (const RadParam*, int, int, const RadEncoding*, const int*,
+                                 const RadTensor*, int, RadLayout*);
+int r3d_rad_layout_iqr_logits   (const RadParam*, int, int, const RadEncoding*, const int*,
+                                 const RadTensor*, int, RadLayout*);
+int r3d_rad_relayout_iqr_logits (const RadParam*, int, int, const RadEncoding*, const int*,
+                                 const RadTensor*, int, void*, int64_t);
+int r3d_rad_unrelayout_iqr_logits(const RadParam*, int, int, const RadEncoding*, const int*,
+                                  const void*, int64_t, const RadTensor*, int);
+
 }  /* extern "C" */
 
 #endif  /* RAD_R3D_PLUGIN_H */

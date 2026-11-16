@@ -227,6 +227,11 @@ set(R3D_UNITS
   "r3d_ple_conv_bf16|"
   "r3d_hc_bf16|"
   "r3d_ar_hc_write|"
+  # The MTP head's entry over the wide stream with E4M3 fc rows (libr4d's joined
+  # `r4d.mtp.e4m3.g128` form, read in place), and the exact rescoring of a coarse head's candidates
+  # over the IQR lm rows (r3d_iqr.h's lm form).
+  "r3d_mtp_hc_e4m3|"
+  "r3d_logit_rerank|"
   # A row in r3d_rows.cpp must name an entry point defined by one of these units: an undefined
   # symbol makes the whole plugin fail to load.
 )

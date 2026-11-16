@@ -739,6 +739,26 @@ static const RadOperandSpec oPick[]      = { { "cand_idx", RAD_OPD_IN, 0 },
                                              { "params", RAD_OPD_IN, 0 },
                                              { "token", RAD_OPD_OUT, 0 } };
 
+/* The MTP head's entry (`ngroup` hc for a grouped norm, 1 for a flat one) and the exact rescoring
+ * of a coarse head's candidates. Both transcribe libref's schemas slot for slot, optionality
+ * included: the loader compares them. */
+static const RadParamSpec pMtpEnter[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
+                                          P_STR("dtype"), P_F64O("wadd"), P_INTO("ngroup"),
+                                          P_STRO("fc") };
+static const RadOperandSpec oMtpEnter[] = { { "h", RAD_OPD_IN, 0 },      { "e", RAD_OPD_IN, 0 },
+                                            { "w_h", RAD_OPD_WEIGHT, 0 }, { "w_e", RAD_OPD_WEIGHT, 0 },
+                                            { "fc_h", RAD_OPD_WEIGHT, 0 }, { "fc_e", RAD_OPD_WEIGHT, 0 },
+                                            { "x", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pLogitRerank[] = { P_INT("M"), P_INT("R"), P_INT("n_vocab"),
+                                             P_INT("n_embd"), P_INTO("vocab_off"),
+                                             P_STR("dtype") };
+static const RadOperandSpec oLogitRerank[] = { { "x", RAD_OPD_IN, 0 },
+                                               { "head", RAD_OPD_WEIGHT, 0 },
+                                               { "idx_in", RAD_OPD_IN, 0 },
+                                               { "idx", RAD_OPD_OUT, 0 },
+                                               { "val", RAD_OPD_OUT, 0 },
+                                               { "pairs", RAD_OPD_OUT, 1 } };
+
 
 /* The fused norm-quantiser from the model unit, libref's slot for slot. `residual` is INOUT because
  * the sum it stores is the one the variance reads. */
@@ -1213,6 +1233,14 @@ static const RadOpSchema kSchemas[] = {
            "because lm_head is its own access class and the sampler wants to fuse against it: the "
            "head is the largest read in a decode step and the output is f32, which every sampler "
            "stage downstream reads."),
+    SCHEMA("mtp_enter", pMtpEnter, oMtpEnter,
+           "The MTP head's entry for a wide residual stream: x[k*n+i] = fc_h[i] . grouped_norm(h)[k] "
+           "+ fc_e[i] . norm(e), for each of the hc sub-streams k. `ngroup` == hc is one rsqrt per "
+           "sub-stream and 1 is a single rsqrt over the whole row."),
+    SCHEMA("logit_rerank", pLogitRerank, oLogitRerank,
+           "Rescore R candidate ids a row exactly against the full-precision head and re-sort on "
+           "those values: the second half of a coarse top-R. `idx_in` carries global ids, "
+           "`vocab_off` is this rank's first column, and an id outside its rows becomes a pad."),
     SCHEMA("gemm_nt_q_gated", pGemmQGated, oGemmQGated,
            "The gated MLP band in one launch: `b` is N = 2n rows, gate over up, the dot products are "
            "narrowed to bf16 as the unfused pair would leave them, the gate is `gt * sigmoid(gt)`, the "
@@ -2020,6 +2048,18 @@ static const RadConstraint cHcReadBf16[] = { C_IN("dtype", "bf16"), C_GE("M", 1)
 static const RadConstraint cHcReadE4m3[] = { C_IN("dtype", "bf16"), C_IN("mix", "e4m3"),
                                              C_GE("M", 1), C_GE("hc", 2), C_LE("hc", 8),
                                              C_DIV("n", 128), C_DIV("lowrank", 64) };
+/* The MTP head's fc matrices as E4M3 rows: n a multiple of the 128-column scale group, and the
+ * whole row's LDS stage (hc + 1 streams) inside a workgroup's 64 KiB. */
+static const RadConstraint cMtpEnterE4m3[] = {
+    C_GE("M", 1), C_DIV("n", 128), C_LE("n", 5734), C_GE("hc", 2), C_LE("hc", 4),
+    C_IN("dtype", "bf16"), C_IN("fc", "e4m3"),
+};
+/* The rescore's IQR lm rows carry a bf16 scale per 128 of n_embd, so the band's width must be a
+ * multiple of 128; the rest is logit_rerank's (R <= 32). */
+static const RadConstraint cLogitRerankIqr[] = {
+    C_GE("M", 1), C_GE("R", 1), C_LE("R", 32), C_GE("n_vocab", 1), C_DIV("n_embd", 128),
+    C_IN("dtype", "bf16"),
+};
 static const RadConstraint cArHc[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C_EQ("world_size", 1),
                                        C_GE("hc", 2), C_LE("hc", 8), C_DIV("n", 8) };
 static const RadConstraint cArGatherHc[] = { C_IN("dtype", "bf16"), C_GE("M", 1),
@@ -3673,6 +3713,31 @@ static const RadKernelInfo kKernels[] = {
   ROW(cRowTopkF32), NOTUNE,
   nullptr, nullptr, r3d_rad_row_topk, nullptr, nullptr, nullptr, r3d_shape_row_topk },
 
+{ "logit_rerank_i8", "logit_rerank", "select",
+  "logit_rerank over the container's int8 head: the coarse head's candidates rescored against "
+  "`output.weight` and re-sorted on the exact values",
+  "logit_rerank's: any M, R <= 32, bf16 x, a multiple-of-128 n_embd; the head is `i8*bf16[1x128]` "
+  "joined into K codes and K/128 bf16 scales a row",
+  "bf16 in, f32 values + i32 ids out, descending, ties to the lower id, an id outside this rank's "
+  "rows a pad (-1, -inf)",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cLogitRerankIqr), NOTUNE,
+  nullptr, nullptr, r3d_rad_logit_rerank_i8, nullptr,
+  r3d_rad_layout_i8_logits, r3d_relayout_logits_head, nullptr, nullptr },
+
+{ "logit_rerank_iqr", "logit_rerank", "select",
+  "logit_rerank over an IQR head: the coarse head's candidates rescored against logits_gemm_iqr's "
+  "rows, then re-sorted on the exact values",
+  "logit_rerank's: any M, R <= 32, bf16 x, a multiple-of-128 n_embd; the head is the IQR lm form "
+  "with a bf16 scale per 128 of K",
+  "bf16 in, f32 values + i32 ids out, descending, ties to the lower id, an id outside this rank's "
+  "rows a pad (-1, -inf)",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cLogitRerankIqr), NOTUNE,
+  nullptr, nullptr, r3d_rad_logit_rerank_iqr, nullptr,
+  r3d_rad_layout_iqr_logits, r3d_rad_relayout_iqr_logits,
+  nullptr, r3d_rad_unrelayout_iqr_logits },
+
 { "sample_argmax_f32", "sample_argmax", "sample",
   "the greedy token: the row's argmax, ties to the lower id",
   "a workgroup a row; the max is a strict `>`, so a NaN is never adopted -- the reference's scan "
@@ -4062,6 +4127,22 @@ static const RadKernelInfo kKernels[] = {
   ROW(cHcReadBf16), NOTUNE,
   nullptr, nullptr, r3d_rad_hc_read, r3d_rad_hc_read_scratch,
   nullptr, nullptr, nullptr, nullptr },
+
+/* ------------------------------------------------------------------ W25: the MTP head's entry
+ *
+ * The drafter's first op at N > 0. The two square fc matrices are read as E4M3 rows (libr4d's
+ * joined form), so a Flash-Next container converted there serves here without a second layout.
+ */
+{ "mtp_enter_e4m3", "mtp_enter", "norm",
+  "the MTP head's entry with fc_hidden and fc_embedding stored as E4M3 rows: half the bytes of the "
+  "two square matrices every draft round reads",
+  "any M, n a multiple of 128 up to 5734, hc 2..4",
+  "bf16 activations, E4M3 fc rows with f32 128-column group scales in each row's tail, f32 gains",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cMtpEnterE4m3), NOTUNE,
+  nullptr, nullptr, r3d_rad_mtp_enter, nullptr,
+  r3d_rad_layout_mtp_e4m3, r3d_rad_relayout_mtp_e4m3,
+  nullptr, r3d_rad_unrelayout_mtp_e4m3 },
 
 { "hc_write_bf16", "hc_write", "norm",
   "h[c] += inj[c] * y on each of the hc streams, in place on the unnormed residual",
