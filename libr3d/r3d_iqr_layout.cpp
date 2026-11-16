@@ -1014,13 +1014,26 @@ int moe_params(const RadParam* p, int n_p, int operand, bool mod4, MoeParams* v)
 
 }  /* namespace */
 
+/* The forms moe_gemm_iqr decodes (r3d_moe_iqr.hip's form_supported): a computed trellis, L = 16,
+ * one f32 scale a row, no tcq_rb, 2..7 code bits. The dense IQR hooks also lay out stored tables
+ * and other trellis geometries; the routed kernel reads none of them, so a table declared for it is
+ * refused at storage rather than launched and refused by dtype. */
+static bool moe_iqr_serves(const RadLayout& l) {
+    const Form f = form(l.dtype);
+    return f.kind == kTrellisMad && f.L == 16 && f.lrb == 0 && f.scale == kRowF32 &&
+           f.bits >= 2 && f.bits <= 7;
+}
+
 #define R3D_MOE_IQR_HOOKS(name, mod4)                                                             \
     extern "C" int r3d_rad_layout_##name(const RadParam* p, int n_p, int operand,                \
                                          const RadEncoding* enc, const int* sel,                 \
                                          const RadTensor* pl, int n, RadLayout* out) {           \
         MoeParams v;                                                                              \
         const int rc = moe_params(p, n_p, operand, mod4, &v);                                     \
-        return rc != RAD_OK ? rc : r3d_rad_layout_iqr(v.p, v.n, v.operand, enc, sel, pl, n, out); \
+        if (rc != RAD_OK) return rc;                                                              \
+        const int lrc = r3d_rad_layout_iqr(v.p, v.n, v.operand, enc, sel, pl, n, out);            \
+        if (lrc != RAD_OK) return lrc;                                                            \
+        return moe_iqr_serves(*out) ? RAD_OK : RAD_E_DTYPE;                                       \
     }                                                                                             \
     extern "C" int r3d_rad_relayout_##name(const RadParam* p, int n_p, int operand,              \
                                            const RadEncoding* enc, const int* sel,               \
