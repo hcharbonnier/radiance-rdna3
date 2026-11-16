@@ -1342,7 +1342,7 @@ static int r3dh_gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had
      * the pair's counters the conv block's upper half). Any other group is refused. */
     const long long qgrp = r3dh_geti_or(a, "group", RU_V);
     const bool wide = had && qgrp == 2 * RU_V;
-    if (qgrp != RU_V && !wide) return R3DH_NO(RAD_E_UNSUPPORTED);
+    if (had && qgrp != RU_V && !wide) return R3DH_NO(RAD_E_UNSUPPORTED);
     if (wide && (H % 2 || (long long)N * Hg > (long long)kRuPairCtr ||
                  (long long)N * (H / 2) > (long long)kRuPairCtr))
         return R3DH_NO(RAD_E_SHAPE);
