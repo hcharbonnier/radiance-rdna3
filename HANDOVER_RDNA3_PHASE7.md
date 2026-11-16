@@ -104,7 +104,7 @@ Build neuf (obligatoire pour un A/B ; les objets d'un build incrémental après
 rsync -a --exclude /.git --exclude /build --exclude /external-docs --exclude /.kilo \
   ./ <gpu-user>@<gpu-host>:<work-root>/work/w17-main/
 ssh <gpu-user>@<gpu-host> "cd <work-root>/work/w17-main && \
-  cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRAD_GPU_TARGETS=gfx1100 && \
+  cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRAD_GPU_TARGETS=gfx1100 -DRAD_WITH_FFMPEG=ON && \
   cmake --build build -j 16"
 ```
 

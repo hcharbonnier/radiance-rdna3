@@ -7,7 +7,8 @@
 - Tout travail GPU (tests, serveur, benchmark) se fait sous
   `flock -w 7200 /tmp/radiance-gpu.lock -c '...'`, un seul processus à la fois.
 - Builds : `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-  -DRAD_GPU_TARGETS=gfx1100` puis `cmake --build build -j 16`.
+  -DRAD_GPU_TARGETS=gfx1100 -DRAD_WITH_FFMPEG=ON` puis
+  `cmake --build build -j 16`.
 - Les `.so` sont écrits **directement** dans `build/radiance_home/kernels` ;
   arrêter le serveur avant de reconstruire. Pour un A/B, utiliser un
   **répertoire de build neuf** (un build incrémental après `rsync -a` peut
