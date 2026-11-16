@@ -80,6 +80,30 @@ validés et neutres en préfill ; la **tuile WMMA** est 25–32 % plus lente que
 `v_dot4` et le préfill 27B tombe de 301 à 231 tok/s avec elle — construite,
 testée, **désactivée** (`kIqrWmmaMinM` au-delà de tout M), à reprendre en W14.
 
+## Flash-Next (W16, 2026-11-16)
+
+Conteneur `qwen3.8-next-flash-iqr-v4` (121 GB), `placement: expert_tiered`,
+`host-pool-mib: 43000`, KV i8, `num-speculative-tokens: 0`,
+`max-model-len: 8192`, `max-num-batched-tokens: 2048`. Serveur réel, 1 séquence,
+greedy, 64 tokens générés :
+
+| prompt | préfill | décodage | TTFT |
+|---|---|---|---|
+| 30 tok | 20,6 tok/s | 4,6 tok/s | 1,46 s |
+| 2290 tok | **42,1 tok/s** | **4,0 tok/s** | 54,3 s |
+| 4570 tok | **41,5 tok/s** | **4,0 tok/s** | 110,2 s |
+| 4 × 30 tok concurrents | 17,8 tok/s (par requête) | 4,0–4,5 tok/s | 1,68–3,38 s |
+
+Lecture : premier **bring-up fonctionnel** du 121 GB, tous les ops résolus en
+device (0 bande device manquante sur 5 074 questions). Le décodage à 4 tok/s
+reflète le tiering des experts (SSD/host), l'absence de MTP et un premier chemin
+sans optimisation ; le préfill tient 42 tok/s jusqu'à 4 570 tokens.
+`kbench` sur ce conteneur : 1 743/1 749 cas corrects, **6 FAIL
+`logits_gemm_bf16`** (rel_l2 ≈ 0,5) et **22 divergences de forme QSA** — corrigés
+en W17. Les timings par row de ce run kbench ne sont **pas exploitables** : la
+carte a throttlé (PPT0/PPT1) pendant les 8 minutes de mesure ; HC/PLE restent à
+mesurer sur carte froide.
+
 ## Lecture
 
 - Le GEMV large atteint 86 % ; la forme `down` était à 49,5 %, le split-K la

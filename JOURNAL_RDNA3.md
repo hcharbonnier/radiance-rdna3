@@ -583,6 +583,35 @@ de Flash-Next avec `num-speculative-tokens: 0`, `max_mixed_tok ≤ 2048`,
   déclarer la contrainte pour retomber sur la row hôte), puis les refus
   suivants jusqu'au texte 1/4 séquences.
 
+## 2026-11-16 — Flash-Next servi
+
+L'agent de bring-up a corrigé les refus runtime successifs :
+
+- `hc_read` : la garde `numel` des poids E4M3 comparait le nombre de codes au
+  row joint ; remplacée par la forme logique déclarée (`hc_dims`).
+- `moe_gather`/`moe_gather_inv` : le `M` de la bande était pris pour le nombre
+  de lignes du pas ; il vient maintenant de la sortie.
+- `moe_iqr` : les tables d'arguments étaient partiellement non initialisées
+  (le moteur compare les octets d'un lancement enregistré) ; `memset` ajouté.
+- Router et tête vocabulaire : formes de pas et plan de tête dérivé du
+  déclaratif au lieu d'un peek `rad.planes` sur un poids VRAM.
+
+**Résultat** : Flash-Next sert le texte. 1 séquence : 30 tok → 20,6 tok/s de
+préfill, 4,6 tok/s de décodage, TTFT 1,46 s ; 2 290 tok → 42,1 tok/s, 4,0,
+54,3 s ; 4 570 tok → 41,5 tok/s, 4,0, 110,2 s. 4 requêtes concurrentes de 30
+tokens : 4,0–4,5 tok/s, TTFT 1,68–3,38 s. `r3d_selftest` 159/0/15.
+
+**kbench de contrôle** sur le conteneur (495 s) : 1 743/1 749 cas corrects,
+**6 FAIL `logits_gemm_bf16`** (n_vocab 248 320, n_embd 2 560, M=1..32, rel_l2
+0,50–0,53) et **22 divergences de forme QSA** (`qsa_select.nsel` en rang 2,
+`qsa_work.nc` `[8]` au lieu de `[seqs]`, `qsa_tail_store.state` `[8,…]` au lieu
+de `[M,…]`). Les timings par row ne sont pas exploitables : la carte a throttlé
+(PPT0/PPT1) pendant la mesure.
+
+Deux agents W17 corrigent la tête bf16 et les formes QSA ; re-vérification
+kbench attendue à 0 FAIL et 0 divergence.
+
+
 
 
 

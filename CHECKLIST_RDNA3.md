@@ -109,15 +109,21 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 - [x] 4bis.2 Déclaratif avec `libr3d` seul : **0 bande device non résolue**
       sur 5 074 questions ; le serveur démarre (44,35 GiB/carte, 21 s) avec
       `/tmp/fn-v1.yaml`. Toutes les rows W15 sont résolues.
-- [~] 4bis.2b Premier pas réel : `hc_read_e4m3` refuse `M=5` alors que la bande
-      est `M≤2048` (`shape this kernel does not serve`). Agent de bring-up
-      dédié : corriger la garde ou déclarer la contrainte pour retomber sur
-      l'hôte, puis traiter les refus runtime suivants jusqu'au texte servi.
+- [x] 4bis.2b Premier pas réel : le refus `hc_read_e4m3 M=5` a été corrigé
+      (numel remplacé par la forme logique), ainsi que `moe_gather`,
+      `moe_iqr`, le router et la tête vocabulaire (plan du déclaratif au lieu
+      d'un peek VRAM). Flash-Next sert le texte.
+- [~] 4bis.2c `kbench` de contrôle sur le conteneur : 1 743/1 749 cas corrects,
+      **6 FAIL `logits_gemm_bf16`** (rel_l2 ≈ 0,5, M=1..32) et **22
+      divergences de forme QSA** (`qsa_select.nsel`, `qsa_work.nc`,
+      `qsa_tail_store.state`). Deux agents W17 corrigent ; re-vérifier 0 FAIL
+      et 0 divergence.
 - [~] 4bis.3 Configuration v1 : `num-speculative-tokens: 0` (MTP hors v1),
       `placement: expert_tiered`, `host-pool-mib: 43000`, KV i8,
       **`max_mixed_tok ≤ 2048`** (le plan `score` fait 512 MiB à 2048 lignes,
       1 Gio à 4096 et le plugin refuse), `max-model-len: 8192`.
-- [ ] 4bis.4 Texte : 1 et 4 séquences, préfill 2048 et 4096, sorties conformes.
+- [x] 4bis.4 Texte : 1 séquence (30 / 2290 / 4570 tokens) et 4 séquences
+      concurrentes servies ; préfill 42 tok/s, décodage 4,0–4,6 tok/s.
 - [ ] 4bis.5 Image / vision si le conteneur la sert (dépend de 4.6).
 - [ ] 4bis.6 Robustesse : formes refusées, erreurs de plan, arrêt propre,
       reprise après redémarrage.
@@ -127,9 +133,9 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 
 ## 5. Mesures et rapport final (M4/M7)
 
-- [ ] 5.1 HC : coût de `hc_read`/`hc_write`/`hc_enter`/`hc_project` (M4 exige
+- [~] 5.1 HC : coût de `hc_read`/`hc_write`/`hc_enter`/`hc_project` (M4 exige
       « coûts documentés »).
-- [ ] 5.2 PLE : coût de `ple_gate`/`ple_conv` et de l'n-gram.
+- [~] 5.2 PLE : coût de `ple_gate`/`ple_conv` et de l'n-gram.
 - [ ] 5.3 Remplir les lignes MoE, QSA, HC, PLE, Flash-Next de
       `TABLEAU_REEL_IDEAL_RDNA3.md`.
 - [ ] 5.4 R3 — mesurer le temps de relayout/chargement du 27B ; vectoriser si

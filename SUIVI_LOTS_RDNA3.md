@@ -24,7 +24,8 @@
 | W13 — optimisation | **terminé (2026-11-15)** | 2 sem | split-K `down` 1,55× ; vision −49 % à M=512 ; tête un lancement ; h256 ; WMMA mesurée plus lente et éteinte |
 | W14 — audit et rows | **terminé** | 1 sem | audit Flash-Next ; 4 ops QSA ; MoE treillis + référence ; formes denses table/grille |
 | W15 — rows Flash-Next | **terminé** | 2 sem | `kSigned` 8, `gdn_conv_recurrent_update_had`, `kv_store` b4, `rope` h128, router fusionné, `gemm_nt` N=1, rows vision, `moe_gemm_w4nl` ; **159 rows / 0 échec / 15 skips** |
-| W16 — bring-up Flash-Next | **en cours** | 1 sem | déclaratif 0 trou device ; correctifs des refus runtime (`hc_read M=5` d'abord), puis texte 1/4 séquences et mesures |
+| W16 — bring-up Flash-Next | **terminé (2026-11-16)** | 1 sem | serveur 121 GB servi : préfill 42 tok/s, décodage 4,0–4,6 tok/s, 4 séquences ; 0 bande device manquante |
+| W17 — corrections kbench | **en cours (2 agents)** | 1 sem | `logits_gemm_bf16` (6 FAIL) et 3 formes QSA divergentes |
 | M0 — Go/No-Go | **GO (2026-11-15)** | fin S3 | `MEMO_M0_RDNA3.md` |
 | M1 — dense IQR | **atteint et dépassé : 27B texte, décodage 28,4 tok/s (16 tok) / 21,2 (819), préfill 301 tok/s à 819** | fin S8 | W15 : WMMA, occupation gated, mesure M=16384 |
 
@@ -73,9 +74,17 @@
 - **R15** — *résolu* : `moe_iqr_test` demandait une classe impaire plus étroite
   que la row refuse par contrat ; les plans carte sont passés à classes égales
   et le refus est épinglé. 10 formes, 0 écart (tolérance 2 ulp).
-- **R16** — Bring-up runtime : le premier pas réel de Flash-Next est refusé par
-  `hc_read_e4m3` à `M=5` (« shape this kernel does not serve ») alors que la
-  bande est `M≤2048` ; le serveur s'arrête. Agent W16 dédié : identifier la
-  garde exacte (contiguïté/pitch, q/qs ou rq/rs partiels, scratch, M<16),
-  corriger la row ou déclarer la contrainte pour retomber sur l'hôte, puis
-  traiter les refus suivants jusqu'au texte servi.
+- **R16** — *résolu* : Flash-Next sert le texte. Les refus runtime (`hc_read`
+  M=5, `moe_gather`, `moe_iqr`, router, tête vocabulaire) sont corrigés et le
+  serveur répond sur 30/2290/4570 tokens et 4 séquences.
+- **R17** — `logits_gemm_bf16` échoue sur les formes Flash-Next
+  (`n_vocab=248320 n_embd=2560`, M=1..32) : 6 cas kbench, rel_l2 ≈ 0,5. Agent
+  W17 : reproduire, corriger le chemin bf16 (le chemin quantifié et la tête IQR
+  ne doivent pas changer), test de non-régression.
+- **R18** — Trois descriptions de sortie QSA divergent de libref
+  (`qsa_select.nsel` rang 2 au lieu de 1, `qsa_work.nc` `[8]` au lieu de
+  `[seqs]`, `qsa_tail_store.state` `[8,…]` au lieu de `[M,…]`). Agent W17 :
+  corriger et vérifier toutes les sorties QSA.
+- **R19** — Les timings par row du kbench Flash-Next ne sont pas exploitables :
+  la carte a throttlé (PPT0/PPT1) pendant les 8 minutes. HC/PLE et MoE/QSA
+  restent à mesurer sur carte froide (`--kernels libr3d:libref`, petits lots).
