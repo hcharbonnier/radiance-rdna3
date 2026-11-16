@@ -102,6 +102,11 @@ set(R3D_UNITS
   # The vision tower's two remaining ops (W10-lite): dense non-causal attention at head_dim 72 and
   # the axial 2-D rotary (sections 18 18) over [2, M] positions. Both transcribe libref's order.
   "r3d_vision_bf16|"
+  # The tower's linear layer (gemm_nt_bias: bias, activation and residual in one rounded chain)
+  # and its learned position table (grid_embed: bilinear align_corners resample added in place).
+  # Both transcribe libref's arithmetic so a vision pass keeps its bits on the card.
+  "r3d_gemm_nt_bias|"
+  "r3d_grid_embed|"
   # The sampler's spine: the row's top-R in one scan, and the stages that turn the candidate plane
   # the top-R produces into one token -- argmax, temp, top-k, the draw, and the four narrowings.
   "r3d_sample_f32|"

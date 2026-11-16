@@ -673,6 +673,30 @@ int r3d_shape_gemm_nt_f32(const RadParam* p, int n_p, int operand, RadOpdDesc* o
 }
 
 
+/* The vision tower's linear: the same operands as gemm_nt plus a per-column bias, and the
+ * optional residual the epilogue adds. The description passes the residual, so the generic
+ * checks exercise that epilogue; a band that omits it sends a null operand. */
+int r3d_shape_gemm_nt_bias(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
+    const RadOpdDesc list[] = {
+        opd(D, M, K), opd(D, N, K), opd(D, N), opd(D, M, N), opd(D, M, N)
+    };                                                     /* a, b, bias, res, y */
+    R3D_PICK(list);
+}
+
+/* grid_embed: x [M, n] in place, the side x side table, and [4, M] coordinates drawn over the
+ * table's side so some rows exercise the clamped taps (libref's own description). */
+int r3d_shape_grid_embed(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), side = gi(p, n_p, "side", 0);
+    if (M <= 0 || n <= 0 || side <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd(D, M, n), opd(D, side * side, n), opd_idx(4, side, -1, 0, M)
+    };                                                     /* x, table, coord */
+    R3D_PICK(list);
+}
+
 /* The vocabulary projection, transcribed from ref_logits_gemm_shape: x [M, n_embd] and the head
  * [n_vocab, n_embd] in the activation's dtype, logits in f32 because every sampler stage reads
  * f32 (a prefill band's plane is 1.07 GB at M=2048). Unlike the reference row, which also places

@@ -333,6 +333,8 @@ int r3d_shape_quant_act_i8g   (const RadParam* p, int n_p, int operand, RadOpdDe
 int r3d_shape_gated_quant_fp8 (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_dequant         (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt         (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_gemm_nt_bias    (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_grid_embed      (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt_q       (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt_q_mxfp4a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 
@@ -407,6 +409,14 @@ int r3d_rad_attn_prefill_h256      (const RadArgs* a, RadStream s);
  * 72, sections 18 18, positions [2, M]). */
 int r3d_rad_attn_dense            (const RadArgs* a, RadStream s);
 int r3d_rad_rope_axial            (const RadArgs* a, RadStream s);
+
+/* --- r3d_gemm_nt_bias.hip: the vision tower's linear layer, gemm_nt with a bias and libref's
+ * act/residual epilogue (bf16). --- */
+int r3d_rad_gemm_nt_bias          (const RadArgs* a, RadStream s);
+
+/* --- r3d_grid_embed.hip: the ViT's learned position table, bilinearly resampled with the grid's
+ * corners on the table's and added to x (bf16). --- */
+int r3d_rad_grid_embed            (const RadArgs* a, RadStream s);
 
 /* --- r3d_gemm_fp8a8_tiled.hip: the quantised GEMM above the decode heights, and the reader for
  * the container's fp8 weight: codes and per-128x128 scale as two planes behind `b_scale`. The row

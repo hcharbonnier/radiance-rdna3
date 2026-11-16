@@ -333,6 +333,21 @@ static const RadParamSpec pGemm[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR(
 static const RadOperandSpec oGemm[] = { { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
                                         { "y", RAD_OPD_OUT, 0 } };
 
+/* The biased form: the product with a per-column bias, then an optional activation and residual,
+ * each rounded where a separate tensor would be. `res` is an optional input and may be `y`
+ * itself, the stream updated in place. */
+static const RadParamSpec pGemmBias[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
+                                          P_STRO("act") };
+static const RadOperandSpec oGemmBias[] = { { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
+                                            { "bias", RAD_OPD_WEIGHT, 0 },
+                                            { "res", RAD_OPD_IN, 1 }, { "y", RAD_OPD_OUT, 0 } };
+
+/* --- elementwise --- */
+static const RadParamSpec pGridEmbed[] = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
+static const RadOperandSpec oGridEmbed[] = { { "x", RAD_OPD_INOUT, 0 },
+                                             { "table", RAD_OPD_WEIGHT, 0 },
+                                             { "coord", RAD_OPD_IN, 0 } };
+
 /* `w_rb` is libr4d's (docs/OPS.md), accepted and ignored: an int8 weight's per-row scale plane
  * holds each block's value in every row, and the trellis forms that need it are IQR dtypes, which
  * no row here serves. */
@@ -846,6 +861,11 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("layernorm", pLayernorm, oLayernorm,
            "y = (x - mean) / sqrt(var + eps) * w + b, the mean and the variance taken in two "
            "passes over the row."),
+    SCHEMA("grid_embed", pGridEmbed, oGridEmbed,
+           "x[m] += the side x side table resampled at the row's grid coordinate, bilinearly with "
+           "the grid's corners on the table's (align_corners), edge taps clamped; `coord` is "
+           "[4, M] -- row, column, grid height, grid width. The taps are summed in f32 and "
+           "rounded to x's dtype, then added to x and rounded again."),
     SCHEMA("add", pAdd, oBinary,
            "y = a + b. `b` carrying exactly n elements against an output of M rows broadcasts "
            "along rows, and nothing else broadcasts at all. With `div`, y = rd(rd(a + b) / div)."),
@@ -961,6 +981,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("gemm_nt_f32", pGemm, oGemm,
            "BF16 activations times F32 weights, F32 accumulation and output; preserves routing "
            "and index gate precision."),
+    SCHEMA("gemm_nt_bias", pGemmBias, oGemmBias,
+           "gemm_nt with a per-column bias added in f32 and rounded to y's dtype; then, "
+           "optionally, `act` of that (none, gelu exact, gelu_tanh) rounded, then `res` added and "
+           "rounded. Each step is what a separate tensor would hold."),
     SCHEMA("gemm_nt_q", pGemmQ, oGemmQ,
            "The same product against a quantised weight. `dtype` names the scheme: fp8a16 a bf16 "
            "activation against E4M3 codes, fp8a8 quant_act_fp8's codes and scales, i8a8 int8 on "
@@ -2077,6 +2101,16 @@ static const RadConstraint cRopeAxialH72[] = {
  * disjoint on N only for this row's exact equality, which the selector reads before priority; the
  * extra rank states the intent for a reader and keeps a future m16 tweak from taking the gate. */
 enum { R3D_PRIO_GEMM_N1 = R3D_PRIO_GEMM_M16 + 10 };
+
+/* The vision tower's linear and its position table, the two ops W10-lite left to the host. Both
+ * are bf16 in the tower, and `M` is the pass's patch count, so the band is a floor: a kernel that
+ * cannot carry an extent refuses it at launch. */
+static const RadConstraint cGemmVision[] = {
+    C_IN("dtype", "bf16"), C_GE("M", 1), C_GE("N", 1), C_GE("K", 1)
+};
+static const RadConstraint cGridEmbedVision[] = {
+    C_IN("dtype", "bf16"), C_GE("M", 1), C_GE("n", 1), C_GE("side", 1)
+};
 
 static const RadKernelInfo kKernels[] = {
 /* ------------------------------------------------------------------ r3d_model_bf16.hip
@@ -4099,6 +4133,31 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ROPE_AXIAL,
   ROW(cRopeAxialH72), NOTUNE,
   nullptr, nullptr, r3d_rad_rope_axial, nullptr, nullptr, nullptr, r3d_shape_rope_axial },
+
+{ "gemm_nt_bias_bf16", "gemm_nt_bias", "gemm",
+  "the vision tower's linear layer: a 16-row x 32-column tile a block, both operands staged as "
+  "f32 in LDS, two output columns a thread walking k ascending with one multiply and one add a "
+  "step; the bias is added in f32 and the result narrowed, then act (exact or tanh GELU) and the "
+  "residual each narrowed where a separate tensor would round",
+  "bf16; any M, N and K (tails clamp); a/b/y/res at their row pitches; bias a dense [N]; act "
+  "none, gelu or gelu_tanh; no split-K, no scratch",
+  "bf16 a, b, bias, res and y; every output's chain is libref's ascending k with separate "
+  "multiply and add, so the row is bit-identical to the reference at every band",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cGemmVision), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_nt_bias, nullptr, nullptr, nullptr, r3d_shape_gemm_nt_bias },
+
+{ "grid_embed_bf16", "grid_embed", "elem",
+  "the vision tower's learned position table: a block a row, the [4, M] coordinate read once and "
+  "its two-by-two taps formed in shared memory, then each thread adds the f32 tap sum (rounded to "
+  "bf16) into x's row",
+  "bf16; side x side table at its row pitch; [4, M] i32 coord at its own strides; x and table "
+  "last axis contiguous; no alignment requirement",
+  "bf16 x in place and table; taps summed in f32 in libref's (h,w) order and rounded once before "
+  "the add, so the row is bit-identical to the reference",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cGridEmbedVision), NOTUNE,
+  nullptr, nullptr, r3d_rad_grid_embed, nullptr, nullptr, nullptr, r3d_shape_grid_embed },
 
 };
 
