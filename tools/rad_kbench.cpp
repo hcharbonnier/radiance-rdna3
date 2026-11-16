@@ -2779,15 +2779,10 @@ int main(int argc, char** argv) {
                 Geometry ga = g;
                 if (band_capacity && !o.ranged_key.empty()) {
                     /* The engine's prepared args carry the selector's resolution, so take the
-                     * capacity from `r.geom` (the band's upper bound) rather than recomputing it
-                     * from the band table. */
+                     * capacity from `r.geom`, whose ranged key is the band's upper bound. */
                     long long bandM = 0;
-                    if (!r.geom.get_i(o.ranged_key, &bandM) || bandM <= 0) {
-                        bandM = o.bands[b].hi;
-                        if (bandM <= 0 || bandM > (1 << 20)) bandM = max_tok;
-                        bandM = std::min<int64_t>(bandM, max_tok);
-                    }
-                    if (bandM > M) ga.set_i(o.ranged_key, (int64_t)bandM);
+                    if (r.geom.get_i(o.ranged_key, &bandM) && bandM > M)
+                        ga.set_i(o.ranged_key, (int64_t)bandM);
                 }
                 /* The report's geometry carries the distinction: the same shapes at a different
                  * declared capacity are a different case. */
@@ -3519,9 +3514,12 @@ int main(int argc, char** argv) {
                 if (bench && s_test >= 0 && !record_only && !fuse_only && (!oracle || s_ref >= 0)) {
                     kb::TimedCase tc;
                     tc.info = r.row->info;
-                    tc.g = g;
+                    /* The launch arguments are the ones the checked call used: with
+                     * --band-capacity that is `ga`, so the timed call reproduces the capacity
+                     * condition the row claims under `args@band`. */
+                    tc.g = ga;
                     tc.seed = case_seed;
-                    tc.what = o.op + " " + r.row->info->name + " " + g.str();
+                    tc.what = o.op + " " + r.row->info->name + " " + gstr;
                     for (size_t k = 0; k < sh.size(); ++k) {
                         kb::TimedOperand d;
                         d.t = t_test[k];

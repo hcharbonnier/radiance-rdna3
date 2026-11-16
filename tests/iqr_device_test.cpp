@@ -1171,11 +1171,15 @@ bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bit
     hipMalloc(&dx, xb.size() * 2);
     hipMemcpy(dx, xb.data(), xb.size() * 2, hipMemcpyHostToDevice);
     /* The output buffer is declared at its capacity, not at this step's extent (the engine's
-     * buffers are max_logit_rows rows), and its rows past M start as NaN: the kernel must leave
-     * them alone. */
+     * buffers are max_logit_rows rows). Its rows past `M` start as NaN, so a kernel that takes
+     * the capacity for a row count is caught; the step's rows stay zero, so a row the launch
+     * fails to write still differs from `want` below. */
     const size_t cap_elems = (size_t)(cap * n_vocab);
+    const size_t step_elems = logits.size();
     hipMalloc(&dl, cap_elems * 4);
-    hipMemset(dl, 0xFF, cap_elems * 4);
+    hipMemset(dl, 0, step_elems * 4);
+    if (cap_elems > step_elems)
+        hipMemset((char*)dl + step_elems * 4, 0xFF, (cap_elems - step_elems) * 4);
     for (int i = 0; i < 4; ++i) {
         hipMalloc(&db[i], cls[i].b.size());
         hipMalloc(&ds[i], cls[i].s.size());

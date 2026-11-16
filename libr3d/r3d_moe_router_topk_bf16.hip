@@ -356,7 +356,9 @@ int r3d_rad_router_sigmoid_topk(const RadArgs* a, RadStream s)
     /* The step's rows, not the band's capacity (see the note in the scatter phase below). */
     const long long M = (long long)r3d_dim(L, 0);
     if (M < 1 || r3d_geti_or(a, "M", M) < M) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(I) < M * tk || r3d_numel(W) < M * tk || r3d_numel(B) < M)
+    /* `B` is the per-expert correction bias `[ne]`, indexed `bias[e]` for `e < n_expert`: its
+     * length is the expert count, not the step's rows. */
+    if (r3d_numel(I) < M * tk || r3d_numel(W) < M * tk || r3d_numel(B) < ne)
         return R3D_NO(RAD_E_SHAPE);
 
     dim3 grid((unsigned)M), blk(kW);
