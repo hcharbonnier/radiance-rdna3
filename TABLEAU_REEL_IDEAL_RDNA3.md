@@ -110,10 +110,239 @@ Contrôle final de non-régression 27B sur la pointe W17 : préfill **303,3 tok/
 à 819 tokens (médiane de 3), décodage **28,6 tok/s** à 16 tokens et **21,4** à
 819, sorties identiques — les rows ajoutées ne changent pas le chemin dense.
 
+**Rejeu 27B (W19, 2026-11-16)** — chargement **15,87 GiB en 2,7 s** (6,2 GB/s,
+dont 1,7 s de disque à 9,8 GB/s), modèle prêt en 3,3 s, 17,57 GiB tenus, KV
+1,58 GiB à 4 séquences. Configuration : `--kv-cache-dtype i8
+--num-speculative-tokens 0` (le drafter h128 fenêtré réclame bf16 ; laisser la
+spéculation active casse le déclaratif).
+
+| cas (max-num-seqs 1) | préfill | décodage |
+|---|---|---|
+| 844 tokens, 16 générés | **318,8 tok/s** | 23,2 tok/s |
+| 29 tokens, 64 générés | 113,7 tok/s | **29,4 tok/s** |
+| 4 requêtes de 32 tokens | — | sérialisées, 5,41 s au total |
+
+**`max-num-seqs 4` : corrigé en W20.** Le 27B échouait au premier pas parce que
+`logits_gemm_vocab_iqr` lisait le paramètre rangé (`M`) comme le nombre de lignes
+de `x`, alors que le moteur y laisse le **plafond de bande** (4) et porte
+l'étendue du pas sur les tenseurs. La row lit maintenant l'étendue sur `x` (comme
+`libr4d/r4d_logits_vocab.hip:408-412`), avec la capacité comme plancher. L'audit
+`rad-kbench --band-capacity` (nouveau mode, voir `AGENTS.md`) a trouvé la même
+faute dans `router_topk`, `router_topk_scatter` et `router_sigmoid_topk`, corrigés
+aussi. Résultat à `SEQS=4` :
+
+| cas (max-num-seqs 4) | préfill | décodage |
+|---|---|---|
+| 844 tokens, 16 générés | **317,5 tok/s** | 23,1 tok/s |
+| 29 tokens, 64 générés | 113,4 tok/s | **29,3 tok/s** |
+| 4 requêtes de 32 tokens en parallèle | — | **13,6–17,9 tok/s chacune, 67,3 tok/s agrégés** (2,67 s) |
+
+Soit ×2,3 sur le débit agrégé par rapport aux 4 requêtes sérialisées à `SEQS=1`
+(29,4 tok/s). Non-régression : `r3d_selftest` 159/0/15, `iqr_device_test` 67
+checks verts, kbench **27B 605/605** et **Flash-Next 856/856** par défaut (pire
+rel_l2 3,619e-3 et 1,206e-2, identiques) **et** dans les mêmes chiffres en
+`--band-capacity` (0 débordement).
+
 Les timings par row du premier run kbench ne sont **pas exploitables** : la
-carte a throttlé (PPT0/PPT1) pendant les 8 minutes de mesure ; HC/PLE restent à
-mesurer sur carte froide. Les 78 cas non couverts par kbench sont hors v1 :
+carte a throttlé (PPT0/PPT1) pendant les 8 minutes de mesure ; HC/PLE, QSA et
+le MoE par row sont repris à froid dans la section suivante. Les 78 cas non
+couverts par kbench sont hors v1 :
 MTP 48 (`mtp.draft_head`, `blk.48`), `ngram_hint` sans oracle libref.
+
+## Flash-Next — rows isolées (W17, 2026-11-16, carte froide)
+
+Arbre `<work-root>/work/w15-main` (code `a772d70`), carte au repos (32 °C), lots de 1 ms,
+`--kernels libr3d:libref --bench`, deux passes : `--op hc --op ple` (M ≤ 512, puis
+`--max-tok 2048`) et `--op qsa`. Horloge moyenne 2 882–2 894 MHz, **aucun throttler** sur les
+passes HC/PLE (bord 32 → 59 °C, jonction 67 °C) ; la passe QSA a tourné à 2 789 MHz (PPT0
+pendant le warm-up), donc ~3–4 % pessimiste. Tous les cas sont vérifiés contre `libref` :
+HC/PLE 110 + 72 cas, 0 échec (pire rel_l2 1,5e-2) ; QSA 147 cas, 0 échec (rel_l2 0).
+
+### HC — `hc_read_e4m3` (n 2 560, hc 4, lowrank 320, matrices E4M3)
+
+6,55 Mo de poids par appel (W_down 320 × 10 240 + W_up 10 240 × 320, E4M3). Plancher à la
+bande passante froide mesurée (622 GB/s) : **10,5 µs** ; le commentaire de la row
+(`libr4d/r4d_hc_bf16.hip:948`, `:1129`) annonce 14,9 µs pour W_up et 18,7 µs pour le read au
+pas de décodage.
+
+| M | `hc_read` (sans inject) | `hc_read` (inject + rotate) | débit effectif |
+|---|---|---|---|
+| 1 | **1 771 µs** | 1 934 µs | 3,7–3,9 GB/s (η ≈ 0,6 %) |
+| 2 | 1 771 | 1 924 | |
+| 4 | 1 816 | 1 954 | |
+| 8 | 3 392 | 3 516 | |
+| 32 | 9 502 | 9 485 | |
+| 128 | 27 685 | 27 969 | |
+| 512 | 113 746 | 115 405 | |
+| 1 024 | 229 909 | 233 276 | |
+| 2 048 | **470 160** | 476 922 | |
+
+Lecture : au-delà de M=8 le temps croît de **0,23 ms par ligne** ajoutée, soit la relecture de
+la paire de matrices par ligne (13,4 Go à M=2 048) à ~28 GB/s, et non une lecture amortie par
+tuile de 128 lignes comme le décrit la row. À 48 `hc_read` par pas (96 matrices), cela fait
+**93 ms par token en décodage** (≈40 % du pas de 217–250 ms à 4,0–4,6 tok/s) et **22,9 s d'un
+préfill de 2 048 tokens** (47 % des 48,6 s mesurés, plafond 89 tok/s). C'est le premier poste
+de Flash-Next, devant le tiering des experts ; l'écart à la borne de la row (~18,7 µs) est
+d'un facteur ~95 et demande un profil engine pour être clos (kbench seul ne le tranche pas).
+
+### HC — `hc_enter`, `hc_write`
+
+| M | `hc_enter` | `hc_write` |
+|---|---|---|
+| 1 | 13,3 µs | 8,0 µs |
+| 8 | 13,4 | 8,1 |
+| 64 | 14,6 | 9,0 |
+| 512 | 40,0 | 29,0 |
+| 2 048 | 155,1 | 97,9 |
+
+Les deux sont au plancher de lancement en décodage (3,07 µs par lancement) : ~4 lancements
+pour `hc_enter`, ~2,6 pour `hc_write`. `hc_project` n'a pas de bande dans ce conteneur :
+aucune mesure.
+
+### PLE
+
+| M | `ple_gate` | `ple_conv` |
+|---|---|---|
+| 1 | 23,1 µs | 5,8 µs |
+| 32 | 32,1 | 42,8 |
+| 128 | 94,8 | 93,8 |
+| 512 | 336,3 | 259,4 |
+| 1 024 | 685,6 | 530,1 |
+| 2 048 | 1 556,9 | 1 044,9 |
+
+`ple_gate` à M=2 048 : 107 GFLOP en 1,56 ms ≈ **69 TFLOP/s** (η ≈ 56 % du pic bf16) ;
+`ple_conv` est lié aux activations (160 Mio en 1,04 ms ≈ 160 GB/s). En décodage, M=1 est au
+plancher de lancement (7,5 lancements pour `ple_gate`, 1,9 pour `ple_conv`). `ngram_hint`
+reste sans oracle.
+
+### QSA
+
+| op | M=1 | M=512 | opérandes (M=512) |
+|---|---|---|---|
+| `qsa_score` | 119,3 µs | **83,4 ms** (±9,6 %) | 258,5 Mio |
+| `qsa_select` | 73,1 µs | 945,7 µs | 131,0 Mio |
+| `qsa_block_key` | 11,5 µs | — | 1,75 Kio |
+| `qsa_work` | 3,7 µs | 5,0 µs | 281 Kio |
+| `qsa_tail_store` | 3,1 µs | 75,2 µs | 1,01 Mio |
+
+`qsa_score` à M=512 : 4,3 GMAC en 83 ms ≈ **103 GFLOP/s** (2 % du pic) ; c'est le poste QSA
+à optimiser (12 couches × 4 sous-lots de 512 = ~4 s par préfill de 2 048 tokens, 8 % du temps
+mesuré). `qsa_select` reste ALU/table. Les autres rows sont au plancher.
+
+### MoE — non mesurable sur ce conteneur
+
+`kbench` refuse de poser les tables d'experts du conteneur : les 110 cas `moe_gemm_q` sont
+**sautés, pas échoués** (140 cas `moe_gather`/`moe_scatter`/router vérifiés, 0 échec).
+
+- `moe_gemm_iqr cannot lay out the table 'w' from trellis:codes=u4[1x1],scale=f32[1x*],trellis=i8{65536x1},trellis.mad=u32{2x1},scale.col=f32[*x128]/fwht128: container format error` (50 cas)
+- `moe_gemm_w4nl cannot lay out the table 'w' from affine:codes=u4[1x1],scale=fp8_e4m3[1x64],scale.1=f32[*x*],table=f32{1x16}/fwht128: shape this kernel does not serve` (60 cas)
+
+Conséquence : ni le temps par row MoE ni η lien par noyau ne sont produisibles par `kbench`
+sur cet artefact. Il faut aligner les tags de format du conteneur et du hook de layout, ou
+passer par une fixture (`--record`).
+
+### η lien (M2)
+
+Borne du rapport §7.3 : 42 Gio copiés une fois à 28 GB/s = 1,61 s pour 4 096 tokens, soit
+2 545 tok/s. Flash-Next mesuré : **42 tok/s** de préfill (2 290 tokens en 54,3 s), donc
+**η ≈ 1,7 %**, très loin des 80 % du critère. L'attribution par row montre que le plafond
+vient de `hc_read` (89 tok/s à lui seul, 3,5 % de la borne), pas du MoE ; le temps MoE n'est
+pas isolable sur ce conteneur.
+
+## M6 — démo serveur Flash-Next (2026-11-16)
+
+Serveur `w15-main` (`a772d70`) avec la configuration v1 : `TP=1`, `NS=0` (MTP hors v1),
+`MLEN=8192`, `HOSTPOOL=43000`, `KVHOST=1024`, `MNBT=2048`, `WIRE=wht6` (défaut). Démarrage :
+poids 41,12 GiB/carte, KV 1,67 GiB (65 584 tokens, 8 × 8192), 20,36 GiB de poids experts dans
+le pool hôte. Prompts de prose distincts et non répétitifs (aucun préfixe commun).
+
+### Débit, 1 séquence (64 tokens gloutons)
+
+| prompt | tokens | TTFT | préfill | décodage |
+|---|---|---|---|---|
+| 1 (MoE expliqué) | 113 | 2,69 s | 41,9 tok/s | 4,58 tok/s |
+| 2 (plan de mesure) | 113 | 2,70 s | 41,9 tok/s | 4,56 tok/s |
+| 3 (note d'estran) | 71 | 1,83 s | 38,7 tok/s | 4,58 tok/s |
+
+Le TTFT suit exactement le préfill à 38,7–41,9 tok/s (113 tokens → 2,7 s) : aucun
+coût fixe visible à ces tailles, contrairement à l'hypothèse de tiering à froid.
+
+### 1, 4 et 6 séquences (48 tokens chacune)
+
+| séquences | mur | par requête | total |
+|---|---|---|---|
+| 1 | 10,89 s | 4,41 tok/s | 4,41 tok/s |
+| 4 | 12,43 s | 3,86–3,93 tok/s | 15,52 tok/s |
+| 6 | 13,10 s | 3,66–3,74 tok/s | 22,05 tok/s |
+
+Le débit agrégé suit le nombre de séquences (×3,5 à 4, ×5 à 6) ; le décodage par requête perd
+~14 % à 4 et ~16 % à 6.
+
+### Cache de préfixe
+
+| cas | tokens | servis par le cache | TTFT |
+|---|---|---|---|
+| prompt identique, 1<sup>re</sup> fois | 4 468 | 0 | 108,4 s |
+| prompt identique, 2<sup>e</sup> fois | 4 468 | **4 096** | 8,97 s |
+| même préfixe + 1 354 tokens | 5 822 | 4 096 | 42,4 s |
+| conversation qui grandit, tour 1 / 2 / 3 | 2 455 / 2 858 / 3 260 | 0 / **2 048** / **2 048** | 58,9 / 19,7 / 29,6 s |
+| rejeu « agent » (5 tours, sous-agents) | 8 543 | **0** (0 %) | 29,6–81,3 s |
+
+Trois constats :
+1. Le cache fonctionne (×12 sur un prompt identique, demi-préfill sur un tour qui grandit) mais
+   la reprise est **exacte** : elle ne repart qu'à une frontière de chunk de 2 048 tokens
+   (`prefix resume: exact`). Un tour de moins de 2 048 tokens ne peut donc rien réutiliser.
+2. Le rejeu multi-agents n'a **rien** réutilisé : `prefix_hit_cuts_total{reason="no_snapshot"}`
+   = 4, `linear_checkpoints_written_total` = 1 pour 5 tours, alors que l'attention détenait
+   4 268 tokens (`attn_cached_tokens_total = prefix_hit_cut_tokens_total = 4 268`). Les
+   snapshots d'état linéaire ne sont pas écrits quand les conversations s'entrelacent.
+3. Le tier KV hôte est **désactivé** par le moteur malgré `--prefix-cache-mib 1024` :
+   `W kv tiers: no device gather/scatter for group 1 at a 4128-byte fragment, so a finished
+   conversation cannot leave VRAM. The tiers are off.` Le groupe `kv_qsa_bkey` n'a pas de
+   gather/scatter device, donc une conversation terminée ne peut pas quitter la VRAM ; à
+   200k tokens de contexte, le cache se vide par éviction et chaque tour re-préfille.
+
+### Contention préfill / décodage (`scripts/fnconc.sh`, 4 décodeurs × 48 tokens, préfill ~3 000 tokens)
+
+| passe | décodeurs seuls | à côté du préfill | coût | préfill |
+|---|---|---|---|---|
+| warm | 12,64 s | 87,69 s | +593,8 % | 87,68 s = 35 tok/s |
+| 1 | 12,64 s | 87,63 s | +593,3 % | 87,62 s = 35 tok/s |
+| 2 | 12,72 s | 87,59 s | +588,6 % | 87,58 s = 35 tok/s |
+
+Les décodeurs ne terminent qu'avec le préfill (mur identique) : le préfill perd ~17 %
+(35 vs 42 tok/s) en leur laissant du device, mais leur latence est celle du préfill entier.
+
+### Robustesse
+
+| cas | résultat |
+|---|---|
+| prompt de 12 002 tokens | HTTP 400 en 0,00 s, message utile (« shorten the prompt by at least 3 811 tokens ») |
+| `max_tokens: 20000` | **pas de 400** : le serveur plafonne à 8 191 (journal) et génère ; à la déconnexion du client, `finish=abort` et `num_requests_running` retombe à 0 |
+| abandon en cours de génération (client part à 3 s) | requête suivante servie en 3,57 s, aucun slot fuit |
+| 6 admissions simultanées (`--max-num-seqs 8`) | 6/6 servies, 3,66–3,74 tok/s chacune |
+| après tout cela | `/health` 200, `num_requests_running` 0 |
+
+### Contextes > 8 192 (16k)
+
+Même configuration, `MLEN=16384`, `SEQS=4` : KV 1,23 GiB (65 596 tokens, 4 × 16 384),
+poids 41,55 GiB, 24 snapshots d'état linéaire (6 par séquence).
+
+| cas | résultat |
+|---|---|
+| prompt de 13 421 tokens | **accepté**, TTFT 328,5 s, préfill **40,9 tok/s**, 8 tokens générés |
+| prompt de 18 756 tokens | HTTP 400 en 0,00 s (« maximum context length is 16384 … ») |
+
+Le pool KV tient 4 × 16k exactement (65 596 ≥ 65 536) ; le débit de préfill ne bouge pas
+(40,9 vs 41,9 tok/s à 113 tokens), donc le coût est bien proportionnel aux tokens. 200k
+reste hors démonstration : il faudrait ~10 × plus de pool (et le tier KV hôte, cf. ci-dessous).
+
+### Ce que M6 ne démontre pas
+
+- Le préfixe multi-tour **au-delà de 2 048 tokens** et le tier KV hôte (bloqué par le
+  gather/scatter du groupe QSA bkey) : le cache ne survit pas à une éviction, donc une
+  session de 200k tokens re-préfille à chaque tour.
+- L'image/vision : `capabilities.image=false` (build sans `RAD_WITH_FFMPEG`).
 
 ## Lecture
 
@@ -135,18 +364,27 @@ MTP 48 (`mtp.draft_head`, `blk.48`), `ngram_hint` sans oracle libref.
 |---|---|---|---|---|
 | W3 | GEMV 27B, split-K | 662,4 GB/s (76,6 %) sur `down` | 864 GB/s | **fait** |
 | W4 | `gemm_iqr_tiled` M=512/4096 | 15,5 / 14,8 TFLOP/s (résident) ; WMMA 11,5 / 11,2 | borne WMMA | WMMA plus lente, éteinte |
-| W5 | `moe_gemm_iqr` préfill/décodage | | | aucun modèle MoE |
+| W5 | `moe_gemm_iqr`, `moe_gemm_w4nl` | — | | **non mesurable** : kbench refuse le format des tables du conteneur (110 cas sautés) |
 | W6 | `attn_paged` h256 decode/prefill | inclus 27B : préfill 301, décodage 21,2 | | à isoler |
-| W8/W9 | `hc_read`, `ple_gate`, `ple_conv` | | | à mesurer |
+| W8/W9 | `hc_read`, `ple_gate`, `ple_conv` | `hc_read` 1,77 ms à M=1 (η 0,6 %) ; `ple_gate` 69 TFLOP/s à M=2 048 | 10,5 µs (borne bande) | **fait** — `hc_read` est le poste dominant |
 | W10 | `attn_dense` hd72 | −49 % à M=512 | | M=16384 non mesuré |
-| M1 | 27B tokens/s (préfill, décodage) | 301,0 / 21,2–28,4 | | **dépassé** |
-| M5 | Flash-Next tokens/s | | | aucun modèle |
+| M1 | 27B tokens/s (préfill, décodage) | 301,0 / 21,2–28,4 (SEQS=1) ; **SEQS=4** : 317,5 tok/s et 67,3 tok/s agrégés sur 4 requêtes | | **dépassé** |
+| M2 | η lien Flash-Next, préfill 2 048 | **1,7 %** (42 tok/s) ; plafond `hc_read` 89 tok/s | 80 % de 2 545 tok/s | **non tenu**, cause identifiée |
+| M4 | QSA par row | `qsa_score` 83,4 ms à M=512 (103 GFLOP/s) ; `qsa_select` 946 µs | | **fait** |
+| M5 | Flash-Next tokens/s | préfill 42,1 / 41,5 tok/s ; décodage 4,0–4,6 | | **fait**, limité par `hc_read` |
+| M6 | Démo serveur (prompts, multi-tour, contention, robustesse) | décodeurs ×7,0 à côté d'un préfill ; cache de préfixe ×12 sur prompt identique, 0 % en rejeu agent | | **fait**, deux limites (tier KV off, snapshots interleavés) |
 
 ## Optimisations différées (W14+)
 
 Ces noyaux sont livrés et validés, mais pas à leur optimum ; ils restent dans
 l'arbre et sont marqués à optimiser, pas à supprimer.
 
+- **`hc_read_e4m3` (priorité 0, Flash-Next)** : 1,77 ms à M=1 pour 6,55 Mo de
+  poids (η 0,6 % de la borne bande) et 0,23 ms par ligne au-delà de M=8 : la
+  paire de matrices est relue par ligne à ~28 GB/s au lieu d'être amortie par
+  tuile. À 48 appels par pas, c'est ~93 ms/token en décodage et 47 % du préfill
+  de 2 048 tokens. Le commentaire de la row annonce 18,7 µs au décodage : l'écart
+  (×95) doit être profilé côté engine avant de toucher au noyau.
 - **Tuile WMMA du préfill** : construite, bit-identique, couverte par les tests,
   **éteinte** car 25–32 % plus lente que le `v_dot4` à toutes les formes mesurées.
   Le problème est l'émission et le staging (decode par une seule wave, fragments),
@@ -159,7 +397,21 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
 - **`attn_paged` h256** : le cache de scores et le pitch 272 sont livrés ; le gain
   isolé n'est pas mesuré et le split du préfill reste interdit par l'ordre exact
   que les tests exigent.
-- **HC/PLE** : aucune mesure.
+- **`qsa_score` à M=512** : 83,4 ms (103 GFLOP/s, 2 % du pic) pour 258 Mio
+  d'opérandes ; ~4 s par préfill de 2 048 tokens. Le plan refuse 2 048/4 096
+  lignes (512 Mio/1 Gio), d'où `max-num-batched-tokens: 2048`.
+- **PLE** : mesuré à froid ; `ple_gate` tient 69 TFLOP/s à M=2 048 et M=1 est au
+  plancher de lancement, rien à optimiser avant le reste.
+- **Tier KV hôte (M6)** : désactivé par le moteur car le groupe `kv_qsa_bkey`
+  (3,25 KiB par bloc de 4 tokens, fragment 4 128 octets) n'a pas de
+  gather/scatter device ; sans lui une conversation terminée ne peut pas quitter
+  la VRAM, donc le cache de préfixe ne survit pas à une éviction et un tour de
+  200k tokens re-préfille tout. Ajouter le gather/scatter du groupe 1, puis
+  refaire le rejeu multi-tour.
+- **Snapshots d'état linéaire en rejeu multi-agents (M6)** : 1 seul checkpoint
+  écrit pour 5 tours entrelacés et 0 % de cache servi (`no_snapshot` ×4) ; la
+  politique `geometric-backoff` (4 snapshots pour 8 192 tokens) est à revoir
+  pour les conversations concurrentes.
 - **E4M3/rotated** : aucun modèle non-IQR sur l'hôte.
 
 

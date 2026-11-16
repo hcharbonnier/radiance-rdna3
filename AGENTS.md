@@ -13,6 +13,8 @@
   **répertoire de build neuf** (un build incrémental après `rsync -a` peut
   garder des objets périmés).
 - Ne pas modifier `core/`, `arch/`, `libr4d/` ni les docs partagés sans besoin.
+- Accès SSH, droits, specs de l'hôte et contraintes d'inférence distante :
+  voir `API_DISTANTE.md` (référence pour tout travail GPU distant).
 
 ## Tester un kernel et ses performances : `rad-kbench`
 
@@ -53,6 +55,7 @@ Options utiles :
 | `--bench-flush MIB` | empreinte de rotation (cache froid) ; défaut 256 sur carte |
 | `--bench-iters N` / `--bench-reps N` / `--bench-warm-ms N` | taille de lot, nombre de lots, warm-up |
 | `--max-cases N` | répétitions par (op, kernel, bibliothèque, géométrie) |
+| `--band-capacity` | issue chaque cas avec le paramètre rangé au **plafond de sa bande** et les opérandes à la taille du point : la condition du moteur (un pas plus étroit que sa bande). Un kernel qui lit ce paramètre comme un nombre de lignes passe les cas par défaut et échoue ici |
 | `--report FILE` | rapport markdown (Correctness, Speed, Divergences, Not covered) |
 | `--strict` | replay : un fixture périmé fait échouer le run |
 

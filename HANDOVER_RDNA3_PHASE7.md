@@ -10,6 +10,10 @@
 | `r3d_selftest` complet | **159 rows, 0 échec, 15 skips** |
 | Tests device | `iqr_device_test`, `logits_bf16_device_test`, 4 tests QSA, `moe_iqr_test`, `moe_iqr_device_test`, `moe_w4nl`, `kv_store_b4`, `rope` h128, router, `gemm_nt` N=1, vision, GDN had : **tous verts** |
 | kbench Flash-Next (`--kernels libr3d:libref`) | **856/856, 0 échec, 0 divergence**, pire rel_l2 1,2e-2 |
+| Mesures à froid W18 (HC/PLE/QSA par row) | 182 + 147 cas, 0 échec ; `hc_read` **1,77 ms à M=1** (η 0,6 %), η lien **1,7 %**, MoE par row bloqué (format du conteneur) |
+| Démo serveur M6 / W19 | préfill 38,7–41,9 tok/s, décodage 4,41 (1 séq.) / 15,5 (4) / 22,1 (6) tok/s ; cache ×12 sur prompt identique, **0 % en rejeu agent** ; **tier KV hôte refusé** ; 4 décodeurs ×7,0 à côté d'un préfill |
+| Rejeu 27B / W19–W20 | chargement 15,87 GiB en 2,7 s ; `SEQS=1` préfill 318,8 tok/s (844), décodage 23,2 / 29,4 ; **`SEQS=4` corrigé** (W20) : préfill 317,5 tok/s, 4 requêtes à 67,3 tok/s agrégés |
+| Contexte 16k | KV 1,23 GiB (4 × 16 384) ; prompt de 13 421 tokens servi à 40,9 tok/s ; >16k → 400 |
 | 27B texte | décodage 28,4 tok/s (16 tok) / 21,2 (819), préfill 301 tok/s à 819 |
 | Flash-Next texte | préfill 42 tok/s (2 290 et 4 570 tok), décodage 4,0–4,6 tok/s, 4 séquences concurrentes OK |
 | Robustesse Flash-Next | prompt 12 001 tok → HTTP 400 clair, serveur vivant ; redémarrages propres |
@@ -106,17 +110,70 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
 
 ## 6. Reste à faire
 
-1. **Mesures à froid** : HC/PLE, MoE/QSA par row et **η lien ≥ 80 %** en
-   préfill 2048/4096 (M2/M4) ; le kbench de 8 min throttle.
-2. **Optimisations différées** : WMMA préfill (éteinte, 25–32 % plus lente),
+1. **Mesures à froid — faites (W18)** : HC/PLE/QSA par row sur `w15-main`
+   (`a772d70`), 0 échec, aucun throttler. Résultats dans
+   `TABLEAU_REEL_IDEAL_RDNA3.md`. Deux constats :
+   - **`hc_read` est le premier poste de Flash-Next** : 1,77 ms à M=1
+     (η ≈ 0,6 % de la borne bande) et 470 ms à M=2 048, soit 0,23 ms par ligne
+     ajoutée — la paire de matrices E4M3 est relue par ligne à ~28 GB/s. À 48
+     appels par pas : ~93 ms/token en décodage (40 % du pas) et 47 % du préfill
+     2 048. La row annonce 18,7 µs au décodage : écart ×95 à profiler côté
+     engine. **C'est la piste n°1** pour le décodage à 4 tok/s.
+   - **η lien = 1,7 %** (42 tok/s contre 2 545 tok/s), donc M2 non tenu, et le
+     plafond mesuré est `hc_read`, pas le MoE. Le **temps par row MoE reste non
+     mesurable** : `kbench` refuse le format des tables du conteneur (110 cas
+     sautés, « container format error » sur `trellis:…/fwht128` et « shape this
+     kernel does not serve » sur `affine:…/fwht128`) ; aligner les tags ou
+     passer par une fixture `--record`.
+2. **Optimisations différées** : `hc_read` (ci-dessus) d'abord ; WMMA préfill
+   (éteinte, 25–32 % plus lente),
    occupation du gated fusionné (1,4 bloc/CU), `attn_dense` à M=16384,
-   `attn_paged` h256 isolé.
-3. **Robustesse étendue** : erreurs de plan, arrêt/reprise en cours de
-   génération, plusieurs admissions.
+   `attn_paged` h256 isolé, `qsa_score` à M=512 (83,4 ms, 2 % du pic).
+3. **Robustesse étendue — faite (W19)** : 12 002 tokens → 400 en 0,00 s avec le
+   nombre de tokens à couper ; `max_tokens` hors contexte **plafonné** à 8 191
+   (pas de 400) et `finish=abort` à la déconnexion, slot rendu ; abandon à 3 s
+   puis requête suivante en 3,57 s ; 6 admissions 6/6 ; `/health` 200 et
+   0 requête en vol. Démo M6 dans `TABLEAU_REEL_IDEAL_RDNA3.md` §M6.
+   Deux limites trouvées : le **tier KV hôte est refusé au démarrage**
+   (`no device gather/scatter for group 1 at a 4128-byte fragment`), donc le
+   cache de préfixe ne vit qu'en VRAM ; et le rejeu multi-agents n'a **rien**
+   réutilisé (0 %, `no_snapshot` ×4, 1 checkpoint pour 5 tours) alors qu'un
+   prompt identique réutilise 4 096 tokens (TTFT 108,4 → 9,0 s) et qu'une
+   conversation qui grandit réutilise 2 048 par tour.
+   Contention (`fnconc`) : 4 décodeurs 12,6 s seuls → 87,6 s à côté d'un préfill
+   de 3 000 tokens (+590 %), préfill 35 tok/s (vs 42 seul).
 4. **R9** : vérifier E4M3/rotated sur un modèle non-IQR (aucun 2B/4B sur
-   l'hôte).
-5. **Rapport final** : `RAPPORT_RDNA3.md` (hors dépôt), tableau et limites.
-6. **Hors v1** : MTP, codebook `w4nl` dans `w4a8`.
+   l'hôte). Dérogation documentée dans `SUIVI_LOTS_RDNA3.md` §R9 (inventaire de
+   l'hôte vérifié le 2026-11-16).
+4bis. **R24 — corrigé (W20)** : le paramètre rangé est une **capacité de bande**,
+   pas le nombre de lignes du pas. `logits_gemm_vocab_iqr` lit l'étendue sur `x`
+   (comme `libr4d`), et l'audit `rad-kbench --band-capacity` a trouvé la même
+   faute dans `router_topk`, `router_topk_scatter` et `router_sigmoid_topk`
+   (corrigés). Épinglé par `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band`
+   (échec sur l'ancienne `.so`, vert sur la nouvelle) ; kbench Flash-Next 856/856
+   dans les deux modes ; `r3d_selftest` 159/0/15. Le 27B se sert donc à
+   `--max-num-seqs 4` (`--kv-cache-dtype i8`, `--num-speculative-tokens 0` : sans
+   `NS=0`, le drafter fenêtré réclame bf16) et 4 requêtes donnent 67,3 tok/s
+   agrégés. Pour trancher R20 sans toucher au noyau : `--profile-ops true` donne
+   le temps device par op.
+
+   Arbre de référence corrigé : **`<work-root>/work/w20-r24`** (même source que
+   `a772d70` plus W20, build ccache 1 min 27). `w15-main` reste l'état `a772d70`
+   non corrigé : ne pas s'en servir pour un A/B avec le correctif.
+5. **Rapport final — mis à jour (2026-11-16)** : encadré de mise à jour en tête,
+   note sur la §7.3, nouvelle §7.5 « Mesures réelles » et §9 révisée. Il reste
+   **hors dépôt** (décision du §7 ci-dessous inchangée) ; le tableau et le journal
+   portent les chiffres dans le dépôt.
+6. **Image / vision — non tenté (décision en attente)** : le build n'a pas
+   `RAD_WITH_FFMPEG` (`capabilities.image=false`) et il n'y a pas de corpus
+   d'images sur l'hôte. Reconstruire avec FFMPEG, puis tester
+   `gemm_nt_bias`/`grid_embed` et un tour vision, **seulement si la cible inclut
+   l'image** ; sinon laisser hors v1 (les rows elles-mêmes sont couvertes par
+   kbench).
+7. **Nettoyage code (non fait)** : traces `r3d_trace_on` ajoutées au bring-up
+   (gated mais répétées par couche) et déduplication `dot4_i8`/`i8_codes4` ; à
+   faire avec la prochaine passe code, pas avec les mesures.
+8. **Hors v1** : MTP, codebook `w4nl` dans `w4a8`.
 
 ## 7. Non ajouté volontairement
 

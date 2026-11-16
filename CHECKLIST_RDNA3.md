@@ -66,8 +66,11 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
       ligne, top-k variable (couvert par `moe_iqr_device_test`).
 - [~] 2.7 Tests : synthétiques verts ; référence hôte en cours de
       réconciliation ; couche réelle du conteneur à faire après 2.10.
-- [ ] 2.8 Mesure M2 : décodage 1 et 4 séquences, préfill 2048/4096, **η lien
-      ≥ 80 %**.
+- [~] 2.8 Mesure M2 : décodage 1 et 4 séquences, préfill 2048/4096, **η lien
+      ≥ 80 %**. Fait à froid le 2026-11-16 : η lien = **1,7 %** (42 tok/s), le
+      plafond étant `hc_read` (89 tok/s à lui seul), pas le MoE ; le temps par
+      row MoE n'est **pas mesurable** sur ce conteneur (`kbench` refuse le format
+      des tables, 110 cas sautés) — voir `TABLEAU_REEL_IDEAL_RDNA3.md`.
 - [ ] 2.9 Doc de la row MoE et des limites connues.
 - [x] 2.10 **`moe_gemm_w4nl`** : forme `kW4NL` (table f32[16], E4M3/64 + f32,
       `group=64`), row device, `a_order` token/sorted, N=1280/2560,
@@ -124,24 +127,50 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 - [x] 4bis.4 Texte : 1 séquence (30 / 2290 / 4570 tokens) et 4 séquences
       concurrentes servies ; préfill 42 tok/s, décodage 4,0–4,6 tok/s.
 - [ ] 4bis.5 Image / vision si le conteneur la sert (dépend de 4.6).
-- [x] 4bis.6 Robustesse : prompt de 12 001 tokens refusé proprement (HTTP 400,
-      message explicite) et serveur toujours vivant ; redémarrages propres.
+- [x] 4bis.6 Robustesse : prompt de 12 002 tokens refusé proprement (HTTP 400,
+      message explicite avec le nombre de tokens à couper) et serveur toujours
+      vivant ; `max_tokens` hors contexte plafonné à 8 191 (pas de 400) et
+      `finish=abort` à la déconnexion, slot rendu ; abandon à 3 s puis requête
+      suivante en 3,57 s ; **6 admissions simultanées 6/6** ; redémarrages
+      propres ; `/health` 200 et 0 requête en vol à la fin.
 - [x] 4bis.7 Aucun nouvel avertissement au démarrage ; les avertissements
       présents (PCIe sous max, swap, governor) sont ceux de l'hôte.
-- [ ] 4bis.8 Démo reproductible (script, prompts, lots) et documentation.
-- [ ] 4bis.9 Mise à jour de `SUIVI_LOTS_RDNA3.md` (M2→M6) et du journal.
+- [x] 4bis.8 Démo reproductible (script, prompts, lots) et documentation :
+      `m6demo.py`/`m6tail.py`/`m6prefix.py`/`m6grow.py` + `agentreplay.py` +
+      `fnconc.sh` ; résultats dans `TABLEAU_REEL_IDEAL_RDNA3.md` §M6. Deux
+      limites documentées : tier KV hôte refusé (gather/scatter du groupe QSA) et
+      0 % de cache en rejeu multi-agents (`no_snapshot`).
+- [x] 4bis.9 Mise à jour de `SUIVI_LOTS_RDNA3.md` (W18/W19, M2→M6, risques
+      R19–R23) et du journal.
 
 ## 5. Mesures et rapport final (M4/M7)
 
-- [~] 5.1 HC : coût de `hc_read`/`hc_write`/`hc_enter`/`hc_project` (M4 exige
-      « coûts documentés »).
-- [~] 5.2 PLE : coût de `ple_gate`/`ple_conv` et de l'n-gram.
-- [ ] 5.3 Remplir les lignes MoE, QSA, HC, PLE, Flash-Next de
-      `TABLEAU_REEL_IDEAL_RDNA3.md`.
-- [ ] 5.4 R3 — mesurer le temps de relayout/chargement du 27B ; vectoriser si
-      nécessaire.
-- [ ] 5.5 R9 — valider E4M3/rotated sur un modèle non-IQR (bloqué : aucun 2B/4B
-      sur l'hôte ; documenter la dérogation si le modèle reste absent).
+- [x] 5.1 HC : coût de `hc_read`/`hc_write`/`hc_enter`/`hc_project` mesuré à
+      froid : `hc_read` 1,77 ms à M=1, 470 ms à M=2 048 ;
+      `hc_enter`/`hc_write` au plancher ; `hc_project` sans bande dans ce
+      conteneur).
+- [x] 5.2 PLE : `ple_gate` 23,1 µs à M=1 / 69 TFLOP/s à M=2 048 ; `ple_conv`
+      5,8 µs à M=1 / 160 GB/s à M=2 048 ; `ngram_hint` reste sans oracle.
+- [x] 5.3 Lignes MoE, QSA, HC, PLE, Flash-Next remplies à froid. Le MoE par row
+      reste bloqué par le format des tables du conteneur (110 cas sautés par
+      kbench, « container format error ») et η lien est calculé de bout en bout
+      (1,7 %).
+- [x] 5.4 R3 — mesurer le temps de relayout/chargement du 27B : **15,87 GiB en
+      2,7 s** (6,2 GB/s, 1,7 s de disque), prêt en 3,3 s ; pas de vectorisation
+      nécessaire. Rejeu : préfill 318,8 tok/s à 844, décodage 23,2/29,4 tok/s.
+- [x] 5.8 R24 — 27B multi-séquence : **corrigé**. Le paramètre rangé est une
+      capacité de bande, pas le nombre de lignes ; `logits_gemm_vocab_iqr` lit
+      l'étendue sur `x` (comme `libr4d`), et l'audit `rad-kbench --band-capacity`
+      a trouvé la même faute dans `router_topk`, `router_topk_scatter` et
+      `router_sigmoid_topk` (corrigés aussi). Preuve : test device
+      `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` (échec sur l'ancienne
+      `.so`, vert sur la nouvelle), kbench 27B 605/605 et Flash-Next 856/856 dans
+      les deux modes (par défaut et `--band-capacity`), 27B `SEQS=4` à 67,3 tok/s
+      agrégés.
+- [~] 5.5 R9 — valider E4M3/rotated sur un modèle non-IQR : **inexécutable sur
+      l'hôte** (inventaire vérifié : seuls le 27B IQR et Flash-Next IQR).
+      Dérogation documentée dans `SUIVI_LOTS_RDNA3.md` §R9 ; à reprendre dès
+      qu'un conteneur non-IQR 2B/4B est présent.
 - [ ] 5.6 Mettre à jour `RAPPORT_RDNA3.md` (hors dépôt aujourd'hui) et décider
       de son ajout au dépôt.
 - [ ] 5.7 Mettre à jour `docs/OPS.md`, `libr3d/README.md` et les limites connues.
@@ -173,11 +202,14 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 - [x] 8.2 Flash-Next démarre et génère (texte, 1 et 4 séquences, préfills
       2048/4096) sans fallback ni avertissement nouveau.
 - [~] 8.3 MoE conforme (treillis + `w4nl` + bf16 protégé, écart borné documenté)
-      ; le **η lien ≥ 80 %** reste à mesurer (kbench throttlé).
+      ; le **η lien ≥ 80 %** est mesuré et **non tenu** (1,7 %) — cause
+      identifiée (`hc_read`, 47 % du préfill), pas le MoE ; le temps par row MoE
+      reste non mesurable sur ce conteneur.
 - [x] 8.4 QSA identique à la référence et égal au dense sous le seuil (781/819
       checks, kbench 0 divergence).
 - [~] 8.5 Tableau réel/idéal complet, écarts expliqués, RAPPORT à jour :
-      Flash-Next et kbench faits ; HC/PLE et η lien en attente d'une carte froide.
+      Flash-Next, kbench, HC/PLE et QSA par row faits à froid ; η lien calculé ;
+      MoE par row bloqué par le format des tables du conteneur.
 - [ ] 8.6 Documentation des rows, architectures, limites et perf à jour.
 - [ ] 8.7 Handover final (phase suivante) et journal à la date de clôture.
 

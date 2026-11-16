@@ -13,11 +13,11 @@
 | W2 — décodeur device | en cours | 1,5 sem | treillis + table/grille faits ; `kSigned`/`w4nl` en W15 |
 | W3 — GEMM M ≤ 16 | **terminé (2026-11-15)** | 1,5 sem | GEMV 86 % ; split-K `down` 76,6 % (1,55×) |
 | W4 — m64 et préfill | **terminé (résident) ; WMMA éteinte** | 2,5 sem | tuile résidente 15,5 TFLOP/s ; WMMA 25–32 % plus lente, à reprendre en W14 |
-| W5 — MoE IQR | **en cours** | 4 sem | treillis + run map + référence hôte verts ; **`w4nl` livré** (MTP 48 inclus) ; restent formes mixtes par couche et experts bf16 protégés |
+| W5 — MoE IQR | **en cours** | 4 sem | treillis + run map + référence hôte verts ; **`w4nl` livré** (MTP 48 inclus) ; restent formes mixtes par couche et experts bf16 protégés ; **temps par row non mesurable sur ce conteneur** (kbench refuse le format des tables) |
 | W6 — attention h256/GQA/KV i8 | **terminé (revu, 15/15 device)** | 3,5 sem | kv_store i8 block 4 et rope imrope h128 livrés en W15 |
-| W7 — QSA | **terminé (2026-11-16, 4 ops)** | 2,5 sem | tests libref verts ; perf à mesurer |
-| W8 — HC | **terminé (revu, device vert)** | 3,5 sem | refus runtime `M=5` à corriger en bring-up |
-| W9 — PLE | **terminé (revu, device vert)** | 1,5 sem | 4 rows ; perf à mesurer |
+| W7 — QSA | **terminé (2026-11-16, 4 ops)** | 2,5 sem | tests libref verts ; perf mesurée en W18 (`qsa_score` 83,4 ms à M=512, 103 GFLOP/s) |
+| W8 — HC | **terminé (revu, device vert)** | 3,5 sem | refus `M=5` corrigé ; coûts mesurés en W18 (`hc_read` 1,77 ms à M=1, η 0,6 %) |
+| W9 — PLE | **terminé (revu, device vert)** | 1,5 sem | 4 rows ; perf mesurée en W18 (69 TFLOP/s à M=2 048) |
 | W10 — vision | **terminé (revu, 142 rows vertes)** | 3 sem | `gemm_nt_bias`/`grid_embed` device livrés en W15 |
 | W11 — intégration | **terminé (2026-11-15)** | 1,5 sem | tête vocabulaire validée et servie par défaut |
 | W12 — optimisation | **terminé (2026-11-15)** | 3–4 sem | préfill 27B ×3,8 ; gated fusionné ; tête 16 bits ; h256/vision |
@@ -26,8 +26,16 @@
 | W15 — rows Flash-Next | **terminé** | 2 sem | `kSigned` 8, `gdn_conv_recurrent_update_had`, `kv_store` b4, `rope` h128, router fusionné, `gemm_nt` N=1, rows vision, `moe_gemm_w4nl` ; **159 rows / 0 échec / 15 skips** |
 | W16 — bring-up Flash-Next | **terminé (2026-11-16)** | 1 sem | serveur 121 GB servi : préfill 42 tok/s, décodage 4,0–4,6 tok/s, 4 séquences ; 0 bande device manquante |
 | W17 — corrections kbench | **terminé (2026-11-16)** | 1 sem | `logits_gemm_bf16` corrigé (échelle 1×128), 3 formes QSA alignées ; kbench **856/856, 0 échec, 0 divergence** |
+| W18 — mesures à froid | **terminé (2026-11-16)** | — | HC/PLE/QSA par row, 0 échec : `hc_read` 1,77 ms à M=1 (η 0,6 %), η lien 1,7 %, MoE par row bloqué par le format du conteneur |
+| W19 — démo M6, robustesse, 16k | **terminé (2026-11-16)** | — | prompts distincts, 1/4/6 séquences, cache de préfixe, 13 421 tokens à 16k, contention, erreurs ; tier KV hôte off et 0 % en rejeu multi-agents documentés |
+| W20 — contrat capacité/étendue | **terminé (2026-11-16)** | — | R24 corrigé (`logits_gemm_vocab_iqr`), même faute trouvée et corrigée dans 3 rows router ; mode `kbench --band-capacity` ; selftest 159/0/15, kbench 856/856 dans les deux modes, 27B `SEQS=4` à 67,3 tok/s |
 | M0 — Go/No-Go | **GO (2026-11-15)** | fin S3 | `MEMO_M0_RDNA3.md` |
 | M1 — dense IQR | **atteint et dépassé : 27B texte, décodage 28,4 tok/s (16 tok) / 21,2 (819), préfill 301 tok/s à 819** | fin S8 | W15 : WMMA, occupation gated, mesure M=16384 |
+| M2 — η lien ≥ 80 % | **non tenu : 1,7 %** (42 tok/s contre 2 545) | fin S10 | le plafond mesuré est `hc_read` (89 tok/s), pas le MoE |
+| M3 — QSA | **atteint** : équivalent au dense, 103 GFLOP/s à M=512 | fin S10 | `qsa_score` reste le poste QSA à optimiser |
+| M4 — coûts documentés | **atteint** : HC, PLE, QSA par row à froid | fin S10 | MoE par row bloqué (format des tables) |
+| M5 — Flash-Next texte | **atteint** : 1/4/6 séquences, 8k et 16k, robustesse | fin S12 | vision hors démo (build sans FFMPEG) |
+| M6 — démo serveur | **atteint avec deux limites** | fin S12 | tier KV hôte refusé, snapshots absents en rejeu multi-agents |
 
 ## Risques ouverts
 
@@ -36,8 +44,18 @@
   lisait la queue d'échelles au mauvais offset. Le test utilise désormais la
   référence GEMM validée et passe ; la row est servie par défaut (plus de
   `RAD_IQR_VOCAB`).
-- **R3** — Relayout hôte scalaire : le chargement du 27B peut être long ;
-  mesurer, puis vectoriser si nécessaire.
+- **R3** — *résolu* : le chargement du 27B prend **2,7 s** pour 15,87 GiB
+  (6,2 GB/s, dont 1,7 s de disque à 9,8 GB/s), modèle prêt en 3,3 s ; le
+  relayout scalaire n'est pas un goulot sur cet hôte.
+- **R24** — *résolu (W20)* : le 27B échouait avec `max-num-seqs > 1` parce que
+  `logits_gemm_vocab_iqr` lisait le paramètre rangé comme le nombre de lignes au
+  lieu d'une capacité de bande. La row lit maintenant l'étendue sur `x`, comme
+  `libr4d`. L'audit `rad-kbench --band-capacity` a trouvé la même faute dans
+  `router_topk`, `router_topk_scatter` et `router_sigmoid_topk` (corrigés). Test
+  device épinglé ; kbench Flash-Next 856/856 dans les deux modes ; 27B `SEQS=4`
+  à préfill 317,5 tok/s et 67,3 tok/s agrégés sur 4 requêtes. Contrat écrit dans
+  `AGENTS.md` (`--band-capacity`) : le paramètre rangé est une capacité, l'étendue
+  est dans les tenseurs.
 - **R4** — Aucune fixture MoE : référence hôte à produire en W5.
 - **R5** — *résolu* : la vision est fusionnée et verte (142 rows).
 - **R6** — *résolu* : `rmsnorm_had_quant_i8g` est déclarée, fusionnée (add +
@@ -52,6 +70,11 @@
   isolément et optimiser en W14.
 - **R9** — La vérification des formes E4M3/rotated sur un modèle non-IQR reste
   impossible : aucun 2B/4B sur l'hôte, seulement le 27B et le Flash-Next.
+  **Dérogation documentée (2026-11-16)** : inventaire de l'hôte vérifié —
+  `qwen3.8-27b-iq4r-l-v4.rad` et `qwen3.8-next-flash-iqr-v4.rad`, tous deux IQR.
+  La couverture actuelle est celle des rows et des tests device sur ces deux
+  conteneurs ; la validation croisée non-IQR reste à faire dès qu'un conteneur
+  est disponible.
 - **R10** — `gemm_iqr_gated_i8a8h` fusionné n'utilise que 1,4 bloc par CU
   (136 groupes, 96 CU) ; son gain est réel (~1,5 % en décodage) mais son
   occupation est à revoir en W14 (deux groupes par bloc ou 256 threads).
@@ -82,7 +105,26 @@
   `(sbr, sbc)`, rel_l2 0,53 → 1,7e-3, test `logits_bf16_device_test` ajouté.
 - **R18** — *résolu* : `qsa_select.nsel`/`seqused` en rang 1, `qsa_work.nc` en
   `[S]`, `qsa_tail_store.state` en `[M,1,ring,n]` ; kbench 0 divergence.
-- **R19** — Les timings par row du kbench Flash-Next ne sont pas exploitables :
-  la carte a throttlé (PPT0/PPT1) pendant les 8 minutes. HC/PLE, MoE/QSA et
-  η lien restent à mesurer sur carte froide (`--kernels libr3d:libref`,
-  petits lots).
+- **R19** — *résolu* : les timings par row ont été repris à froid (W18), sans
+  throttler ; 182 + 147 cas, 0 échec. Voir `TABLEAU_REEL_IDEAL_RDNA3.md`.
+- **R20** — `hc_read_e4m3` coûte **1,77 ms à M=1** (6,55 Mo de poids, η 0,6 %)
+  alors que le commentaire de la row annonce 18,7 µs, et 0,23 ms par ligne
+  au-delà de M=8 (matrices relues par ligne). À 48 appels par pas : ~93 ms du
+  décodage et 47 % du préfill. L'A/B deux-grilles (g_hc_decode_form = 1) donne
+  les mêmes temps et chaud = froid : ce n'est ni l'attente par tickets ni la
+  bande passante. C'est le premier poste à instrumenter (hors périmètre de
+  l'optimisation noyau demandée pour l'instant).
+- **R21** — Le tier KV hôte est **refusé au démarrage** : « no device
+  gather/scatter for group 1 at a 4128-byte fragment ». Sans lui, une
+  conversation terminée ne quitte pas la VRAM et le cache de préfixe ne survit
+  pas à une éviction (multi-tour long impossible).
+- **R22** — En rejeu multi-agents (5 tours entrelacés), le cache de préfixe ne
+  sert **rien** (0 %, `no_snapshot` ×4, 1 checkpoint écrit) alors qu'un prompt
+  identique sert 4 096 tokens et qu'une conversation qui grandit sert 2 048 par
+  tour. Politique `geometric-backoff`/snapshots à revoir pour les
+  conversations concurrentes.
+- **R23** — `kbench` ne peut pas poser les tables MoE du conteneur (110 cas
+  sautés : « container format error » sur le treillis, « shape this kernel does
+  not serve » sur `w4nl`), donc le temps par row MoE et η lien par noyau ne
+  sont pas mesurables sur cet artefact ; aligner les tags de format ou passer
+  par une fixture `--record`.
