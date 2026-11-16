@@ -458,6 +458,22 @@ void run_case(const Cfg& c) {
                         (tag + " step " + std::to_string(step) + ": o_scale vs libref quantiser "
                          "over the pair's o").c_str())) ok = false;
 
+        /* The int8 contract: symmetric (the clamp is +-127, so -128 never appears), and a group's
+         * amax reaches the top code. Every scale of a real token is positive and finite. */
+        {
+            std::vector<int8_t> code((size_t)(real * H * V));
+            down(d_oq[1], code.data(), code.size());
+            int lo = 127, hi = -128;
+            for (int8_t v : code) { lo = v < lo ? v : lo; hi = v > hi ? v : hi; }
+            std::vector<float> sc((size_t)(real * (H * V / c.qg)));
+            down(d_os[1], sc.data(), sc.size() * 4);
+            bool pos = true;
+            for (float s : sc) if (!(s > 0.0f) || !std::isfinite(s)) pos = false;
+            std::fprintf(stderr, "  %s step %d: codes [%d, %d], scales all positive %d\n",
+                         tag.c_str(), step, lo, hi, (int)pos);
+            CHECK(lo >= -127 && hi <= 127 && hi == 127 && lo <= -126 && pos);
+        }
+
         /* Against libref's own gdn_conv_recurrent_update (its conv silu and exp differ from the
          * device's fast ones by a last bit, so this is a tolerance, not byte equality). */
         if (!close_bf16(d_o[1], d_o[2], o_b / 2, (tag + " step " + std::to_string(step) +
@@ -632,6 +648,27 @@ TEST(gdn_conv_recurrent_had_refuses_forms_it_does_not_serve) {
         std::vector<RadTensor> t = r.tensors();
         std::vector<RadParam> p = r.params();
         for (auto& q : p) if (!std::strcmp(q.key, "head_k")) q.ival = 64;
+        CHECK_EQ(run(rhad, t, p), RAD_E_SHAPE);
+    }
+    /* A flattened `o_q` is not [tokens, heads * head_v]. */
+    {
+        std::vector<RadTensor> t = r.tensors();
+        std::vector<RadParam> p = r.params();
+        t[16] = ten(r.oq.p, RAD_I8, { 1 * 512 });
+        CHECK_EQ(run(rhad, t, p), RAD_E_SHAPE);
+    }
+    /* A `o_q` base the four-byte stores cannot address. */
+    {
+        std::vector<RadTensor> t = r.tensors();
+        std::vector<RadParam> p = r.params();
+        t[16].data = (char*)t[16].data + 2;
+        CHECK_EQ(run(rhad, t, p), RAD_E_ALIGN);
+    }
+    /* A flattened `o_scale` cannot carry one scale a head. */
+    {
+        std::vector<RadTensor> t = r.tensors();
+        std::vector<RadParam> p = r.params();
+        t[17] = ten(r.os.p, RAD_F32, { 4 });
         CHECK_EQ(run(rhad, t, p), RAD_E_SHAPE);
     }
 }

@@ -1375,6 +1375,17 @@ static int r3dh_gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had
     /* The recurrent half's checks, as in r3dh_rad_gdn_recurrent_update. */
     const int anc = ru_state_form(a);
     if (anc < 0) return R3DH_NO(RAD_E_UNSUPPORTED);
+    /* `_had` writes its codes as four-byte stores, so its rows are [tokens, heads * head_v] with
+     * a pitch and a base a dword wide, and its scale row is [tokens, n_head_v] (group 128) or
+     * [tokens, n_head_v / 2] (group 256). The base rows' byte stores need neither. */
+    const long long oq_pitch = oq ? (long long)r3dh_row_pitch(oq) : 0;
+    const long long os_ld = os ? (long long)r3dh_row_pitch(os) : 0;
+    if (had) {
+        if (oq->rank < 2 || oq_pitch < H * V) return R3DH_NO(RAD_E_SHAPE);
+        if ((oq_pitch & 3) || ((size_t)oq->data & 3)) return R3DH_NO(RAD_E_ALIGN);
+        if (os->rank < 2 || os_ld < (wide ? H / 2 : H)) return R3DH_NO(RAD_E_SHAPE);
+        if ((size_t)os->data & 3) return R3DH_NO(RAD_E_ALIGN);
+    }
     const float scale = (float)r3dh_getf(a, "scale", 1.0);
     const float thr   = (float)r3dh_getf(a, "softplus_thr", 20.0);
     const float neps  = (float)r3dh_getf(a, "eps", 0.0);
@@ -1400,8 +1411,7 @@ static int r3dh_gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had
     return ru_conv_recurrent_launch(
         cv, ta->data, tb->data, (long)ab_stride, alog->data, dtb->data, state->data,
         (long)state->stride[0], (long)state->stride[1], o->data, oq ? oq->data : nullptr,
-        os ? os->data : nullptr, oq ? (long)r3dh_row_pitch(oq) : 0,
-        os ? (long)r3dh_row_pitch(os) : 0, cu->data, sidx->data, (long)sidx->stride[0],
+        os ? os->data : nullptr, oq_pitch, os_ld, cu->data, sidx->data, (long)sidx->stride[0],
         nacc ? nacc->data : nullptr, z->data, (long)z_row, nw->data, neps, nact, N, (int)H,
         (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s, qmode, anc != 0);
 }
