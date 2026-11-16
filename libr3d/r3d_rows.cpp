@@ -2578,7 +2578,7 @@ static const RadKernelInfo kKernels[] = {
   "the QSA indexer's block score: relu per (block, head), summed over heads, over 1/sqrt(n)",
   "any n, head count and block count; a thread a (query, block); the dot is an ascending f32 "
   "chain, the relus summed in head order; bt's page ids bound the store",
-  "bf16 q and bk (bk may be the group's bf16 in another dtype), i32 bt/cu/nc, f32 scores; a "
+  "bf16 q, bf16/f16/f32 bk (widened exactly to f32), i32 bt/cu/nc, f32 scores; a "
   "negative page scores -inf and a page past the store is left unwritten",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cQsaScoreBf16), NOTUNE,
@@ -2597,7 +2597,8 @@ static const RadKernelInfo kKernels[] = {
 { "qsa_score_f32", "qsa_score", "kv",
   "the QSA indexer's block score: relu per (block, head), summed over heads, over 1/sqrt(n)",
   "any n, head count and block count; a thread a (query, block); the reference's f32 chain",
-  "f32 q and bk, i32 bt/cu/nc, f32 scores; a negative page scores -inf",
+  "f32 q, bf16/f16/f32 bk, i32 bt/cu/nc, f32 scores; a negative page scores -inf and a page "
+  "past the store is left unwritten",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cQsaScoreF32), NOTUNE,
   nullptr, nullptr, r3d_rad_qsa_score, nullptr, nullptr, nullptr,
