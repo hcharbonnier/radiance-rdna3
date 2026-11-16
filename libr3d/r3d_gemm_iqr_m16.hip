@@ -64,11 +64,6 @@ using namespace r3d_iqr_dev;
 
 constexpr int kIqrWave = 32;
 constexpr int kMTMax = 16;
-/* i32 sub of four signed int8 pairs, exact: gfx11's dot4 is signed x unsigned, so both operands
- * are negated (libr4d's form), which is the signed product (r4d_gemm_iqr.hip:284). */
-__device__ __forceinline__ int dot4_i8(uint32_t a4, uint32_t w4, int acc) {
-    return __builtin_amdgcn_sudot4(true, (int)w4, true, (int)a4, acc, false);
-}
 
 template <class F, int MT>
 __global__ void __launch_bounds__(kIqrWave) R3D_WAVES(4)

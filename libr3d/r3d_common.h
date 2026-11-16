@@ -92,6 +92,33 @@ __device__ __forceinline__ float ldg_f32(const float* p) {
     return *(const __attribute__((address_space(1))) float*)p;
 }
 
+/* ================================================================== int8 codes and the IQR dot
+ *
+ * The int8 activation quantiser's dword: four values times `inv` (the quantiser's 1/scale), clamped
+ * to +-127 before the codec's round-to-nearest-even and packed with the low element in the low byte.
+ * Every int8 producer encodes a lane's four columns with this word and stores it at the position its
+ * plane layout names (row-major for the i8g producers, the step permutation for the WMMA planes);
+ * the clamp precedes the rounding because the reference saturates before it encodes
+ * (rad_round_even_sat). */
+__device__ __forceinline__ float i8_clamp_top(float c) {
+    if (c > 127.0f) c = 127.0f;
+    if (c < -127.0f) c = -127.0f;
+    return c;
+}
+__device__ __forceinline__ uint32_t i8_codes4(const float* v, float inv) {
+    const uint32_t b0 = (uint32_t)(uint8_t)f32_to_i8_rtne(i8_clamp_top(v[0] * inv));
+    const uint32_t b1 = (uint32_t)(uint8_t)f32_to_i8_rtne(i8_clamp_top(v[1] * inv));
+    const uint32_t b2 = (uint32_t)(uint8_t)f32_to_i8_rtne(i8_clamp_top(v[2] * inv));
+    const uint32_t b3 = (uint32_t)(uint8_t)f32_to_i8_rtne(i8_clamp_top(v[3] * inv));
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+/* i32 sub of four signed int8 pairs, exact: gfx11's dot4 is signed x unsigned, so both operands are
+ * negated (libr4d's form), which is the signed product (r4d_gemm_iqr.hip:284). */
+__device__ __forceinline__ int dot4_i8(uint32_t a4, uint32_t w4, int acc) {
+    return __builtin_amdgcn_sudot4(true, (int)w4, true, (int)a4, acc, false);
+}
+
 /* ================================================================== lane maths
  *
  * A wave is 32 lanes, two rows of sixteen. Reductions are XOR butterflies in the order a

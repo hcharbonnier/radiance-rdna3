@@ -34,18 +34,6 @@ constexpr float kI8Floor = 1e-8f;
 __device__ __forceinline__ float ld_bf(const uint16_t* p, uint32_t i) {
     return bf16_to_f32((uint16_t)ldg_u16(p + i));
 }
-__device__ __forceinline__ float clamp_top(float c, float top) {
-    if (c > top) c = top;
-    if (c < -top) c = -top;
-    return c;
-}
-__device__ __forceinline__ uint32_t i8_codes4(const float* v, float inv) {
-    const uint32_t b0 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[0] * inv, kTopI8));
-    const uint32_t b1 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[1] * inv, kTopI8));
-    const uint32_t b2 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[2] * inv, kTopI8));
-    const uint32_t b3 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[3] * inv, kTopI8));
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-}
 __device__ __forceinline__ uint32_t i8_step_pos(uint32_t c) {
     return (c & ~12u) | ((c & 4u) << 1) | ((c & 8u) >> 1);
 }

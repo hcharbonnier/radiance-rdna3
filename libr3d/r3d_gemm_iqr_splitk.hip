@@ -43,12 +43,6 @@ constexpr int kIqrWave = 32;
 constexpr int kIqrSplitMaxN = 8192;   /* the narrow band: above it N already fills the card */
 constexpr int kIqrSplitMax = 8;
 
-/* i32 sub of four signed int8 pairs, exact, as r3d_gemm_iqr_m16.hip: gfx11's dot4 is signed x
- * unsigned, so both operands are negated. */
-__device__ __forceinline__ int dot4_i8(uint32_t a4, uint32_t w4, int acc) {
-    return __builtin_amdgcn_sudot4(true, (int)w4, true, (int)a4, acc, false);
-}
-
 /* One slice: the GEMV's group fold over kb in [kbeg, kend), one f32 partial an output column. */
 template <class F>
 __global__ void __launch_bounds__(kIqrWave) R3D_WAVES(4)

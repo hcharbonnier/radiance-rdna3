@@ -44,24 +44,6 @@ constexpr float kTopI8 = 127.0f;
  * owners read one lane column), which also holds the GEMV's i32 partials. */
 constexpr int kPartBytes = 16 * 33 * 4;
 
-/* i32 sub of four signed int8 pairs, exact: gfx11's dot4 is signed x unsigned, so both operands
- * are negated (libr4d's form), which is the signed product (r4d_gemm_iqr.hip:284). */
-__device__ __forceinline__ int dot4_i8(uint32_t a4, uint32_t w4, int acc) {
-    return __builtin_amdgcn_sudot4(true, (int)w4, true, (int)a4, acc, false);
-}
-
-__device__ __forceinline__ float clamp_top(float c, float top) {
-    if (c > top) c = top;
-    if (c < -top) c = -top;
-    return c;
-}
-__device__ __forceinline__ uint32_t i8_codes4(const float* v, float inv) {
-    const uint32_t b0 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[0] * inv, kTopI8));
-    const uint32_t b1 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[1] * inv, kTopI8));
-    const uint32_t b2 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[2] * inv, kTopI8));
-    const uint32_t b3 = (uint32_t)(uint8_t)f32_to_i8_rtne(clamp_top(v[3] * inv, kTopI8));
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-}
 __device__ __forceinline__ float wave_max_f(float v) {
     v = fmaxf(v, r3d_xor_lane<16>(v));
     v = fmaxf(v, r3d_xor_lane<8>(v));

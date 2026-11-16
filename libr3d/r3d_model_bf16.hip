@@ -2169,24 +2169,6 @@ extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s) {
         slot_max = el / (2 * head_dim);
     }
 
-    /* Diagnostic, when RAD_R3D_TRACE is set: synchronises the device and prints
-     * "[r3d] kvstore: T=<tokens> kvbase=<cache ptr> slots=<first 8 slot ids>", showing where this
-     * step's KV lands (a tail naming slots of an adopted block overwrites the shared prefix). */
-    if (r3d_trace_on())
-    {
-        (void)hipDeviceSynchronize();
-        int slots[8];
-        const int n_print = T < 8 ? (int)T : 8;
-        if (hipMemcpy(slots, (const void*)(uintptr_t)r3d_addr(sm), (size_t)n_print * sizeof(int),
-                      hipMemcpyDeviceToHost) == hipSuccess) {
-            std::fprintf(stderr, "[r3d] kvstore: T=%lld kvbase=%p slots=", (long long)T,
-                         (const void*)(uintptr_t)r3d_addr(kv));
-            for (int c = 0; c < n_print; ++c)
-                std::fprintf(stderr, "%s%d", c ? " " : "", slots[c]);
-            std::fprintf(stderr, "\n");
-        }
-    }
-
     if (i8)
         return r3d_launch_ok(r3d_kv_store_i8(r3d_addr(k), r3d_addr(v), r3d_addr(sm),
                                              r3d_addr(kv), (int)T, (int)head_dim, (int)n_head_kv,

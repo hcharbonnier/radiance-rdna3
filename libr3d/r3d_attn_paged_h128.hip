@@ -931,12 +931,6 @@ int fill(Args& A, long q, long kv, long bt, long seqused, long k_desc, long v_de
     A.causal = causal ? 1 : 0; A.window = window;
     A.jcap = max_ctx;
     if ((long long)bt_cols * block_size < max_ctx) A.jcap = bt_cols * block_size;
-    /* RAD_R3D_TRACE: the table geometry and the walk's reach (jcap). A short jcap means the table
-     * is narrower than the sequence, a plan fact rather than a kernel one. */
-    if (r3d_trace_on())
-        std::fprintf(stderr, "[r3d] attn: q_len %d rows %ld n_seq %d bs %d bt cols %d pitch %d "
-                             "cstride %d max_ctx %d -> jcap %d\n", q_len, rows, num_seqs,
-                     block_size, bt_cols, bt_rs, bt_cs, max_ctx, A.jcap);
     {   /* RAD_R3D_TRACE: a one-record hipMalloc buffer the kernel writes and launch() reads back,
          * allocated on first traced use. Null when the flag is unset. */
         static void* g_trace_buf = nullptr;
@@ -944,39 +938,6 @@ int fill(Args& A, long q, long kv, long bt, long seqused, long k_desc, long v_de
         if (r3d_trace_on() && !g_trace_buf)
             (void)hipMalloc(&g_trace_buf, sizeof(DevRec));
         if (g_trace_buf) A.trace_buf = (DevRec*)g_trace_buf;
-    }
-    /* RAD_R3D_TRACE: synchronise the device and print, for up to 4 sequences, the first 16 block
-     * table entries ("[r3d] devstate s=.. bt=..") and seqused with the KV base, then the first
-     * block id. The device sync is needed because staging may run on the engine's stream, and a
-     * copy on the default stream is unordered with it. */
-    if (r3d_trace_on())
-    {
-        (void)hipDeviceSynchronize();
-        const char* kvb = A.kv8 ? (const char*)A.kv8 : (const char*)A.kv;
-        for (int s = 0; s < (int)num_seqs && s < 4; ++s) {
-            int row[16];
-            if (hipMemcpy(row, (const char*)A.bt + (size_t)s * (size_t)bt_rs * sizeof(int),
-                          16 * sizeof(int), hipMemcpyDeviceToHost) == hipSuccess) {
-                std::fprintf(stderr, "[r3d] devstate s=%d bt=", s);
-                for (int c = 0; c < 16; ++c) std::fprintf(stderr, "%s%d", c ? " " : "", row[c]);
-                std::fprintf(stderr, "\n");
-            }
-            int su = -1;
-            if (A.su &&
-                hipMemcpy(&su, (const char*)A.su + (size_t)s * sizeof(int), sizeof(int),
-                          hipMemcpyDeviceToHost) == hipSuccess)
-                std::fprintf(stderr, "[r3d] devstate s=%d seqused=%d kvbase=%p\n", s, su,
-                             (const void*)kvb);
-        }
-        int first = -1;
-        if (kvb &&
-            hipMemcpy(&first, (const char*)A.bt, sizeof(int), hipMemcpyDeviceToHost) == hipSuccess &&
-            first >= 0) {
-            /* Only the block id is printed: a D2H copy from the cache base faults in the engine
-             * process even where the kernel's own read is fine. */
-            std::fprintf(stderr, "[r3d] devstate first_block=%d (block content not read)\n",
-                         first);
-        }
     }
     A.scale = scale > 0.0f ? scale : 1.0f / std::sqrt((float)kHeadDim);
     A.splits = splits > 0 ? splits : 1;

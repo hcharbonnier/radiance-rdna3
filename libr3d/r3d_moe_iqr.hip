@@ -60,12 +60,6 @@ constexpr uint32_t kMapRows = 64;            /* sorted rows a run-map entry hold
 constexpr uint32_t kMaxExpert = 512;         /* moe_scatter's ceiling */
 constexpr uint32_t kMapTail = 0xffffffffu;   /* a run-map entry owning no expert */
 
-/* The same exact four-pair signed dot the dense row uses: gfx11's dot4 is signed x unsigned, so
- * both operands are negated, which is the signed product. */
-__device__ __forceinline__ int dot4_i8(uint32_t a4, uint32_t w4, int acc) {
-    return __builtin_amdgcn_sudot4(true, (int)w4, true, (int)a4, acc, false);
-}
-
 /* A routed slot's token: f / top_k by the launch's reciprocal (0: top_k is 1). */
 __device__ __forceinline__ uint32_t slot_token(uint32_t f, uint32_t inv_k) {
     return inv_k ? __umulhi(f, inv_k) : f;

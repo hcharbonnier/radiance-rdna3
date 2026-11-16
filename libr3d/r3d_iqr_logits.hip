@@ -127,12 +127,6 @@ __global__ __launch_bounds__(kThreads) void logits_quant_kernel(
     *(uint32_t*)(qlr + (uint32_t)base) = lp;
 }
 
-/* i32 sub of four signed int8 pairs, exact (r3d_gemm_iqr_m16.hip): gfx11's dot4 is signed x
- * unsigned, so both operands are negated, which is the signed product. */
-__device__ __forceinline__ int dot4_i8(uint32_t a4, uint32_t w4, int acc) {
-    return __builtin_amdgcn_sudot4(true, (int)w4, true, (int)a4, acc, false);
-}
-
 /* One wave a 16-row tile of one class, MT tokens a block. Each /128-K block decodes the lane's
  * four columns of all 16 rows once, stages the 16 x 128 int8 tile in LDS, then every (token, row)
  * pair is a full 128-K dot of 32 v_dot4 per plane: hi scaled by 128 in the integer, lo added, the
