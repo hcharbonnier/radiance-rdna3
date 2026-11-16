@@ -6,3 +6,5 @@ compile_commands.json
 /sync-jarvis.sh
 __pycache__/
 .cache/
+external
+external-docs/
