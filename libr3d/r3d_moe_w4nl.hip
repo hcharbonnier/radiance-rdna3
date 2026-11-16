@@ -410,6 +410,7 @@ extern "C" int r3d_rad_moe_gemm_w4nl(const RadArgs* a, RadStream s) {
     int rc = r3d_moe_call(a, true, &c);
     if (rc != RAD_OK) return rc;
 
+    if (!c.a_scale) return R3D_NO(RAD_E_INVAL);
     if (c.a->dtype != RAD_I8 || c.a_scale->dtype != RAD_F32 || c.y->dtype != RAD_BF16)
         return R3D_NO(RAD_E_DTYPE);
     if (c.sorted->dtype != RAD_I32 || c.off->dtype != RAD_I32) return R3D_NO(RAD_E_DTYPE);

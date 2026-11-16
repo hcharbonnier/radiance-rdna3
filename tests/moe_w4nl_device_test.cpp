@@ -520,6 +520,9 @@ bool run_case(const Case& c) {
 TEST(moe_w4nl_decode_top1) {
     CHECK(run_case(Case{ "down decode top1", 2560, 640, 4, 1, 4, 1, 128, false, false, 0, 0, false }));
 }
+TEST(moe_w4nl_decode_single_expert) {
+    CHECK(run_case(Case{ "down decode E=1", 2560, 640, 1, 1, 2, 1, 128, false, false, 0, 0, false }));
+}
 TEST(moe_w4nl_decode_top10_sorted) {
     CHECK(run_case(Case{ "down decode top10 sorted", 2560, 640, 8, 10, 1, 1, 128, true, false, 0, 1,
                          false }));
@@ -536,6 +539,11 @@ TEST(moe_w4nl_prefill_all_dropped) {
     CHECK(run_case(Case{ "down prefill all dropped", 2560, 640, 4, 1, 8, 1, 128, false, false, 1, 8,
                          false }));
 }
+/* One run of 125 rows: the map splits it into a 64-row and a 61-row entry. */
+TEST(moe_w4nl_prefill_long_run) {
+    CHECK(run_case(Case{ "down prefill run>64", 2560, 640, 4, 1, 128, 1, 128, false, false, 2, 0,
+                         false }));
+}
 TEST(moe_w4nl_decode_512_experts) {
     CHECK(run_case(Case{ "down decode E=512", 2560, 640, 512, 1, 64, 1, 128, false, false, 0, 0,
                          true }));
@@ -544,6 +552,10 @@ TEST(moe_w4nl_decode_512_experts) {
 /* ---- the MTP head: N 1280, K 2560, parts 2, 48 experts -------------------------------------- */
 TEST(moe_w4nl_mtp_decode_top2) {
     CHECK(run_case(Case{ "MTP decode top2", 1280, 2560, 48, 2, 4, 2, 128, false, false, 2, 0, false }));
+}
+/* A run longer than a decode tile: expert 0 takes 36 rows, so the tile's run walk clips at 16. */
+TEST(moe_w4nl_mtp_decode_cross_tile_run) {
+    CHECK(run_case(Case{ "MTP decode run>16", 1280, 2560, 48, 1, 48, 2, 128, false, false, 2, 0, false }));
 }
 TEST(moe_w4nl_mtp_prefill_top2) {
     CHECK(run_case(Case{ "MTP prefill top2", 1280, 2560, 48, 2, 64, 2, 128, false, false, 1, 5,
