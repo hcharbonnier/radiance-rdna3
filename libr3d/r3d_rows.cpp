@@ -1508,6 +1508,10 @@ static int64_t attn_h256_scratch(const RadArgs* a) {
  * otherwise. Declared here because the plugin's own header is not the ABI. */
 extern "C" int64_t r3d_rad_gemm_nt_q_iqr_m16_scratch(const RadArgs* a);
 
+/* The N = 1 GEMV (r3d_gemm_nt_n1.hip). Declared here because the plugin's own header is not the
+ * ABI. */
+extern "C" int r3d_rad_gemm_nt_bf16_n1(const RadArgs* a, RadStream s);
+
 /* The routed IQR GEMM (r3d_moe_iqr.hip), its run-map scratch hook and the IQR storage hooks at the
  * MoE classes' geometry (r3d_iqr_layout.cpp). Declared here because the plugin's own header is
  * not the ABI. */
@@ -1743,6 +1747,11 @@ static const RadConstraint cGemmM16[] = { C_IN("dtype", "bf16"), C_GE("M", 1), C
                                           C_DIV("K", 2), C_GE("N", 1) };
 static const RadConstraint cGemmM16F16[] = { C_IN("dtype", "f16"), C_GE("M", 1), C_LE("M", 16),
                                              C_DIV("K", 2), C_GE("N", 1) };
+/* The one-column GEMV: the shared expert's gate at prefill heights, where the m16 row's wave map
+ * has one column to cover. Its band is N = 1 and any M; K is the 16-element load step's multiple
+ * (128 is the container's block, and the row's store order does not need a split). */
+static const RadConstraint cGemmN1[] = { C_IN("dtype", "bf16"), C_EQ("N", 1), C_GE("M", 1),
+                                         C_DIV("K", 128) };
 /* The a16 band: the 16x16x16 f16 tile's M, the group's K, the tile's N. K divisible by 128
  * because the slab is a whole (scale, zero) group; N by 16 because a wave's column tile is a
  * tile. */
@@ -2063,6 +2072,11 @@ static const RadConstraint cAttnDenseH72[] = {
 static const RadConstraint cRopeAxialH72[] = {
     C_EQ("head_dim", 72), C_EQ("rotary_dim", 72), C_IN("mode", "axial")
 };
+
+/* The N = 1 GEMV serves a band the m16 row also matches, so it must outrank it. The two rows are
+ * disjoint on N only for this row's exact equality, which the selector reads before priority; the
+ * extra rank states the intent for a reader and keeps a future m16 tweak from taking the gate. */
+enum { R3D_PRIO_GEMM_N1 = R3D_PRIO_GEMM_M16 + 10 };
 
 static const RadKernelInfo kKernels[] = {
 /* ------------------------------------------------------------------ r3d_model_bf16.hip
@@ -2625,6 +2639,24 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r3d_rad_gemm_nt_bf16_m16,
   [](const RadArgs* a) -> int64_t { return gemm_scratch(a->p, a->n_p); },
   nullptr, nullptr, r3d_shape_gemm_nt },
+
+/* ------------------------------------------------------------------ r3d_gemm_nt_n1.hip
+ *
+ * The shared expert's gate: gemm_nt at N = 1, where the m16 row's wave-per-run-of-columns map has
+ * one column and the tiled row's M floor is out of band. One lane an output row, the dot walked
+ * ascending in 16-element steps with no cross-lane reduction or split, so the result is libref's
+ * chain bit for bit.
+ */
+{ "gemm_nt_bf16_n1", "gemm_nt", "gemm",
+  "y[m] = a[m,K] . b[0,K] for N = 1, f32 accumulate in the reference's ascending-k chain, one "
+  "narrowing at the store",
+  "N == 1; any M; one lane an output row, K read in 16-element steps; K a multiple of 128, a and "
+  "b 16-byte aligned, the activation row pitch a multiple of 8 elements",
+  "bf16 a, b and y; every product and its add round in f32 and neither is contracted "
+  "(-ffp-contract=off), so y is bit-identical to libref's gemm_nt at N = 1",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_N1,
+  ROW(cGemmN1), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_nt_bf16_n1, nullptr, nullptr, nullptr, r3d_shape_gemm_nt },
 
 /* ------------------------------------------------------------------ r3d_gemm_f16_nt_m16.hip
  *

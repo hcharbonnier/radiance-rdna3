@@ -132,6 +132,9 @@ set(R3D_UNITS
   # The skinny bf16 GEMM for decode, M <= 16: one output element a lane, k ascending, so the
   # accumulation order is libref's.
   "r3d_gemm_bf16_nt_m16|"
+  # Its N = 1 GEMV: the shared expert's gate, one lane an output row, the dot in libref's
+  # ascending-k chain.
+  "r3d_gemm_nt_n1|"
   # The wave-matrix arm of the skinny bf16 GEMM: V_WMMA_F32_16X16X16_BF16 over a 16x16x16 tile, a
   # wave a tile, the `impl` point of the dot2 arm's row.
   "r3d_gemm_bf16_nt_m16_wmma|"
