@@ -2709,6 +2709,11 @@ whole tensor below. libr4d's `logits_gemm_vocab_iqr` decodes every class in one 
 every token of a prefill chunk instead of the last one per sequence: `n_tok / n_seq` times the work,
 and at `max_tok` 8192 against a 248K vocab the logits buffer alone is 8 GiB.
 
+A `dtype` of `u8` names **opaque byte rows** (the KV tier's fragments, where a row is one layer's
+bytes of one block): the move is a byte copy, not an element pass through a codec, so a NaN payload
+survives. libr3d's `gather_rows_u8` takes `n`, the source pitch and the destination pitch in bytes;
+all three are multiples of 4.
+
 ### `scatter_rows`
 
 | op | params | operands |

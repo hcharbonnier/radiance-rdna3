@@ -170,13 +170,16 @@ for (op, geom), d in sorted(rows.items()):
 ```bash
 flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
   ./build/tests/iqr_device_test && ./build/tests/logits_bf16_device_test && \
+  ./build/tests/gather_rows_u8_device_test && \
   ./build/bin/r3d_selftest ./build/radiance_home/kernels/libr3d.so'
 ```
 
-État de référence de la branche (W20, commit `fae6c44`) : **159 rows, 0 échec,
+État de référence de la branche (R21, commit `7338226`) : **161 rows, 0 échec,
 15 skips** ; `kbench` Flash-Next **856/856** et 27B **605/605**, 0 échec,
 0 divergence, **dans les deux modes** (défaut et `--band-capacity`). Test de
-contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band`.
+contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
+`gather_rows_u8_device_test` couvre les rows u8 du tier KV (fragment 4 128 octets,
+octets opaques, pitches larges).
 
 Recette 27B (dense, IQR) : `--kv-cache-dtype i8 --num-speculative-tokens 0`
 (le drafter h128 fenêtré réclame bf16), `--max-num-seqs 4` — le multi-séquence

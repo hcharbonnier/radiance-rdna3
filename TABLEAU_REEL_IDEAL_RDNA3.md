@@ -296,11 +296,14 @@ Trois constats :
    = 4, `linear_checkpoints_written_total` = 1 pour 5 tours, alors que l'attention détenait
    4 268 tokens (`attn_cached_tokens_total = prefix_hit_cut_tokens_total = 4 268`). Les
    snapshots d'état linéaire ne sont pas écrits quand les conversations s'entrelacent.
-3. Le tier KV hôte est **désactivé** par le moteur malgré `--prefix-cache-mib 1024` :
+3. Le tier KV hôte était **désactivé** par le moteur malgré `--prefix-cache-mib 1024` :
    `W kv tiers: no device gather/scatter for group 1 at a 4128-byte fragment, so a finished
-   conversation cannot leave VRAM. The tiers are off.` Le groupe `kv_qsa_bkey` n'a pas de
-   gather/scatter device, donc une conversation terminée ne peut pas quitter la VRAM ; à
-   200k tokens de contexte, le cache se vide par éviction et chaque tour re-préfille.
+   conversation cannot leave VRAM. The tiers are off.` **Résolu en W22a** : les rows u8
+   `gather_rows`/`scatter_rows` déplacent les fragments opaques. Sur Flash-Next le tier se
+   configure avec **2 groupes paginés** (51,38 Kio par entrée, lots de 318) ; sur le 27B,
+   1 groupe (516 Kio, lots de 64). Rejeu 27B de 3 tours avec éviction : `to_host` 471,
+   `promoted` 245, `restore_cuts` 0, `failures` 0, 2 048 tokens cachés par tour ; hash de
+   vérification actif (`RADIANCE_DEBUG_TIER_VERIFY=1`).
 
 ### Contention préfill / décodage (`scripts/fnconc.sh`, 4 décodeurs × 48 tokens, préfill ~3 000 tokens)
 
@@ -402,12 +405,13 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
   lignes (512 Mio/1 Gio), d'où `max-num-batched-tokens: 2048`.
 - **PLE** : mesuré à froid ; `ple_gate` tient 69 TFLOP/s à M=2 048 et M=1 est au
   plancher de lancement, rien à optimiser avant le reste.
-- **Tier KV hôte (M6)** : désactivé par le moteur car le groupe `kv_qsa_bkey`
-  (3,25 KiB par bloc de 4 tokens, fragment 4 128 octets) n'a pas de
-  gather/scatter device ; sans lui une conversation terminée ne peut pas quitter
-  la VRAM, donc le cache de préfixe ne survit pas à une éviction et un tour de
-  200k tokens re-préfille tout. Ajouter le gather/scatter du groupe 1, puis
-  refaire le rejeu multi-tour.
+- **Tier KV hôte (M6)** : **actif** depuis R21 (W22a). Les fragments KV sont
+  des octets opaques (3,25 KiB par bloc de 4 tokens pour `kv_qsa_bkey`,
+  fragment 4 128 octets) et passent par les rows u8 dédiées, sans codec E4M3.
+  Flash-Next : 2 groupes paginés, 51,38 Kio/entrée ; 27B : 1 groupe,
+  516 Kio/entrée. Copie et restauration mesurées (27B : `to_host` 471,
+  `promoted` 245, 0 échec), hash de vérification actif. Reste R22 (snapshots
+  d'état linéaire) pour le rejeu multi-agents.
 - **Snapshots d'état linéaire en rejeu multi-agents (M6)** : 1 seul checkpoint
   écrit pour 5 tours entrelacés et 0 % de cache servi (`no_snapshot` ×4) ; la
   politique `geometric-backoff` (4 snapshots pour 8 192 tokens) est à revoir

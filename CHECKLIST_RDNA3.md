@@ -1,9 +1,10 @@
 # Checklist de clôture — RDNA3 / Qwen3.8 Flash-Next IQR-V4
 
-État au 2026-11-16, branche `rdna3-iqr`, pointe `fae6c44` (W20 : contrat
-capacité/étendue corrigé ; Flash-Next et 27B vérifiés dans les deux modes
-kbench, 27B multi-séquence servi). Sert à suivre l'avancement ; cocher au fur et
-à mesure et dater la ligne. Le détail des décisions et mesures est dans
+État au 2026-11-16, branche `rdna3-iqr`, pointe `7338226` (R21 : rows u8
+`gather_rows`/`scatter_rows`, tier KV hôte actif ; l'état W20 856/856 et
+605/605 reste la référence, `gather_rows`/`scatter_rows` re-mesurés 48/48 et
+84/84 sans divergence). Sert à suivre l'avancement ; cocher au fur et à mesure
+et dater la ligne. Le détail des décisions et mesures est dans
 `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md`, `SUIVI_LOTS_RDNA3.md`,
 `HANDOVER_RDNA3_PHASE7.md` et `FLASH_NEXT_AUDIT.md`.
 
@@ -24,10 +25,6 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       préfill 2 048 (item 3.8).
 
 **P1 — cache multi-tour et couverture MoE**
-- [ ] **R21 tier KV hôte** — écrire `gather_rows`/`scatter_rows` device (u8,
-      fragment 4 128 octets) pour `kv_qsa_bkey` ; le tier est refusé au démarrage
-      (`no device gather/scatter for group 1`), donc pas de cache durable,
-      200k impossible.
 - [ ] **R22 snapshots multi-agents** — 0 % de cache servi en rejeu agent
       (`no_snapshot` ×4, 1 checkpoint/5 tours) ; revoir `geometric-backoff` et la
       rétention des snapshots.
@@ -76,10 +73,15 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       robustesse étendue, rejeu 27B et R3 (chargement 2,7 s)
 - [x] W20 — contrat capacité/étendue : R24 corrigé, même faute corrigée dans
       3 rows router, mode `kbench --band-capacity`, test device épinglé
+- [x] W22 (R21) — rows u8 `gather_rows`/`scatter_rows` pour les fragments KV
+      opaques (4 128 octets) ; tier KV hôte actif sur Flash-Next (2 groupes,
+      51,38 Kio/entrée) et 27B (516 Kio/entrée), copie et restauration
+      vérifiées par hash (`RADIANCE_DEBUG_TIER_VERIFY=1`), 0 échec ; test
+      `gather_rows_u8_device_test` ; 161 rows au selftest
 - [x] M3 (QSA) — équivalent au dense, 4 ops device vertes
 - [x] M4 — coûts HC/PLE/QSA documentés (MoE par row bloqué, cf. R23)
 - [x] M5 / M6 — Flash-Next texte 1/4/6 séquences, 8k et 16k, démo et
-      robustesse ; deux limites documentées (R21, R22)
+      robustesse ; R21 résolu, R22 encore documentée
 - [!] M2 — η lien **1,7 %** contre 80 % : cause mesurée (`hc_read`), lot W21
 
 ## 1. W1/W2 — formes IQR restantes (prérequis MoE)
@@ -178,8 +180,8 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       `placement: expert_tiered`, `host-pool-mib: 43000`, KV i8,
       **`max_mixed_tok ≤ 2048`** (le plan `score` fait 512 MiB à 2048 lignes,
       1 Gio à 4096 et le plugin refuse), `max-model-len: 8192`. Vérifiée en W19
-      (serveur démarré avec ces réglages) ; le tier KV hôte reste refusé
-      (R21), c'est une limite du moteur, pas du réglage.
+      (serveur démarré avec ces réglages) ; le tier KV hôte est actif depuis
+      R21, avec les deux groupes paginés de Flash-Next.
 - [x] 4bis.4 Texte : 1 séquence (30 / 2290 / 4570 tokens) et 4 séquences
       concurrentes servies ; préfill 42 tok/s, décodage 4,0–4,6 tok/s.
 - [ ] 4bis.5 Image / vision si le conteneur la sert (dépend de 4.6).

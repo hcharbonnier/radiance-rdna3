@@ -1,27 +1,28 @@
-# Handover — RDNA3, phase 7 (W14–W20 livrés)
+# Handover — RDNA3, phase 7 (W14–W20, R21 livrés)
 
-2026-11-16. Branche `rdna3-iqr`, pointe `fae6c44` (W20 : contrat
-capacité/étendue). Ce document remplace `HANDOVER_RDNA3_PHASE6.md` pour l'état
-courant ; §8 donne la reprise immédiate.
+2026-11-16. Branche `rdna3-iqr`, pointe `7338226` (W20 : contrat
+capacité/étendue ; R21 : tier KV hôte). Ce document remplace
+`HANDOVER_RDNA3_PHASE6.md` pour l'état courant ; §8 donne la reprise immédiate.
 
 ## 1. État vérifié
 
 | Vérification | Résultat |
 |---|---|
-| `r3d_selftest` complet | **159 rows, 0 échec, 15 skips** |
-| Tests device | `iqr_device_test`, `logits_bf16_device_test`, 4 tests QSA, `moe_iqr_test`, `moe_iqr_device_test`, `moe_w4nl`, `kv_store_b4`, `rope` h128, router, `gemm_nt` N=1, vision, GDN had : **tous verts** |
+| `r3d_selftest` complet | **161 rows, 0 échec, 15 skips** |
+| Tests device | `iqr_device_test`, `logits_bf16_device_test`, 4 tests QSA, `moe_iqr_test`, `moe_iqr_device_test`, `moe_w4nl`, `kv_store_b4`, `gather_rows_u8`, `rope` h128, router, `gemm_nt` N=1, vision, GDN had : **tous verts** |
 | kbench Flash-Next (`--kernels libr3d:libref`) | **856/856, 0 échec, 0 divergence**, pire rel_l2 1,2e-2 ; **856/856 aussi en `--band-capacity`** (W20) |
 | kbench 27B | **605/605, 0 échec** dans les deux modes (W20), pire rel_l2 3,6e-3 |
 | Contrat capacité (W20) | `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` : rouge sur `a772d70`, vert sur `fae6c44` |
+| R21 tier KV (W22a) | rows u8 `gather_rows`/`scatter_rows` ; Flash-Next **2 groupes, 51,38 Kio/entrée**, 27B **1 groupe, 516 Kio** ; rejeu 27B : `to_host` 471, `promoted` 245, 0 échec (hash de vérification actif) |
 | Mesures à froid W18 (HC/PLE/QSA par row) | 182 + 147 cas, 0 échec ; `hc_read` **1,77 ms à M=1** (η 0,6 %), η lien **1,7 %**, MoE par row bloqué (format du conteneur) |
-| Démo serveur M6 / W19 | préfill 38,7–41,9 tok/s, décodage 4,41 (1 séq.) / 15,5 (4) / 22,1 (6) tok/s ; cache ×12 sur prompt identique, **0 % en rejeu agent** ; **tier KV hôte refusé** ; 4 décodeurs ×7,0 à côté d'un préfill |
+| Démo serveur M6 / W19 | préfill 38,7–41,9 tok/s, décodage 4,41 (1 séq.) / 15,5 (4) / 22,1 (6) tok/s ; cache ×12 sur prompt identique, **0 % en rejeu agent** (R22 ouverte) ; 4 décodeurs ×7,0 à côté d'un préfill |
 | Rejeu 27B / W19–W20 | chargement 15,87 GiB en 2,7 s ; `SEQS=1` préfill 318,8 tok/s (844), décodage 23,2 / 29,4 ; **`SEQS=4` corrigé** (W20) : préfill 317,5 tok/s, 4 requêtes à 67,3 tok/s agrégés |
 | Contexte 16k | KV 1,23 GiB (4 × 16 384) ; prompt de 13 421 tokens servi à 40,9 tok/s ; >16k → 400 |
 | 27B texte | décodage 28,4 tok/s (16 tok) / 21,2 (819), préfill 301 tok/s à 819 |
 | Flash-Next texte | préfill 42 tok/s (2 290 et 4 570 tok), décodage 4,0–4,6 tok/s, 4 séquences concurrentes OK |
 | Robustesse Flash-Next | prompt 12 001 tok → HTTP 400 clair, serveur vivant ; redémarrages propres |
 
-## 2. Ce que W14–W20 ont livré
+## 2. Ce que W14–W20 et R21 ont livré
 
 - **QSA complet** : `qsa_work`, `qsa_block_key`, `qsa_score`, `qsa_select`
   (plus `tail_store`), tests libref ; formes alignées sur libref (`nsel`
@@ -52,6 +53,12 @@ courant ; §8 donne la reprise immédiate.
   `logits_gemm_vocab_iqr` et dans `router_topk`, `router_topk_scatter`,
   `router_sigmoid_topk` (trouvés par le nouveau `kbench --band-capacity`).
   Test device épinglé ; 27B multi-séquence servi (67,3 tok/s agrégés).
+- **W22a (R21)** : rows u8 `gather_rows`/`scatter_rows` pour les fragments KV
+  opaques (dword par thread, pas de passage par le codec E4M3), contrainte
+  `dtype == u8`, `n % 4 == 0` ; test `gather_rows_u8_device_test` (octets
+  opaques, indices -1/hors plan, pitches larges, M = 1/8/2 048). Le tier KV
+  hôte se configure et déplace réellement des entrées sur Flash-Next et le 27B,
+  vérification par hash active.
 
 ## 3. Flash-Next — configuration v1
 
@@ -123,9 +130,11 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
   (`max_seqs × (1 + spec)`), jamais le nombre de lignes du pas ; l'étendue est
   sur les tenseurs. Une row qui compare les deux refuse un pas plus étroit que sa
   bande et le moteur arrête le modèle (R24). Tester avec `--band-capacity`.
-- **Tier KV hôte** : refusé au démarrage (« no device gather/scatter for group
-  1 ») ; ne pas conclure à une mauvaise configuration, c'est une row manquante
-  (R21).
+- **Tier KV hôte** : actif depuis R21. Les fragments sont des octets opaques et
+  passent par les rows u8 (`n` et pitches en octets, multiples de 4) ; ne pas
+  les router vers les rows bf16/f32, dont le codec E4M3 ne préserve pas un
+  payload NaN. Vérifier avec `RADIANCE_DEBUG_TIER_VERIFY=1` (hash après gather
+  et après scatter) et `/sessions` (`moved.to_host`, `promoted`, `failures`).
 
 ## 6. Reste à faire
 
@@ -153,12 +162,11 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
    (pas de 400) et `finish=abort` à la déconnexion, slot rendu ; abandon à 3 s
    puis requête suivante en 3,57 s ; 6 admissions 6/6 ; `/health` 200 et
    0 requête en vol. Démo M6 dans `TABLEAU_REEL_IDEAL_RDNA3.md` §M6.
-   Deux limites trouvées : le **tier KV hôte est refusé au démarrage**
-   (`no device gather/scatter for group 1 at a 4128-byte fragment`), donc le
-   cache de préfixe ne vit qu'en VRAM ; et le rejeu multi-agents n'a **rien**
-   réutilisé (0 %, `no_snapshot` ×4, 1 checkpoint pour 5 tours) alors qu'un
-   prompt identique réutilise 4 096 tokens (TTFT 108,4 → 9,0 s) et qu'une
-   conversation qui grandit réutilise 2 048 par tour.
+   Une limite restante : le rejeu multi-agents n'a **rien** réutilisé (0 %,
+   `no_snapshot` ×4, 1 checkpoint pour 5 tours) alors qu'un prompt identique
+   réutilise 4 096 tokens (TTFT 108,4 → 9,0 s) et qu'une conversation qui
+   grandit réutilise 2 048 par tour. **R21 est résolu** (W22a) : le tier KV hôte
+   se configure et déplace des entrées ; R22 reste à traiter.
    Contention (`fnconc`) : 4 décodeurs 12,6 s seuls → 87,6 s à côté d'un préfill
    de 3 000 tokens (+590 %), préfill 35 tok/s (vs 42 seul).
 4. **R9** : vérifier E4M3/rotated sur un modèle non-IQR (aucun 2B/4B sur
@@ -220,18 +228,17 @@ contredit.
    `--profile-ops true` (temps device par op) sur Flash-Next ; la forme
    deux-grilles et la température sont déjà écartées. **Demander le feu vert**
    avant de toucher au noyau.
-2. **W22 cache (R21, R22)** — rows `gather_rows`/`scatter_rows` device pour
-   `kv_qsa_bkey` afin d'activer le tier KV hôte, puis snapshots en rejeu
-   multi-agents. C'est ce qui débloque 200k et le multi-tour long.
+2. **W22 cache (R22)** — R21 est livré (tier KV actif, copie et restauration
+   vérifiées) ; reste la politique de snapshots en rejeu multi-agents. C'est ce
+   qui débloque le multi-tour long et les conversations entrelacées.
 3. **W23 MoE (R23)** — poser les tables du conteneur dans kbench (tags de format
    ou fixture `--record`), puis mesurer le temps par row et l'η lien par noyau.
 4. **W24 QSA et doc** — `qsa_score` à M=512, doc OPS/README, décision sur
    `RAPPORT_RDNA3.md`, handover final.
 
 **Décisions qui appartiennent à l'utilisateur** : (1) feu vert pour
-l'optimisation noyau (W21) ; (2) autorisation d'écrire les rows du tier KV
-(W22) ; (3) ajout de `RAPPORT_RDNA3.md` au dépôt ; (4) vision, seulement si la
-cible l'inclut.
+l'optimisation noyau (W21) ; (2) ajout de `RAPPORT_RDNA3.md` au dépôt ;
+(3) vision, seulement si la cible l'inclut.
 
 **Discipline de mesure.** Un chiffre sans commande, sans horloge et sans état de
 la carte ne compte pas. Carte froide, `flock`, un seul processus, build neuf pour

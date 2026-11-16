@@ -760,6 +760,48 @@ dans les deux modes (pire rel_l2 3,619e-3, identique) ; 27B à
 `--max-num-seqs 4` : préfill 317,5 tok/s, décodage 23,1/29,3 tok/s, **4 requêtes
 concurrentes 67,3 tok/s agrégés** (contre 29,4 sérialisées à `SEQS=1`).
 
+## 2026-11-16 — W22a : tier KV hôte (R21) activé
+
+Le tier refusait de se configurer sur Flash-Next : la row `gather_rows`/`scatter_rows`
+demandée pour le groupe `kv_qsa_bkey` (fragment de 4 128 octets) n'existait
+qu'en bf16/f32, dont `ld_elem`/`st_elem` font passer chaque octet par le codec
+E4M3 — un payload NaN ne survit pas à l'aller-retour. Le tier déplace des
+fragments **opaques**, pas des valeurs.
+
+1. **Rows u8** (`libr3d/r3d_rows.cpp`, `r3d_model_bf16.hip`) :
+   `gather_rows_u8` et `scatter_rows_u8`, un dword par thread, contrainte
+   `dtype == u8` et `n % 4 == 0` ; `n` et les deux pitches sont des octets, et
+   le lanceur refuse un pitch qui n'est pas un dword entier. Index négatif :
+   ligne zéro au gather, rien au scatter ; index au-delà du plan : idem, aucune
+   lecture/écriture hors du plan. Le shim branche sur `dt == R3D_DT_U8` avant
+   le chemin élément.
+2. **Test** : `tests/gather_rows_u8_device_test.cpp` — 6 géométries par row,
+   M = 1/8/2 048, fragment 4 128 octets et petites lignes, pitches larges,
+   toutes les valeurs d'octet, indices -1 et hors plan, destination du scatter
+   partiellement écrite. Oracle local octet à octet (pas libref, dont le chemin
+   u8 passe par float) ; contraintes et description d'opérandes vérifiées.
+3. **Selftest** : deux géométries u8 (M = 8, n = 4 128) ; **161 rows, 0 échec,
+   15 skips**.
+
+Validation (arbre neuf `w21-kvtier`, build complet) : `gather_rows_u8_device_test`
+33 checks verts ; `iqr_device_test` 67 verts ; `logits_bf16_device_test` 8 verts ;
+`kv_store_b4_device_test` 42 verts. kbench ciblé `gather_rows`/`scatter_rows` :
+27B **48/48** et Flash-Next **84/84**, 0 échec, 0 divergence.
+
+Tier en service, `RADIANCE_DEBUG_TIER_VERIFY=1` (hash des octets après gather et
+après scatter) :
+- Flash-Next (`--prefix-cache-mib 1024`, 8k) : **2 groupes paginés**, 51,38 Kio
+  par entrée, lots de 318 ; requête de 25 tokens servie ; 8 copies vers l'hôte,
+  0 échec.
+- 27B (même réglage, 4k, `max-num-seqs 1`) : 1 groupe, 516 Kio par entrée, lots
+  de 64. Conversation A de 3 899 + 3 927 tokens, conversation B de 3 562
+  tokens pour évincer A, puis A au tour 3 : `to_host` 471, `dropped` 586,
+  `promoted` **245**, `restore_cuts` 0, `failures` 0 ; tours 2 et 3 servis avec
+  **2 048 tokens cachés** chacun. La copie et la restauration passent donc par
+  les deux rows, et le hash confirme les octets.
+
+Reste de W22 : R22 (snapshots en rejeu multi-agents), inchangé.
+
 
 
 
