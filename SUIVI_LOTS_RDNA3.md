@@ -34,16 +34,17 @@
 | M2 — η lien ≥ 80 % | **non tenu : 1,7 %** (42 tok/s contre 2 545) | fin S10 | le plafond mesuré est `hc_read` (89 tok/s), pas le MoE |
 | M3 — QSA | **atteint** : équivalent au dense, 103 GFLOP/s à M=512 | fin S10 | `qsa_score` reste le poste QSA à optimiser |
 | M4 — coûts documentés | **atteint** : HC, PLE, QSA par row à froid | fin S10 | MoE par row bloqué (format des tables) |
-| M5 — Flash-Next texte | **atteint** : 1/4/6 séquences, 8k et 16k, robustesse | fin S12 | vision **dans la cible depuis l'ADR-7** (W26) |
+| M5 — Flash-Next texte | **atteint** : 1/4/6 séquences, 8k et 16k, robustesse ; **vision livrée** (W26) | fin S12 | image 512²/1024² servie, `capabilities.image=true` |
 | M6 — démo serveur | **atteint avec une limite** | fin S12 | R21 résolu (tier KV actif) ; snapshots absents en rejeu multi-agents (R22) |
 
-## Prochains lots (W21–W26)
+## Prochains lots (W21–W25)
 
-État : W0–W20 livrés, R21 (la moitié « tier KV » de W22) livré ; M0, M1, M3,
-M4, M5, M6 atteints ; **M2 non tenu** (η lien 1,7 %). **Périmètre révisé le
-2026-11-16** (ADR-7) : la vision et le MTP de Flash-Next entrent dans la cible ;
-l'ADR-6 est supersédé et `num-speculative-tokens: 0` n'est plus qu'un repli.
-L'ordre ci-dessous est celui de la valeur décroissante.
+État : W0–W20 livrés, R21 (la moitié « tier KV » de W22) livré, **W26 (vision)
+livré** ; M0, M1, M3, M4, M5, M6 atteints ; **M2 non tenu** (η lien 1,7 %).
+**Périmètre révisé le 2026-11-16** (ADR-7) : la vision et le MTP de Flash-Next
+entrent dans la cible ; la vision est faite, l'ADR-6 est supersédé et
+`num-speculative-tokens: 0` n'est plus qu'un repli. L'ordre ci-dessous est
+celui de la valeur décroissante.
 
 | lot | contenu | entrée | critère de sortie |
 |---|---|---|---|
@@ -52,7 +53,7 @@ L'ordre ci-dessous est celui de la valeur décroissante.
 | **W23 — MoE mesurable (R23)** | aligner les tags de format conteneur ↔ hook de layout, ou fixture `--record` ; puis temps par row et η lien par noyau | 110 cas `moe_gemm_q` sautés | kbench couvre `moe_gemm_q` sur le conteneur ; η lien MoE calculé ; 2.11/2.12 tranchés |
 | **W24 — QSA et clôture doc** | `qsa_score` à M=512 (3.8), doc des 5 ops QSA (3.9), `docs/OPS.md` + `libr3d/README.md` (1.5/5.7/8.6), `RAPPORT` (5.6), handover final (8.7) | 83,4 ms à M=512 (2 % du pic) | `qsa_score` ≥ 20 % du pic ou cause écrite ; doc publiée ; décision d'ajout du RAPPORT prise |
 | **W25 — MTP Flash-Next (R25, ADR-7)** | rows device `mtp_enter` et `logit_rerank` dans `libr3d` (contrats de `libr4d`), tests device ; puis `num-speculative-tokens > 0` et couverture MTP 48 de kbench | plugin `qwen4exp_fp8` déclare les trois ops MTP à `NS > 0` ; libr3d n'a aucune des deux rows ; 78 cas kbench « Not covered » dont le MTP 48 | MTP servi ; kbench MTP 48 couvert (0 « Not covered » MTP) ; gain de décodage mesuré ; 27B inchangé (`NS=0`) |
-| **W26 — vision servie (R26, ADR-7)** | build `-DRAD_WITH_FFMPEG=ON`, corpus d'images, un tour image de bout en bout, `capabilities.image` à vrai | W10 a porté la tour et ses rows ; le build n'a pas FFMPEG | un tour image accepté et répondu ; `capabilities.image=true` ; limite retirée des tableaux |
+| **W26 — vision servie (R26, ADR-7)** — **fait** | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3 / ffmpeg 8.0), corpus de 4 PNG sur l'hôte, tours image 512² et 1024² (`data:` URL), `capabilities.image=true` | tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16384 patches | 512² : 256 tokens image, TTFT 8,19 s ; 1024² : 1024 tokens, TTFT 28,73 s ; réponses correctes ; 856/856 kbench dans les deux modes, 480/480 cas vision |
 
 Hors v1 et non planifié : codebook `w4nl` dans `w4a8` seulement. Le MTP et la
 vision sont revenus dans la cible le 2026-11-16 (ADR-7).
@@ -161,9 +162,10 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   livré. Les experts du MTP 48 (`w4nl` `u4`) sont déjà servis par
   `moe_gemm_w4nl` ; restent les deux rows et la couverture kbench des cas MTP.
   Le 27B n'est pas concerné (son drafter h128 exige un KV bf16).
-- **R26** — Vision **dans la cible** (ADR-7) : la tour est portée (W10,
-  `attn_dense` hd72, `gemm_nt_bias`, `grid_embed`, `patch_*`) et ses rows sont
-  vertes, mais le build servi n'a pas `RAD_WITH_FFMPEG`
-  (`capabilities.image=false`), donc aucun tour image n'est possible. Rebuild
-  avec `-DRAD_WITH_FFMPEG=ON`, corpus d'images sur l'hôte, un tour de bout en
-  bout.
+- **R26** — *résolu* (W26) : build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3,
+  ffmpeg 8.0), tour de 27 blocs (856,68 Mio) placée en VRAM, staging média de
+  48,27 Mio pour 16 384 patches. `capabilities.image=true` ; image 512² servie
+  (256 tokens image, 281 avec le texte, TTFT 8,19 s) et 1024² (1 024 tokens,
+  TTFT 28,73 s), réponses correctes. La vidéo est annoncée par le processeur mais
+  n'a pas été testée. `kbench` 856/856 dans les deux modes et 480/480 cas
+  vision, 0 divergence.

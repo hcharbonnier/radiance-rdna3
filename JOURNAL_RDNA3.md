@@ -832,6 +832,52 @@ configuration v1 » mais le repli jusqu'à W25 ; la clôture gagne deux critère
 (8.8 vision servie, 8.9 MTP servi et couvert). Les docs de suivi (checklist,
 suivi des lots, handover, audit, plan, rapport) portent la révision.
 
+## 2026-11-16 — W26 : vision servie (R26)
+
+FFmpeg 8.0.1 et les paquets `libav*-dev` sont installés sur l'hôte (avformat
+62.3.100, avcodec 62.11.100, swscale 9.1.100 ; `pkg-config` les voit). Arbre
+neuf `w26-vision`, build complet avec `-DRAD_WITH_FFMPEG=ON` ; l'exécutable
+lie `libavformat.so.62`, `libavcodec.so.62` et `libswscale.so.9`.
+
+**Configuration** — celle de W19, sans changement de code ni de réglage :
+`placement: expert_tiered`, `host-pool-mib: 43000`, marge 96 Mio, KV i8,
+`NS=0`, `max-model-len 8192`, `max-num-batched-tokens 2048`,
+`--mm-max-patches` reste `auto`. Le démarrage décide :
+
+```
+I placement: encoder towers (856.68 MiB a rank) vram (default)
+I media staging: 10.00 MiB a rank for a step's encoder rows and 48.27 MiB for an encoder pass of up to 16384 patches
+I media: images and video through 'vision'; an image resizes to at most 4194304 pixels (16384 patches a pass)
+```
+
+Carte : 44,35 GiB tenus sur 44,98 (la tour est dans les poids statiques) ; le
+pool hôte reste à 20,02 GiB réservés. `capabilities.image=true` dans
+`/v1/models` (la vidéo est aussi annoncée).
+
+**Tours servis** (corpus `<work-root>/images`, PNG générés avec ffmpeg ;
+requête `chat/completions` en `data:image/png;base64`, `enable_thinking:false`) :
+
+| tour | tokens de prompt | dont image | TTFT | réponse |
+|---|---|---|---|---|
+| texte, 234 tok | 234 | — | 5,99 s | référence |
+| image 512² | 281 | 256 | 8,19 s | « three solid-colored squares — red, green, and blue — … light gray background », positions exactes |
+| image 1024² | 1 045 | 1 024 | 28,73 s | dégradé « deep navy blue … warm golden orange », exact |
+
+Le préfill texte tourne à ~39 tok/s ; la différence de TTFT donne ~1,0 s de
+tour pour 1 024 patches et ~1,9 s pour 4 096 (estimation, pas de profil par
+op). Un premier essai sans `enable_thinking:false` avait consommé les 192
+tokens en raisonnement : la perception était déjà juste, mais le contenu était
+vide (`finish=length`).
+
+**Non-régression** — `r3d_selftest` 161/0/15 ; `iqr_device_test` 67 checks,
+`logits_bf16_device_test`, `gather_rows_u8_device_test` et
+`vision_rows_device_test` verts ; `kbench` Flash-Next
+`--kernels libr3d:libref --max-cases 1` **856/856** en défaut et en
+`--band-capacity`, 0 divergence, pire rel_l2 1,206e-2 (identique à W20) ; run
+complet 2 189/2 189 et ciblé vision **480/480**, 0 divergence.
+
+Reste non testé : la vidéo et l'audio (annoncés par le processeur).
+
 
 
 

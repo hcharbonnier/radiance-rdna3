@@ -1,9 +1,10 @@
 # Checklist de clôture — RDNA3 / Qwen3.8 Flash-Next IQR-V4
 
 État au 2026-11-16, branche `rdna3-iqr`, pointe `7338226` (R21 : rows u8
-`gather_rows`/`scatter_rows`, tier KV hôte actif ; l'état W20 856/856 et
-605/605 reste la référence, `gather_rows`/`scatter_rows` re-mesurés 48/48 et
-84/84 sans divergence). **Périmètre révisé le 2026-11-16** : la vision et le
+`gather_rows`/`scatter_rows`, tier KV hôte actif ; R26 : vision servie sur un
+build FFmpeg ; l'état W20 856/856 et 605/605 reste la référence,
+`gather_rows`/`scatter_rows` re-mesurés 48/48 et 84/84 sans divergence).
+**Périmètre révisé le 2026-11-16** : la vision et le
 MTP de Flash-Next entrent dans la cible (ADR-7, qui supersède l'ADR-6), suivis
 en R25 et R26. Sert à suivre l'avancement ; cocher au fur et à mesure
 et dater la ligne. Le détail des décisions et mesures est dans
@@ -37,9 +38,6 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       en device dans `libr3d` (mêmes contrats que `libr4d`), puis servir avec
       `num-speculative-tokens > 0`, couvrir les cas MTP 48 de kbench et mesurer
       le gain de décodage. Le 27B reste à 0 (drafter h128 en bf16).
-- [ ] **R26 vision servie (ADR-7)** — rebuild `-DRAD_WITH_FFMPEG=ON`, corpus
-      d'images sur l'hôte, un tour image de bout en bout, `capabilities.image`
-      à vrai.
 - [ ] 2.11/2.12 — formes mixtes par couche et rows `mod4` (seulement si `tp=4`).
 
 **P2 — couverture, doc, clôture**
@@ -88,6 +86,10 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       51,38 Kio/entrée) et 27B (516 Kio/entrée), copie et restauration
       vérifiées par hash (`RADIANCE_DEBUG_TIER_VERIFY=1`), 0 échec ; test
       `gather_rows_u8_device_test` ; 161 rows au selftest
+- [x] W26 (R26) — vision servie : build `-DRAD_WITH_FFMPEG=ON` (libavformat
+      62.3, ffmpeg 8.0), tour 856,68 Mio en VRAM, `capabilities.image=true`,
+      tour image 512² et 1024² accepté et répondu ; 856/856 kbench dans les
+      deux modes et 480/480 cas vision, 0 divergence
 - [x] M3 (QSA) — équivalent au dense, 4 ops device vertes
 - [x] M4 — coûts HC/PLE/QSA documentés (MoE par row bloqué, cf. R23)
 - [x] M5 / M6 — Flash-Next texte 1/4/6 séquences, 8k et 16k, démo et
@@ -194,13 +196,18 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       Vérifiée en W19 (serveur démarré avec ces réglages) ; le tier KV hôte est
       actif depuis R21, avec les deux groupes paginés de Flash-Next. Le
       `num-speculative-tokens: 0` de l'ADR-6 n'est plus la configuration servie
-      dès que R25 est livré (ADR-7) ; il reste le repli entre-temps.
+      dès que R25 est livré (ADR-7) ; il reste le repli entre-temps. Depuis
+      R26, le build servi exige `-DRAD_WITH_FFMPEG=ON`, `--mm-max-patches`
+      reste `auto` (16384 patches, 2048²) et la tour tient en VRAM
+      (856,68 Mio) dans le budget `host-pool-mib: 43000` / marge 96 Mio.
 - [x] 4bis.4 Texte : 1 séquence (30 / 2290 / 4570 tokens) et 4 séquences
       concurrentes servies ; préfill 42 tok/s, décodage 4,0–4,6 tok/s.
-- [ ] 4bis.5 Image / vision : **dans la cible depuis l'ADR-7** (R26) — rebuild
-      `-DRAD_WITH_FFMPEG=ON`, un corpus d'images, un tour image servi, et
-      `capabilities.image` à vrai. La tour elle-même est portée (W10) et ses
-      rows sont vertes.
+- [x] 4bis.5 Image / vision : **livrée** (R26, ADR-7). Build
+      `-DRAD_WITH_FFMPEG=ON` ; `capabilities.image=true` ; image 512² →
+      256 tokens (281 avec le texte), TTFT 8,19 s ; image 1024² →
+      1024 tokens (1045), TTFT 28,73 s ; réponses correctes (couleurs et
+      disposition, dégradé). La tour (856,68 Mio) est en VRAM, la vidéo est
+      annoncée mais non testée.
 - [x] 4bis.6 Robustesse : prompt de 12 002 tokens refusé proprement (HTTP 400,
       message explicite avec le nombre de tokens à couper) et serveur toujours
       vivant ; `max_tokens` hors contexte plafonné à 8 191 (pas de 400) et
@@ -293,9 +300,9 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [ ] 8.7 Handover final (phase suivante) et journal à la date de clôture ; le
       handover courant (`HANDOVER_RDNA3_PHASE7.md` §8) couvre la reprise
       immédiate.
-- [ ] 8.8 **Vision servie (ADR-7)** : build `RAD_WITH_FFMPEG=ON`,
-      `capabilities.image` à vrai, un tour image accepté et répondu, et la
-      limite retirée de `TABLEAU_REEL_IDEAL_RDNA3.md`.
+- [x] 8.8 **Vision servie (ADR-7)** : build `RAD_WITH_FFMPEG=ON`,
+      `capabilities.image=true`, tours image 512² et 1024² acceptés et
+      répondus, limite retirée de `TABLEAU_REEL_IDEAL_RDNA3.md` (W26).
 - [ ] 8.9 **MTP Flash-Next (ADR-7)** : `mtp_enter` et `logit_rerank` en device,
       run avec `num-speculative-tokens > 0`, cas MTP 48 couverts par kbench
       (0 « Not covered » sur le MTP), gain de décodage mesuré et consigné.

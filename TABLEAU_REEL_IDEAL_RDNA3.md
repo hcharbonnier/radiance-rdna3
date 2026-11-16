@@ -340,13 +340,35 @@ Le pool KV tient 4 × 16k exactement (65 596 ≥ 65 536) ; le débit de préfill
 (40,9 vs 41,9 tok/s à 113 tokens), donc le coût est bien proportionnel aux tokens. 200k
 reste hors démonstration : il faudrait ~10 × plus de pool (et le tier KV hôte, cf. ci-dessous).
 
+## Vision (W26, 2026-11-16)
+
+Build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3.100, avcodec 62.11.100,
+swscale 9.1.100), même configuration que ci-dessus. Démarrage :
+`images and video through 'vision'`, tour de 27 blocs **856,68 Mio en VRAM**,
+staging média 48,27 Mio pour 16 384 patches, `capabilities.image=true`.
+Serveur réel, 1 séquence, greedy, `enable_thinking: false` :
+
+| tour | tokens de prompt | dont image | TTFT | réponse |
+|---|---|---|---|---|
+| texte (~234 tok) | 234 | — | 5,99 s | référence |
+| image 512² | 281 | 256 | **8,19 s** | trois carrés rouge/vert/bleu, couleurs et disposition correctes |
+| image 1024² | 1 045 | 1 024 | **28,73 s** | dégradé bleu nuit → orangé, exact |
+
+Lecture : le préfill texte tourne à ~39 tok/s ; au même débit, 281 tokens
+vaudraient ~7,2 s et 1 045 ~26,8 s, donc la tour (décodage et redimensionnement
+compris) coûte **~1,0 s pour 1 024 patches** et **~1,9 s pour 4 096** (estimé
+par différence de TTFT, pas profilé par op). `kbench` ciblé vision :
+**480/480 cas**, 0 échec, 0 divergence ; `--kernels libr3d:libref
+--max-cases 1` reste **856/856** dans les deux modes.
+La vidéo est annoncée par le processeur mais n'a pas été testée.
+
 ### Ce que M6 ne démontre pas
 
-- Le préfixe multi-tour **au-delà de 2 048 tokens** et le tier KV hôte (bloqué par le
-  gather/scatter du groupe QSA bkey) : le cache ne survit pas à une éviction, donc une
-  session de 200k tokens re-préfille à chaque tour.
-- L'image/vision : `capabilities.image=false` (build sans `RAD_WITH_FFMPEG`).
-  **Dans la cible depuis l'ADR-7** : reste le lot W26 (build FFMPEG, tour image).
+- Le préfixe multi-tour **au-delà de 2 048 tokens** : le tier KV hôte est actif
+  depuis R21 (copie et restauration vérifiées) mais le corpus de démo n'a pas
+  exercé une session de 200k ; il faudrait ~10 × plus de pool.
+- L'image/vision : **levé en W26** (voir § Vision) ; la vidéo et l'audio ne sont pas
+  testés.
 - Le MTP de Flash-Next : `num-speculative-tokens: 0` et pas de row device pour
   `mtp_enter`/`logit_rerank`. **Dans la cible depuis l'ADR-7** : lot W25.
 

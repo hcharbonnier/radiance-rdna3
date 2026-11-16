@@ -55,3 +55,13 @@ MTP 48 tables and `ngram_hint`.
   served path needs, so its "Not covered" cases are still not regressions.
 - Phase closure (checklist §8) gains two acceptance lines: an image turn
   served, and a speculative Flash-Next run with its kbench coverage.
+
+## Outcome (2026-11-16)
+
+- Vision: **delivered** (W26). The host has FFmpeg 8.0.1 and the `libav*-dev`
+  packages; the serving build is configured with `-DRAD_WITH_FFMPEG=ON`
+  (libavformat 62.3), the tower (856.68 MiB) is in VRAM, `capabilities.image`
+  is true, and 512²/1024² image turns are answered correctly. Video and audio
+  are advertised by the processor but untested.
+- MTP: **open**. `mtp_enter` and `logit_rerank` still have no `libr3d` device
+  row; the run stays at `num-speculative-tokens: 0` until W25.

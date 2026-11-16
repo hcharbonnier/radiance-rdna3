@@ -15,8 +15,8 @@ Ce document est un audit. Aucun code produit n'a été ajouté au dépôt, le mo
 > moment de l'audit, `mtp_enter` et `logit_rerank` n'avaient aucune row
 > `libr3d`), mais ils deviennent le travail du lot W25 (deux rows MTP +
 > couverture kbench), et non une exclusion. Côté vision, `gemm_nt_bias_bf16` et
-> `grid_embed_bf16` ont été livrées depuis (W15) ; il ne manque que le décodage
-> média (build FFMPEG, lot W26).
+> `grid_embed_bf16` ont été livrées depuis (W15) et le décodage média l'est en
+> W26 (build FFmpeg, `capabilities.image=true`, tours image 512²/1024² servis).
 
 ## 0. Résumé exécutif
 
@@ -498,8 +498,8 @@ Points importants :
 | `router_gemm_topk_scatter` | `M<=64`, `n_expert=512`, `top_k=10`, `protect`, bf16 | hôte seulement | row device fusionnée, ou garder la paire `router_gemm` + `router_topk_scatter` |
 | `gemm_nt` | `N=1`, `K=2560`, `M=2048` (shared gate, préfill) | hôte seulement | row GEMV préfill, ou padding N |
 | `gemm_nt_q` | i8 simple tourné, bandes `N=512/1280/2560/…` | hôte seulement | aucune nouvelle row : étendre `gemm_iqr_*` à `kSigned` 8 |
-| `gemm_nt_bias` | vision | aucune row à l'audit (livrée W15 : `gemm_nt_bias_bf16`) | — (reste le décodage média, W26) |
-| `grid_embed` | vision | aucune row à l'audit (livrée W15 : `grid_embed_bf16`) | — (reste le décodage média, W26) |
+| `gemm_nt_bias` | vision | aucune row à l'audit (livrée W15 : `gemm_nt_bias_bf16`) | servie ; média livré en W26 |
+| `grid_embed` | vision | aucune row à l'audit (livrée W15 : `grid_embed_bf16`) | servie ; média livré en W26 |
 | `mtp_enter` | MTP | hôte seulement | row device à écrire (ADR-7, W25) |
 | `logit_rerank` | MTP | hôte seulement | row device à écrire (ADR-7, W25) |
 
@@ -534,10 +534,11 @@ Points importants :
    les deux rows manquent, le run garde `num-speculative-tokens: 0`, ce qui
    retire aussi la couche 48 et ses poids `w4nl`/IQR. Les experts du MTP 48
    sont déjà servis (`moe_gemm_w4nl`).
-5. **Vision — dans la cible depuis l'ADR-7.** `gemm_nt_bias` et `grid_embed`
-   n'avaient pas de row device à l'audit ; elles sont servies depuis W15
-   (`gemm_nt_bias_bf16`, `grid_embed_bf16`), comme `attn_dense` hd72. Ce qui
-   manque est le décodage média : rebuild avec FFMPEG et un tour image (W26).
+5. **Vision — livrée (ADR-7, W26).** `gemm_nt_bias` et `grid_embed` n'avaient
+   pas de row device à l'audit ; elles sont servies depuis W15
+   (`gemm_nt_bias_bf16`, `grid_embed_bf16`), comme `attn_dense` hd72. Le
+   décodage média est actif depuis W26 (build FFmpeg) : image 512² → 256 tokens,
+   1024² → 1 024, réponses exactes, `capabilities.image=true`.
 6. **`moe_gemm_iqr` n'a pas de référence hôte** (R4) : `libref` n'implémente pas
    la row. Il faut la référence avant de valider le noyau device, comme prévu en
    W5.
@@ -581,9 +582,9 @@ Points importants :
 8. **`router_gemm_topk_scatter`** device avec `protect` (décodage), ou accepter
    deux lancements `router_gemm` + `router_topk_scatter` déjà servis.
 9. **`gemm_nt` N=1 préfill** (shared gate) : row GEMV ou padding N.
-10. **Vision** : `gemm_nt_bias`/`grid_embed` servies depuis W15, reste le
-    décodage média (W26) ; **MTP** `mtp_enter` / `logit_rerank` (W25) — les deux
-    sont dans la cible depuis l'ADR-7.
+10. **Vision** : `gemm_nt_bias`/`grid_embed` servies depuis W15, décodage média
+    livré en W26 ; **MTP** `mtp_enter` / `logit_rerank` (W25) — les deux sont
+    dans la cible depuis l'ADR-7.
 
 ## 10. Réponse courte
 
@@ -604,4 +605,4 @@ Points importants :
    aussi IQR + w4nl.
 10. Risques : plan QSA 512 Mio au contexte natif, graphe obtenu avec deux
     contournements de debug ; `w4nl`, MTP et vision ne sont plus des exclusions
-    (ADR-7) mais du travail (W25, W26, checklist §7.2).
+    (ADR-7) mais du travail (W25 ; vision livrée en W26).

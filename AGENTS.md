@@ -170,16 +170,18 @@ for (op, geom), d in sorted(rows.items()):
 ```bash
 flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
   ./build/tests/iqr_device_test && ./build/tests/logits_bf16_device_test && \
-  ./build/tests/gather_rows_u8_device_test && \
+  ./build/tests/gather_rows_u8_device_test && ./build/tests/vision_rows_device_test && \
   ./build/bin/r3d_selftest ./build/radiance_home/kernels/libr3d.so'
 ```
 
-État de référence de la branche (R21, commit `7338226`) : **161 rows, 0 échec,
-15 skips** ; `kbench` Flash-Next **856/856** et 27B **605/605**, 0 échec,
+État de référence de la branche (R21 + R26, commit `7338226`) : **161 rows, 0
+échec, 15 skips** ; `kbench` Flash-Next **856/856** et 27B **605/605**, 0 échec,
 0 divergence, **dans les deux modes** (défaut et `--band-capacity`). Test de
 contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
 `gather_rows_u8_device_test` couvre les rows u8 du tier KV (fragment 4 128 octets,
-octets opaques, pitches larges).
+octets opaques, pitches larges). Vision : build **`-DRAD_WITH_FFMPEG=ON`**
+(libavformat 62.3), `capabilities.image=true`, image 512² → 256 tokens,
+1024² → 1 024 ; la tour (856,68 Mio) est en VRAM, le staging média 48,27 Mio.
 
 Recette 27B (dense, IQR) : `--kv-cache-dtype i8 --num-speculative-tokens 0`
 (le drafter h128 fenêtré réclame bf16), `--max-num-seqs 4` — le multi-séquence
@@ -191,6 +193,10 @@ est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill ≈ 318 tok/s
 - Un `.so` remplacé pendant qu'un serveur tourne : tuer le serveur avant de reconstruire.
 - Vérifier que le processus qui répond sur le port est bien le binaire visé
   (`readlink /proc/<pid>/exe`).
+- Un build sans `-DRAD_WITH_FFMPEG=ON` refuse toute image
+  (`capabilities.image=false`) ; l'hôte exige les paquets `libav*-dev` et
+  `pkg-config --modversion libavformat` doit répondre. `<gpu-user>` n'a pas
+  `sudo` : l'installation des paquets est une action administrateur.
 - Les cas `ngram_hint` restent sans oracle : leur « Not covered » n'est pas une
   régression. Les cas **MTP 48** sont en revanche exigibles depuis l'ADR-7
   (2026-11-16, vision et MTP de Flash-Next dans la cible) : un MTP non couvert
