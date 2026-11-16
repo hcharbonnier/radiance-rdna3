@@ -216,6 +216,7 @@ struct Inputs {
     int M = 0, top_k = 0;
     bool protect = false;
     bool gate = false;
+    int xpad = 0;   /* extra elements per activation row: a padded row slice */
 };
 
 /* Runs the fused row against libref, and (when `with_pair`) against the device gemm_nt +
@@ -224,13 +225,13 @@ bool run_case(const Inputs& in, bool with_pair, const char* what) {
     static const int E = 512, K = 2560;
     const int M = in.M, tk = in.top_k;
 
-    const size_t a_elems = (size_t)M * K;
     const size_t b_elems = (size_t)E * K;
     const size_t logits_elems = (size_t)M * E;
     const size_t T = (size_t)M * tk;
 
-    std::vector<uint16_t> a(a_elems, 0), b(b_elems, 0), gb(in.gate ? (size_t)K : 0, 0);
-    for (int t = 0; t < M; ++t) a[(size_t)t * K + t] = bfv(1.0f);
+    const int ap = K + in.xpad;   /* the activation's row pitch */
+    std::vector<uint16_t> a((size_t)M * ap, 0), b(b_elems, 0), gb(in.gate ? (size_t)K : 0, 0);
+    for (int t = 0; t < M; ++t) a[(size_t)t * ap + t] = bfv(1.0f);
     for (int e = 0; e < E; ++e)
         for (int t = 0; t < M; ++t) b[(size_t)e * K + t] = bfv(score(t, e));
     for (int t = 0; t < M; ++t)
@@ -249,7 +250,7 @@ bool run_case(const Inputs& in, bool with_pair, const char* what) {
     CHECK(kd && kr);
     if (!(kd && kr)) return false;
 
-    Dev da(a_elems * 2), db(b_elems * 2), dgb(gb.size() * 2);
+    Dev da(a.size() * 2), db(b_elems * 2), dgb(gb.size() * 2);
     up(da, a.data(), da.bytes);
     up(db, b.data(), db.bytes);
     if (!gb.empty()) up(dgb, gb.data(), dgb.bytes);
@@ -275,8 +276,10 @@ bool run_case(const Inputs& in, bool with_pair, const char* what) {
     for (Dev* d : { &cnt0, &cnt1 }) up(*d, cnt_fill.data(), d->bytes);
 
     auto operands = [&](Dev& lg, Dev& w, Dev& gate, Dev& ids, Dev& st, Dev& off, Dev& cnt) {
+        RadTensor xt = ten(da.p, RAD_BF16, { M, K });
+        xt.stride[0] = ap;   /* a padded row slice keeps its pitch */
         std::vector<RadTensor> v;
-        v.push_back(ten(da.p, RAD_BF16, { M, K }));
+        v.push_back(xt);
         v.push_back(ten(db.p, RAD_BF16, { E, K }));
         v.push_back(in.gate ? ten(dgb.p, RAD_BF16, { 1, K }) : RadTensor{});
         v.push_back(ten(lg.p, RAD_BF16, { M, E }));
@@ -378,8 +381,9 @@ bool run_case(const Inputs& in, bool with_pair, const char* what) {
 
         Dev plg(logits_elems * 2), pw(T * 2), pids(T * 4), pst(T * 4), poff(((size_t)E + 1) * 4),
             pcnt((size_t)E * 4);
-        std::vector<RadTensor> g_t = { ten(da.p, RAD_BF16, { M, K }),
-                                       ten(db.p, RAD_BF16, { E, K }),
+        RadTensor px = ten(da.p, RAD_BF16, { M, K });
+        px.stride[0] = ap;
+        std::vector<RadTensor> g_t = { px, ten(db.p, RAD_BF16, { E, K }),
                                        ten(plg.p, RAD_BF16, { M, E }) };
         std::vector<RadParam> g_p = { RAD_INT("M", M), RAD_INT("N", E), RAD_INT("K", K),
                                       RAD_STR("dtype", "bf16") };
@@ -448,6 +452,18 @@ TEST(router_fused_m17_crosses_to_tiled_and_pair) {
     CHECK(run_case(in, true, "M17 k10 protect"));
 }
 
+/* A padded activation row slice: the row pitch is K + 8, as a slice of a wider buffer would be.
+ * Both the router GEMM (the m16 arm at M = 16 and the tiled arm at 17) and the gate chunks must
+ * stride by the tensor's pitch, not by K. */
+TEST(router_fused_pitched_activation_matches_libref_and_pair) {
+    if (!ready()) return;
+    for (int M : { 16, 17 }) {
+        Inputs in;
+        in.M = M; in.top_k = 10; in.protect = true; in.gate = true; in.xpad = 8;
+        CHECK(run_case(in, true, "pitched act"));
+    }
+}
+
 /* The rest of the matrix: every M with both top_k, protect on and off, and the shared gate
  * present. The ties are in every row (three experts share the maximum). */
 TEST(router_fused_matrix_matches_libref) {
@@ -466,6 +482,48 @@ TEST(router_fused_gate_absent_matches_libref) {
     Inputs in;
     in.M = 16; in.top_k = 10; in.protect = true; in.gate = false;
     CHECK(run_case(in, false, "no gate"));
+}
+
+/* The contract's refusals: the gate weight and its output come together, M stays at or below 64,
+ * top_k at or below 32, and K on the tiled arm's 32-code chunk. Every one is a launch-time code,
+ * returned before a kernel runs, so the descriptors alone are enough. */
+TEST(router_fused_refuses_malformed_calls) {
+    if (!ready()) return;
+    const RadKernelInfo* kd = g_r3d.find("router_gemm_topk_scatter", RAD_DOMAIN_DEVICE,
+                                         "moe_router_gemm_topk_scatter");
+    REQUIRE(kd);
+
+    uintptr_t next = 0x1000000;
+    auto dummy = [&](int dtype, std::initializer_list<long long> dims) {
+        RadTensor t = ten((void*)next, dtype, dims);
+        next += 0x100000;   /* stays non-null and 16-byte aligned; the shim refuses before reading */
+        return t;
+    };
+    /* gate_mode: 0 none, 1 both, 2 gate_b only, 3 gate only. */
+    auto call = [&](long long M, long long K, long long tk, int gate_mode) {
+        std::vector<RadTensor> t;
+        t.push_back(dummy(RAD_BF16, { M, K }));
+        t.push_back(dummy(RAD_BF16, { 512, K }));
+        t.push_back(gate_mode == 1 || gate_mode == 2 ? dummy(RAD_BF16, { 1, K }) : RadTensor{});
+        t.push_back(dummy(RAD_BF16, { M, 512 }));
+        t.push_back(dummy(RAD_I32, { M, tk }));
+        t.push_back(dummy(RAD_BF16, { M, tk }));
+        t.push_back(dummy(RAD_I32, { M * tk }));
+        t.push_back(dummy(RAD_I32, { 513 }));
+        t.push_back(dummy(RAD_I32, { 512 }));
+        if (gate_mode == 1 || gate_mode == 3) t.push_back(dummy(RAD_BF16, { M, 1 }));
+        std::vector<RadParam> p = { RAD_INT("M", M), RAD_INT("K", K), RAD_INT("n_expert", 512),
+                                    RAD_INT("n_local", 512), RAD_INT("top_k", tk),
+                                    RAD_INT("norm", 1), RAD_STR("dtype", "bf16"),
+                                    RAD_INT("expert_base", 0) };
+        return run(kd, t, p, nullptr, 0);
+    };
+
+    CHECK_EQ(call(64, 2560, 10, 2), (int)RAD_E_INVAL);   /* gate_b without gate */
+    CHECK_EQ(call(64, 2560, 10, 3), (int)RAD_E_INVAL);   /* gate without gate_b */
+    CHECK_EQ(call(65, 2560, 10, 0), (int)RAD_E_SHAPE);   /* M past the band */
+    CHECK_EQ(call(16, 2560, 33, 0), (int)RAD_E_SHAPE);   /* top_k past 32 */
+    CHECK_EQ(call(16, 2552, 10, 0), (int)RAD_E_SHAPE);   /* K not on the 32-code chunk */
 }
 
 }  // namespace

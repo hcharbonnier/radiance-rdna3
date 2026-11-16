@@ -416,10 +416,12 @@ int rg_gemm(const RadArgs* a, RadStream s, const RadTensor& x, const RadTensor& 
 }
 
 /* The shared expert's gate: a [M,K] x gate_b [1,K]^T -> gate [M,1] through the m16 row, whose
- * band is 16 rows, one chunk at a time. A row of the product reads only its own activation row,
- * so the chunking changes no bit. `nt` is the m16 row's default (non-temporal weight streaming). */
+ * band is 16 rows, one chunk at a time. `a_ld` is the activation's row pitch the m16 shim would
+ * read (K on a dense buffer), so a sliced activation keeps its stride. A row of the product
+ * reads only its own activation row, so the chunking changes no bit. `nt` is the m16 row's
+ * default (non-temporal weight streaming). */
 int rg_gate(const RadArgs* a, RadStream s, const RadTensor& x, const RadTensor& gb,
-            const RadTensor& y, long long M, long long K) {
+            const RadTensor& y, long long M, long long K, long long a_ld) {
     const int sk = rg_pick_sk(K, 16);
     if (sk > 1 && (!a->scratch || a->scratch_bytes < (long long)sk * 16 * 4))
         return R3D_NO(RAD_E_SCRATCH);
@@ -428,8 +430,8 @@ int rg_gate(const RadArgs* a, RadStream s, const RadTensor& x, const RadTensor& 
     for (long long i = 0; i < M; i += 16) {
         const int mc = (int)((M - i) < 16 ? (M - i) : 16);
         const int e = r3d_gemm_nt_bf16_m16(
-            (long)(uintptr_t)(xp + (size_t)i * (size_t)K), (long)r3d_addr(&gb),
-            (long)(uintptr_t)(yp + i), mc, 1, (int)K, (int)K, 1, sk, 8, 1,
+            (long)(uintptr_t)(xp + (size_t)i * (size_t)a_ld), (long)r3d_addr(&gb),
+            (long)(uintptr_t)(yp + i), mc, 1, (int)K, (int)a_ld, 1, sk, 8, 1,
             (long)(uintptr_t)(sk > 1 ? a->scratch : nullptr), (long)(uintptr_t)s);
         if (e != 0)
             return R3D_NO(e == -1 ? RAD_E_INVAL : e == -2 ? RAD_E_SHAPE
@@ -456,8 +458,6 @@ extern "C" int r3d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s)
     const long long ne = r3d_geti_or(a, "n_expert", 0);
     const long long tk = r3d_geti_or(a, "top_k", 0);
     const long long nl = r3d_geti_or(a, "n_local", ne);
-    const long long norm = r3d_geti_or(a, "norm", 0);
-    (void)norm;
     if (ne <= 0 || ne > 512 || tk <= 0 || tk > kW || tk > ne) return R3D_NO(RAD_E_SHAPE);
     if (nl <= 0 || nl > ne) return R3D_NO(RAD_E_SHAPE);
 
@@ -472,11 +472,19 @@ extern "C" int r3d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s)
     long long M = 0, K = 0;
     if (r3d_rows_of(x, &M, &K) != RAD_OK) return R3D_NO(RAD_E_SHAPE);
     if (M < 1 || M > 64) return R3D_NO(RAD_E_SHAPE);
+    /* The selection reads `M` from the parameters; it must be the rows the GEMM will write. */
+    if (r3d_geti_or(a, "M", M) != M) return R3D_NO(RAD_E_SHAPE);
     if (r3d_geti_or(a, "K", K) != K) return R3D_NO(RAD_E_SHAPE);
     if (r3d_dim(wr, 0) != ne || r3d_dim(wr, 1) != K) return R3D_NO(RAD_E_SHAPE);
-    /* The GEMM reads contiguous rows; the pair's tiled band wants K on its 32-code chunk. */
-    if (!r3d_contig(x) || !r3d_contig(wr) || !r3d_contig(lg)) return R3D_NO(RAD_E_STRIDE);
-    if (K % 32) return R3D_NO(RAD_E_SHAPE);
+    /* The activation may be a row slice of a wider buffer, so take its pitch as the m16 and tiled
+     * rows do; the weight and the logits are the dedicated dense planes. */
+    long long xrows = 0;
+    const long long a_ld = r3d_rows_pitch(x, K, &xrows);
+    if (a_ld < 0) return R3D_NO(RAD_E_STRIDE);
+    if (xrows < M) return R3D_NO(RAD_E_SHAPE);
+    if (!r3d_contig(wr) || !r3d_contig(lg)) return R3D_NO(RAD_E_STRIDE);
+    if (a_ld % 8) return R3D_NO(RAD_E_STRIDE);          /* the m16 arm's 16-byte row bases */
+    if (K % 32) return R3D_NO(RAD_E_SHAPE);             /* the tiled arm's 32-code chunk */
     if (r3d_numel(lg) < M * ne) return R3D_NO(RAD_E_SHAPE);
 
     const long long T = M * tk;
@@ -491,7 +499,8 @@ extern "C" int r3d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s)
         if (!r3d_contig(wg) || !r3d_contig(gate)) return R3D_NO(RAD_E_STRIDE);
         if (r3d_numel(gate) < M) return R3D_NO(RAD_E_SHAPE);
     }
-    if (!r3d_aligned(r3d_p(x), 16) || !r3d_aligned(r3d_p(wr), 16))
+    if (!r3d_aligned(r3d_p(x), 16) || !r3d_aligned(r3d_p(wr), 16) ||
+        (wg && !r3d_aligned(r3d_p(wg), 16)))
         return R3D_NO(RAD_E_ALIGN);
 
     /* 1) The router GEMM: the same row the unfused router resolves to, m16 at decode heights and
@@ -501,7 +510,7 @@ extern "C" int r3d_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s)
 
     /* 2) The shared expert's gate, at N = 1 over the same activation. */
     if (wg) {
-        rc = rg_gate(a, s, *x, *wg, *gate, M, K);
+        rc = rg_gate(a, s, *x, *wg, *gate, M, K, a_ld);
         if (rc != RAD_OK) return rc;
     }
 
