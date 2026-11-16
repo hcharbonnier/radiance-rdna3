@@ -74,8 +74,8 @@ int unsigned_bits(uint32_t dt) {
     return 0;
 }
 int signed_bits(uint32_t dt) {
-    static const uint32_t kS[] = { RAD_I2, RAD_I3, RAD_I4, RAD_I5, RAD_I6, RAD_I7 };
-    for (int i = 0; i < 6; ++i)
+    static const uint32_t kS[] = { RAD_I2, RAD_I3, RAD_I4, RAD_I5, RAD_I6, RAD_I7, RAD_I8 };
+    for (int i = 0; i < 7; ++i)
         if (dt == kS[i]) return i + 2;
     return 0;
 }
@@ -406,10 +406,13 @@ int weight_relayout(const Form& f, const Geom& g, int64_t entries, const Planes&
     /* Which codes refuse, for the forms whose check is the code alone. */
     std::vector<uint8_t> refuse;
     if (f.kind == kSigned || f.kind == kTable || f.kind == kGrid) {
+        /* An eight-bit signed code reaches int8's -128; the narrower signed forms and the tables
+         * stop at -127. */
+        const int lo = f.kind == kSigned && B == 8 ? -128 : -127;
         refuse.assign((size_t)1 << B, 0);
         for (uint32_t c = 0; c <= m; ++c) {
             const int val = f.kind == kGrid ? 0 : scalar_value(f, v, entries, 0, 0, c);
-            refuse[c] = f.kind == kGrid ? (int64_t)c >= entries : (val < -127 || val > 127);
+            refuse[c] = f.kind == kGrid ? (int64_t)c >= entries : (val < lo || val > 127);
         }
     }
     const int zb = f.kind == kZero ? unsigned_bits(v.aux->dtype) : 0;

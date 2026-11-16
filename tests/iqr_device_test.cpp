@@ -194,10 +194,20 @@ void fwht128_host(float* v) {
 }
 
 /* A class's decoded int8 weight (no tcq_rb rescale: the head's classes are off that grid). */
-std::vector<int8_t> decode_class(const W& w, uint32_t B, uint32_t L, int64_t N, int64_t K) {
+std::vector<int8_t> decode_class(const W& w, uint32_t B, uint32_t L, int64_t N, int64_t K,
+                                 Kind kind = kTrellisMad) {
+    std::vector<int8_t> dec((size_t)(N * K));
+    if (kind == kSigned) {
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t k = 0; k < K; ++k) {
+                const uint32_t code = code_at(w, n, k, B);
+                dec[(size_t)(n * K + k)] = (int8_t)((int)(int32_t)(code << (32u - B)) >>
+                                                   (int32_t)(32u - B));
+            }
+        return dec;
+    }
     const uint32_t A = ((const uint32_t*)w.data[(size_t)w.find("trellis.mad")].data())[0];
     const uint32_t Bc = ((const uint32_t*)w.data[(size_t)w.find("trellis.mad")].data())[1];
-    std::vector<int8_t> dec((size_t)(N * K));
     const int64_t run = 256;
     for (int64_t n = 0; n < N; ++n)
         for (int64_t k = 0; k < K; ++k) {
@@ -250,6 +260,17 @@ std::vector<int8_t> decode_rows(const W& w, Kind kind, uint32_t B, uint32_t LV, 
                 const uint32_t code = code_at(w, n, c, B);
                 for (int64_t j = 0; j < V; ++j)
                     dec[(size_t)(n * K + c * V + j)] = grid[code * V + j];
+            }
+        return dec;
+    }
+    if (kind == kSigned) {
+        /* The code is the value: B bits, sign-extended. At B = 8 that is the whole int8 range, -
+         * 128 included. */
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t k = 0; k < K; ++k) {
+                const uint32_t code = code_at(w, n, k, B);
+                const int v = (int)(int32_t)(code << (32u - B)) >> (int32_t)(32u - B);
+                dec[(size_t)(n * K + k)] = (int8_t)v;
             }
         return dec;
     }
@@ -336,6 +357,11 @@ bool run_case(const Case& c) {
         w.enc.plane[t].block[0] = 256;
         w.enc.plane[t].block[1] = c.RB ? 32 : 0;
         rad_enc_add_table(&w.enc, "trellis.mad", RAD_U32, 2, 1);
+    } else if (c.kind == kSigned) {
+        /* The rotated int8 grid: the codes themselves, under a bf16 scale a (row, 128), no aux. */
+        rad_enc_copy_str(w.enc.scheme, "affine");
+        rad_enc_add_plane(&w.enc, "codes", RAD_I8, 1, 1);
+        rad_enc_add_plane(&w.enc, "scale", RAD_BF16, 1, 128);
     } else {
         rad_enc_copy_str(w.enc.scheme, "affine");
         rad_enc_add_plane(&w.enc, "codes", udt(c.B), 1, c.kind == kGrid ? 4 : 1);
@@ -357,7 +383,11 @@ bool run_case(const Case& c) {
     if (c.pattern == 1) std::fill(w.data[(size_t)ic].begin(), w.data[(size_t)ic].end(), (uint8_t)0);
     else if (c.pattern == 2)
         std::fill(w.data[(size_t)ic].begin(), w.data[(size_t)ic].end(), (uint8_t)0xFF);
-    else
+    else if (c.pattern == 3) {
+        /* The eight-bit signed form's two rails: -128 (0x80) and 127 (0x7F), alternating. */
+        uint8_t* p = w.data[(size_t)ic].data();
+        for (size_t i = 0; i < w.data[(size_t)ic].size(); ++i) p[i] = (i & 1u) ? 0x7Fu : 0x80u;
+    } else
         for (auto& b : w.data[(size_t)ic]) b = (uint8_t)rnd();
     if (c.kind == kTrellisMad) {
         const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
@@ -366,7 +396,7 @@ bool run_case(const Case& c) {
         ab[1] = Bc;
         int8_t* tab = (int8_t*)w.data[(size_t)w.find("trellis")].data();
         for (uint32_t st = 0; st < (1u << c.L); ++st) tab[st] = (int8_t)mad_value(st, A, Bc);
-    } else {
+    } else if (c.kind != kSigned) {
         const char* role = c.kind == kTable ? "table" : "grid";
         int8_t* tab = (int8_t*)w.data[(size_t)w.find(role)].data();
         const size_t ntab = w.data[(size_t)w.find(role)].size();
@@ -618,34 +648,49 @@ bool run_case(const Case& c) {
  * same code bytes and the same f32 scales with no intermediate and no scratch. The weight is the
  * 27B's feed-forward width (n = 17408, so 136 groups of 128) at a shorter K, and M in {1, 5, 16},
  * act in {silu, sigmoid} and out_bf16 present or absent are all run against it. */
-bool run_gated_fold() {
-    const int64_t n = 17408, N = 2 * n, K = 2560;
+bool run_gated_fold(bool signed_form = false) {
+    /* The 27B's feed-forward width (n = 17408) exercises the many-group grid; the signed form runs
+     * a smaller shape, because its eight-bit codes are twice the trellis's bytes. */
+    const int64_t n = signed_form ? 1024 : 17408;
+    const int64_t N = 2 * n, K = signed_form ? 512 : 2560;
     const int64_t nkb = K / 128, ng = n / 128;
-    const uint32_t B = 4, L16 = 16;
+    const uint32_t B = signed_form ? 8 : 4, L16 = 16;
     W w;
     rad_enc_clear(&w.enc);
-    rad_enc_copy_str(w.enc.scheme, "trellis");
-    rad_enc_add_plane(&w.enc, "codes", kU[B], 1, 1);
-    rad_enc_add_plane(&w.enc, "scale", RAD_F32, 1, 0);
-    rad_enc_add_plane(&w.enc, "scale.col", RAD_F32, 0, 128);
-    const int t = rad_enc_add_table(&w.enc, "trellis", RAD_I8, (int64_t)1 << L16, 1);
-    w.enc.plane[t].block[0] = 256;
-    w.enc.plane[t].block[1] = 0;
-    rad_enc_add_table(&w.enc, "trellis.mad", RAD_U32, 2, 1);
+    if (signed_form) {
+        rad_enc_copy_str(w.enc.scheme, "affine");
+        rad_enc_add_plane(&w.enc, "codes", RAD_I8, 1, 1);
+        rad_enc_add_plane(&w.enc, "scale", RAD_BF16, 1, 128);
+    } else {
+        rad_enc_copy_str(w.enc.scheme, "trellis");
+        rad_enc_add_plane(&w.enc, "codes", kU[B], 1, 1);
+        rad_enc_add_plane(&w.enc, "scale", RAD_F32, 1, 0);
+        rad_enc_add_plane(&w.enc, "scale.col", RAD_F32, 0, 128);
+        const int t = rad_enc_add_table(&w.enc, "trellis", RAD_I8, (int64_t)1 << L16, 1);
+        w.enc.plane[t].block[0] = 256;
+        w.enc.plane[t].block[1] = 0;
+        rad_enc_add_table(&w.enc, "trellis.mad", RAD_U32, 2, 1);
+    }
     rad_enc_copy_str(w.enc.transform, "fwht128");
     w.size(N, K);
 
     for (auto& b : w.data[(size_t)w.find("codes")]) b = (uint8_t)rnd();
-    const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
-    uint32_t* ab = (uint32_t*)w.data[(size_t)w.find("trellis.mad")].data();
-    ab[0] = A;
-    ab[1] = Bc;
-    int8_t* tab = (int8_t*)w.data[(size_t)w.find("trellis")].data();
-    for (uint32_t st = 0; st < (1u << L16); ++st) tab[st] = (int8_t)mad_value(st, A, Bc);
-    float* rs = (float*)w.data[(size_t)w.find("scale")].data();
-    for (int64_t i = 0; i < N; ++i) rs[i] = 0.001f + 0.0005f * (float)(i % 7);
-    float* cf = (float*)w.data[(size_t)w.find("scale.col")].data();
-    for (int64_t kb = 0; kb < nkb; ++kb) cf[kb] = 0.5f + 0.1f * (float)kb;
+    if (signed_form) {
+        uint16_t* sc = (uint16_t*)w.data[(size_t)w.find("scale")].data();
+        for (int64_t i = 0; i < N * nkb; ++i)
+            sc[i] = f32_to_bf16(0.002f + 0.0001f * (float)(i % 11));
+    } else {
+        const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
+        uint32_t* ab = (uint32_t*)w.data[(size_t)w.find("trellis.mad")].data();
+        ab[0] = A;
+        ab[1] = Bc;
+        int8_t* tab = (int8_t*)w.data[(size_t)w.find("trellis")].data();
+        for (uint32_t st = 0; st < (1u << L16); ++st) tab[st] = (int8_t)mad_value(st, A, Bc);
+        float* rs = (float*)w.data[(size_t)w.find("scale")].data();
+        for (int64_t i = 0; i < N; ++i) rs[i] = 0.001f + 0.0005f * (float)(i % 7);
+        float* cf = (float*)w.data[(size_t)w.find("scale.col")].data();
+        for (int64_t kb = 0; kb < nkb; ++kb) cf[kb] = 0.5f + 0.1f * (float)kb;
+    }
 
     const std::vector<RadParam> lp = { pint("N", N), pint("K", K), pint("group", 128),
                                        pstr("dtype", "i8a8h") };
@@ -881,6 +926,19 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
         { "grid u9 V4 bf16 zero codes, GEMV", 9, 0, 0, kBf16, 256, 384, 1, false, kGrid, 1, 2 },
         { "grid u9 V4 bf16 max codes, 16 tokens", 9, 0, 0, kBf16, 256, 384, 16, false, kGrid, 2, 2 },
         { "grid u12 V4 bf16 max codes, GEMV", 12, 0, 0, kBf16, 256, 384, 1, false, kGrid, 2, 2 },
+        /* The rotated int8 grid (kSigned, 8 bits): the codes themselves under a bf16 scale a
+         * (row, 128), the form the Flash-Next dense rows refuse until W15. M = 1 / 16 / 512 (the
+         * decode band, its top, and the resident/tiled row), a zero code plane, and the two int8
+         * rails (-128 and 127) whose -128 the layout must accept. */
+        { "signed i8 bf16, GEMV", 8, 0, 0, kBf16, 256, 384, 1, false, kSigned },
+        { "signed i8 bf16, 16 tokens", 8, 0, 0, kBf16, 256, 384, 16, false, kSigned },
+        { "signed i8 bf16, 512 tokens (resident)", 8, 0, 0, kBf16, 256, 384, 512, false, kSigned },
+        { "signed i8 bf16 zero codes, GEMV", 8, 0, 0, kBf16, 256, 384, 1, false, kSigned, 1 },
+        { "signed i8 bf16 zero codes, 16 tokens", 8, 0, 0, kBf16, 256, 384, 16, false, kSigned, 1 },
+        { "signed i8 bf16 -128/127 codes, 16 tokens", 8, 0, 0, kBf16, 256, 384, 16, false, kSigned,
+          3 },
+        { "signed i8 bf16 -128/127 codes, 512 tokens (resident)", 8, 0, 0, kBf16, 256, 384, 512,
+          false, kSigned, 3 },
         /* The 27B's down vector (N = 5120, K = 17408, u4, one f32 scale a row, M = 1): the shape
          * the W0 table measures at 51.5 %. It takes the split band, so the comparison is in bf16
          * ulps (2). Every other case above stays bit-identical: it either passes no scratch (the
@@ -889,6 +947,30 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
           true },
     };
     for (const Case& c : cases) CHECK(run_case(c));
+}
+
+/* One band's geometry, two weight forms. The engine aggregates weight instances of the same
+ * [N, K] into one band and resolves one row for it, so a row must accept both the computed trellis
+ * (the MTP 48's IQR bands) and the rotated int8 grid (kSigned, the plain i8 weights sharing those
+ * bands). This exercises the same row's shims back to back on one geometry: each instance is laid
+ * out from its own declared form and launched through the same rows, and each must still match the
+ * host reference. The aggregation itself lives in the plugin/engine and is not covered here. */
+TEST(iqr_signed_and_trellis_share_one_row_geometry) {
+    if (!lib().ok()) {
+        std::fprintf(stderr, "skip: %s not loadable here\n", RAD_R3D_SO);
+        return;
+    }
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) {
+        std::fprintf(stderr, "skip: no card\n");
+        return;
+    }
+    const Case mixed[] = {
+        { "same band: mad u4 L16 one-f32-row, 16 tokens", 4, 16, 0, kRowF32, 256, 384, 16 },
+        { "same band: mad u4 L16 bf16, 16 tokens", 4, 16, 0, kBf16, 256, 384, 16 },
+        { "same band: signed i8 bf16, 16 tokens", 8, 0, 0, kBf16, 256, 384, 16, false, kSigned },
+    };
+    for (const Case& c : mixed) CHECK(run_case(c));
 }
 
 TEST(iqr_gated_fold_is_bit_identical_to_the_unfused_pair) {
@@ -902,6 +984,22 @@ TEST(iqr_gated_fold_is_bit_identical_to_the_unfused_pair) {
         return;
     }
     CHECK(run_gated_fold());
+}
+
+/* The same fold over the rotated int8 grid (kSigned, 8 bits, bf16 scale): the Fused row must
+ * accept the form W15 adds, and its decode is the trellis's own lane, so the pair comparison is
+ * bit-identical there too. */
+TEST(iqr_gated_fold_takes_the_signed_form) {
+    if (!lib().ok() || !lib().gated || !lib().fused) {
+        std::fprintf(stderr, "skip: %s or its gated rows not loadable here\n", RAD_R3D_SO);
+        return;
+    }
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) {
+        std::fprintf(stderr, "skip: no card\n");
+        return;
+    }
+    CHECK(run_gated_fold(true));
 }
 
 /* ------------------------------------------------------------------ the vocabulary head
@@ -919,33 +1017,48 @@ struct Cls {
     std::vector<int32_t> ids;
     int64_t rows = 0;
     uint32_t bits = 4;
+    Kind kind = kTrellisMad;
 };
 
-bool make_class(Cls& c, int64_t rows, int64_t K, int32_t id0, uint64_t seed, uint32_t bits = 4) {
+bool make_class(Cls& c, int64_t rows, int64_t K, int32_t id0, uint64_t seed, uint32_t bits = 4,
+                Kind kind = kTrellisMad) {
     g_z = seed;
     c.rows = rows;
-    c.bits = bits;
+    c.kind = kind;
+    c.bits = kind == kSigned ? 8u : bits;
     rad_enc_clear(&c.w.enc);
-    rad_enc_copy_str(c.w.enc.scheme, "trellis");
-    rad_enc_add_plane(&c.w.enc, "codes", kU[bits], 1, 1);
-    rad_enc_add_plane(&c.w.enc, "scale", RAD_F32, 1, 0);
-    rad_enc_add_plane(&c.w.enc, "scale.col", RAD_F32, 0, 128);
-    const int t = rad_enc_add_table(&c.w.enc, "trellis", RAD_I8, 1ll << 16, 1);
-    c.w.enc.plane[t].block[0] = 256;
-    rad_enc_add_table(&c.w.enc, "trellis.mad", RAD_U32, 2, 1);
+    if (kind == kSigned) {
+        rad_enc_copy_str(c.w.enc.scheme, "affine");
+        rad_enc_add_plane(&c.w.enc, "codes", RAD_I8, 1, 1);
+        rad_enc_add_plane(&c.w.enc, "scale", RAD_BF16, 1, 128);
+    } else {
+        rad_enc_copy_str(c.w.enc.scheme, "trellis");
+        rad_enc_add_plane(&c.w.enc, "codes", kU[bits], 1, 1);
+        rad_enc_add_plane(&c.w.enc, "scale", RAD_F32, 1, 0);
+        rad_enc_add_plane(&c.w.enc, "scale.col", RAD_F32, 0, 128);
+        const int t = rad_enc_add_table(&c.w.enc, "trellis", RAD_I8, 1ll << 16, 1);
+        c.w.enc.plane[t].block[0] = 256;
+        rad_enc_add_table(&c.w.enc, "trellis.mad", RAD_U32, 2, 1);
+    }
     rad_enc_copy_str(c.w.enc.transform, "fwht128");
     c.w.size(rows, K);
     for (auto& v : c.w.data[(size_t)c.w.find("codes")]) v = (uint8_t)rnd();
-    const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
-    uint32_t* ab = (uint32_t*)c.w.data[(size_t)c.w.find("trellis.mad")].data();
-    ab[0] = A;
-    ab[1] = Bc;
-    int8_t* tab = (int8_t*)c.w.data[(size_t)c.w.find("trellis")].data();
-    for (uint32_t st = 0; st < (1u << 16); ++st) tab[st] = (int8_t)mad_value(st, A, Bc);
-    float* rs = (float*)c.w.data[(size_t)c.w.find("scale")].data();
-    for (int64_t n = 0; n < rows; ++n) rs[n] = 0.001f + 0.0002f * (float)(n % 5);
-    float* cf = (float*)c.w.data[(size_t)c.w.find("scale.col")].data();
-    for (int64_t kb = 0; kb < K / 128; ++kb) cf[kb] = 1.0f;
+    if (kind == kSigned) {
+        uint16_t* sc = (uint16_t*)c.w.data[(size_t)c.w.find("scale")].data();
+        for (int64_t i = 0; i < rows * (K / 128); ++i)
+            sc[i] = f32_to_bf16(0.002f + 0.0001f * (float)(i % 11));
+    } else {
+        const uint32_t A = (uint32_t)(rnd() & 0xFFFFFFu) | 1u, Bc = (uint32_t)rnd();
+        uint32_t* ab = (uint32_t*)c.w.data[(size_t)c.w.find("trellis.mad")].data();
+        ab[0] = A;
+        ab[1] = Bc;
+        int8_t* tab = (int8_t*)c.w.data[(size_t)c.w.find("trellis")].data();
+        for (uint32_t st = 0; st < (1u << 16); ++st) tab[st] = (int8_t)mad_value(st, A, Bc);
+        float* rs = (float*)c.w.data[(size_t)c.w.find("scale")].data();
+        for (int64_t n = 0; n < rows; ++n) rs[n] = 0.001f + 0.0002f * (float)(n % 5);
+        float* cf = (float*)c.w.data[(size_t)c.w.find("scale.col")].data();
+        for (int64_t kb = 0; kb < K / 128; ++kb) cf[kb] = 1.0f;
+    }
     c.ids.resize((size_t)rows);
     for (int64_t r = 0; r < rows; ++r) c.ids[(size_t)r] = id0 + (int32_t)((r * 37) % rows);
 
@@ -982,9 +1095,14 @@ bool make_class(Cls& c, int64_t rows, int64_t K, int32_t id0, uint64_t seed, uin
 void reference16(const Cls& cl, const std::vector<float>& xr, int64_t M, int64_t K, int32_t voff,
                  int64_t n_vocab, float* want) {
     const int64_t rows = cl.rows, nkb = K / 128;
-    const std::vector<int8_t> dec = decode_class(cl.w, cl.bits, 16, rows, K);
-    const float* rs = (const float*)cl.w.data[(size_t)cl.w.find("scale")].data();
-    const float* cf = (const float*)cl.w.data[(size_t)cl.w.find("scale.col")].data();
+    const std::vector<int8_t> dec = decode_class(cl.w, cl.bits, 16, rows, K, cl.kind);
+    const float* rs = cl.kind == kSigned
+                          ? nullptr
+                          : (const float*)cl.w.data[(size_t)cl.w.find("scale")].data();
+    const float* cf = cl.kind == kSigned
+                          ? nullptr
+                          : (const float*)cl.w.data[(size_t)cl.w.find("scale.col")].data();
+    const uint16_t* sb = cl.kind == kSigned ? (const uint16_t*)cl.s.data() : nullptr;
     for (int64_t m = 0; m < M; ++m)
         for (int64_t n = 0; n < rows; ++n) {
             const int64_t rel = (int64_t)cl.ids[(size_t)n] - voff;
@@ -995,9 +1113,13 @@ void reference16(const Cls& cl, const std::vector<float>& xr, int64_t M, int64_t
                 for (int64_t k = 0; k < 128; ++k)
                     sub += (double)xr[(size_t)(m * K + kb * 128 + k)] *
                            (double)dec[(size_t)(n * K + kb * 128 + k)];
-                acc += sub * (double)cf[kb];
+                const double sw = cl.kind == kSigned
+                                      ? (double)bf16_to_f32(sb[tile_major(n, kb, nkb)])
+                                      : (double)cf[kb];
+                acc += sub * sw;
             }
-            want[(size_t)(m * n_vocab + rel)] = (float)(acc * (double)rs[n]);
+            want[(size_t)(m * n_vocab + rel)] =
+                (float)(cl.kind == kSigned ? acc : acc * (double)rs[n]);
         }
 }
 
@@ -1013,7 +1135,7 @@ constexpr float kLogitAtol = 5e-3f, kLogitRtol = 2e-4f;
  * the output window drops `voff` ids at each end, so the caller can also give the classes unequal
  * row counts (the one launch's empty-block path). */
 bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bits = nullptr,
-               const int64_t* row_counts = nullptr) {
+               const int64_t* row_counts = nullptr, Kind kind = kTrellisMad) {
     const int64_t K = 512, voff = 128;
     int64_t rows[4] = { 256, 256, 256, 256 };
     for (int i = 0; i < 4; ++i)
@@ -1025,7 +1147,7 @@ bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bit
     int64_t id0 = 0;
     for (int i = 0; i < 4; ++i) {
         if (!make_class(cls[i], rows[i], K, (int32_t)id0, 0x9E3779B97F4A7C15ull * (i + 3),
-                        bits ? bits[i] : 4u))
+                        bits ? bits[i] : 4u, kind))
             return false;
         id0 += rows[i];
     }
@@ -1095,8 +1217,32 @@ bool run_vocab(int64_t M, std::vector<float>* out = nullptr, const uint32_t* bit
             std::memcpy(&xr[(size_t)(m * K + kg * 128)], v, sizeof v);
         }
     std::vector<float> want((size_t)(M * n_vocab), 0.0f);
+    /* The signed form's reference takes the activation the kernel actually reads: the rotated
+     * group quantised to q = 128 hi + lo exactly as logits_quant_kernel does, so the comparison
+     * isolates the weight decode, the block fold and the scatter instead of the quantiser's
+     * rounding (which the trellis reference leaves to the tolerance below). */
+    std::vector<float> xq;
+    if (kind == kSigned) {
+        xq = xr;
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t kg = 0; kg < nkb; ++kg) {
+                float* p = &xq[(size_t)(m * K + kg * 128)];
+                float amax = 0.0f;
+                for (int j = 0; j < 128; ++j) amax = std::fmax(amax, std::fabs(p[j]));
+                const float sc = amax > 0.0f ? amax / (127.0f * 128.0f) : 1.0f;
+                const float inv = 1.0f / sc;
+                for (int j = 0; j < 128; ++j) {
+                    const float t = p[j] * inv;
+                    const int q = (int)std::rintf(std::fmin(
+                        std::fmax(t == t ? t : 0.0f, -127.0f * 128.0f), 127.0f * 128.0f));
+                    const int hi = (q + 64) >> 7, lo = q - hi * 128;
+                    p[j] = sc * (float)(hi * 128 + lo);
+                }
+            }
+    }
+    const std::vector<float>& act = kind == kSigned ? xq : xr;
     for (int i = 0; i < 4; ++i)
-        reference16(cls[i], xr, M, K, (int32_t)voff, n_vocab, want.data());
+        reference16(cls[i], act, M, K, (int32_t)voff, n_vocab, want.data());
 
     size_t bad = 0, first = want.size();
     double worst_abs = 0.0, worst_rel = 0.0;
@@ -1265,6 +1411,18 @@ TEST(iqr_vocab_head_matches_its_reference) {
      * classes' blocks past their rows must return without touching the tile or the logits. */
     const int64_t uneven[4] = { 256, 512, 768, 256 };
     CHECK(run_vocab(2, nullptr, nullptr, uneven));
+}
+
+/* The head's other form: four classes of the rotated int8 grid (kSigned, 8 bits, bf16 scale).
+ * The class dispatch's width switch must serve 8 as it serves 2..7, and the fold takes the bf16
+ * block scale with no row factor. Both tilings are run against the same high-precision reference. */
+TEST(iqr_vocab_head_takes_the_signed_form) {
+    if (!lib().ok() || !lib().logits || !lib().logits_scratch) return;
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) return;
+    CHECK(run_vocab(1, nullptr, nullptr, nullptr, kSigned));
+    CHECK(run_vocab(2, nullptr, nullptr, nullptr, kSigned));
+    CHECK(run_vocab(7, nullptr, nullptr, nullptr, kSigned));
 }
 
 /* The head's two tilings: M = 1 selects MT = 1 (the hi/lo wave split), M = 2 selects MT = 2. The

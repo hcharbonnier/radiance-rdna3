@@ -2,9 +2,11 @@
  *
  * W0/W3 slice: the computed trellis (`tcq_code=mad`) with one f32 scale a row and a factor a 128-K
  * block, or a bf16 scale a (row, 128); W14 adds IQR-V1's scalar codebook (`kTable`, u2..u5) and
- * vector codebook (`kGrid`, u8/u9/u10/u12, V = 4), both under a bf16 scale a (row, 128). The other
- * forms the container can declare (E4M3 scales, tcq_rb grids, the read trellis, signed/zero codes)
- * stay refused: no kernel and no measured container weight exercises them yet.
+ * vector codebook (`kGrid`, u8/u9/u10/u12, V = 4), both under a bf16 scale a (row, 128); W15 adds
+ * the rotated int8 grid (`kSigned`, 8 bits) under the same bf16 scale, which one row serves beside
+ * the computed trellis of its geometry. The other forms the container can declare (E4M3 scales,
+ * tcq_rb grids, the read trellis, zero codes) stay refused: no kernel and no measured container
+ * weight exercises them yet.
  *
  * ---- the arithmetic ------------------------------------------------------------------------------
  *
@@ -403,12 +405,17 @@ int mt_for(int M) {
 int form_supported(const Form& f) {
     /* W0: the computed trellis, L = 16, one scale a row or a bf16 scale a (row, 128). W14 adds the
      * two IQR-V1 forms the decoded-lane kernels already read: a scalar codebook (kTable, u2..u5) and
-     * a vector codebook (kGrid, V = 4, u8/u9/u10/u12), both under a bf16 scale a (row, 128). The
-     * built() list is the authority for every form, so a width or scale the layout cannot produce is
-     * refused here with the same code. */
+     * a vector codebook (kGrid, V = 4, u8/u9/u10/u12), both under a bf16 scale a (row, 128). W15
+     * adds the rotated int8 grid (kSigned, 8 bits) the same decoded-lane kernels already sign-extend,
+     * so a row serves both it and the computed trellis of one geometry. The built() list is the
+     * authority for every form, so a width or scale the layout cannot produce is refused here with
+     * the same code. */
     if (is_trellis(f.kind))
         return f.kind == kTrellisMad && f.L == 16 && f.lrb == 0 &&
                (f.scale == kRowF32 || f.scale == kBf16) && f.bits >= 2 && f.bits <= 7 &&
+               built(kernel_word(word(f)));
+    if (f.kind == kSigned)
+        return f.bits == 8 && f.scale == kBf16 && f.lv == 0 && f.L == 0 && f.lrb == 0 &&
                built(kernel_word(word(f)));
     if (f.kind != kTable && f.kind != kGrid) return 0;
     if (!built(kernel_word(word(f)))) return 0;
@@ -558,6 +565,11 @@ extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M,
     R3D_IQR_M16_FORM(KIND, B, LV, L, LRB, kBf16)
 
     switch (f.kind) {
+        case kSigned:
+            switch (f.bits) {
+                case 8: R3D_IQR_M16_BF16(kSigned, 8, 0, 0, 0);
+                default: return -6;
+            }
         case kTrellisMad:
             switch (f.bits) {
                 case 2: R3D_IQR_M16_SC(kTrellisMad, 2, 0, 16, 0);
@@ -627,6 +639,11 @@ extern "C" int r3d_gemm_iqr_tiled(long a, long as, long b, long bs, long y, int 
     R3D_IQR_TILED_FORM(KIND, B, LV, L, LRB, kBf16)
 
     switch (f.kind) {
+        case kSigned:
+            switch (f.bits) {
+                case 8: R3D_IQR_TILED_BF16(kSigned, 8, 0, 0, 0);
+                default: return -6;
+            }
         case kTrellisMad:
             switch (f.bits) {
                 case 2: R3D_IQR_TILED_SC(kTrellisMad, 2, 0, 16, 0);

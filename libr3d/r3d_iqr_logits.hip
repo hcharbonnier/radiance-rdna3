@@ -237,16 +237,17 @@ __device__ __forceinline__ void dispatch_class(
     const Cls& cl, uint32_t* __restrict__ sW, const int8_t* __restrict__ xh,
     const int8_t* __restrict__ xl, const float* __restrict__ xs, float* __restrict__ logits,
     int M, int K, int ld, int voff, int n_vocab, uint32_t rt, int tok0) {
-#define R3D_LOGITS_TILE(B, SC)                                                                    \
-    logits16_tile<FormT<kTrellisMad, B, 0, 16, 0, SC>, MT>(cl, sW, xh, xl, xs, logits, M, K, ld,   \
-                                                            voff, n_vocab, rt, tok0)
+#define R3D_LOGITS_TILE(KIND, B, L, SC)                                                           \
+    logits16_tile<FormT<KIND, B, 0, L, 0, SC>, MT>(cl, sW, xh, xl, xs, logits, M, K, ld,           \
+                                                   voff, n_vocab, rt, tok0)
+    if (cl.bits == 8) R3D_LOGITS_TILE(kSigned, 8, 0, kBf16);
     switch (cl.bits) {
-        case 2: if (cl.scale == kRowF32) R3D_LOGITS_TILE(2, kRowF32); else R3D_LOGITS_TILE(2, kBf16); break;
-        case 3: if (cl.scale == kRowF32) R3D_LOGITS_TILE(3, kRowF32); else R3D_LOGITS_TILE(3, kBf16); break;
-        case 4: if (cl.scale == kRowF32) R3D_LOGITS_TILE(4, kRowF32); else R3D_LOGITS_TILE(4, kBf16); break;
-        case 5: if (cl.scale == kRowF32) R3D_LOGITS_TILE(5, kRowF32); else R3D_LOGITS_TILE(5, kBf16); break;
-        case 6: if (cl.scale == kRowF32) R3D_LOGITS_TILE(6, kRowF32); else R3D_LOGITS_TILE(6, kBf16); break;
-        case 7: if (cl.scale == kRowF32) R3D_LOGITS_TILE(7, kRowF32); else R3D_LOGITS_TILE(7, kBf16); break;
+        case 2: if (cl.scale == kRowF32) R3D_LOGITS_TILE(kTrellisMad, 2, 16, kRowF32); else R3D_LOGITS_TILE(kTrellisMad, 2, 16, kBf16); break;
+        case 3: if (cl.scale == kRowF32) R3D_LOGITS_TILE(kTrellisMad, 3, 16, kRowF32); else R3D_LOGITS_TILE(kTrellisMad, 3, 16, kBf16); break;
+        case 4: if (cl.scale == kRowF32) R3D_LOGITS_TILE(kTrellisMad, 4, 16, kRowF32); else R3D_LOGITS_TILE(kTrellisMad, 4, 16, kBf16); break;
+        case 5: if (cl.scale == kRowF32) R3D_LOGITS_TILE(kTrellisMad, 5, 16, kRowF32); else R3D_LOGITS_TILE(kTrellisMad, 5, 16, kBf16); break;
+        case 6: if (cl.scale == kRowF32) R3D_LOGITS_TILE(kTrellisMad, 6, 16, kRowF32); else R3D_LOGITS_TILE(kTrellisMad, 6, 16, kBf16); break;
+        case 7: if (cl.scale == kRowF32) R3D_LOGITS_TILE(kTrellisMad, 7, 16, kRowF32); else R3D_LOGITS_TILE(kTrellisMad, 7, 16, kBf16); break;
         default: break;
     }
 #undef R3D_LOGITS_TILE
@@ -285,7 +286,11 @@ int mt_for(int M) {
 
 int form_supported(const Form& f) {
     /* The forms the head's layout hook stores: the computed trellis, L = 16, one f32 a row under
-     * a factor a 128-K block, or a bf16 scale a (row, 128). */
+     * a factor a 128-K block, or a bf16 scale a (row, 128). W15 adds the rotated int8 grid
+     * (kSigned, 8 bits) under a bf16 scale a (row, 128), decoded by the same lane as the trellis. */
+    if (f.kind == kSigned)
+        return f.bits == 8 && f.scale == kBf16 && f.lv == 0 && f.L == 0 && f.lrb == 0 &&
+               built(kernel_word(word(f)));
     return f.kind == kTrellisMad && f.L == 16 && f.lrb == 0 &&
            (f.scale == kRowF32 || f.scale == kBf16) && f.bits >= 2 && f.bits <= 7;
 }
@@ -387,13 +392,14 @@ int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream stream) {
         if (((uintptr_t)r3d_p(w[i]) & 15u) || ((uintptr_t)r3d_p(sc[i]) & 15u))
             return R3D_NO(RAD_E_ALIGN);
         const unsigned lrun = (unsigned)((w[i]->dtype >> 22) & 15u);
-        if (lrun < 4 || rows[i] % (long long)(1u << lrun)) return R3D_NO(RAD_E_SHAPE);
+        if (is_trellis(f.kind) && (lrun < 4 || rows[i] % (long long)(1u << lrun)))
+            return R3D_NO(RAD_E_SHAPE);
         Cls& c = head.c[head.n++];
         c.b = (const uint8_t*)r3d_p(w[i]);
         c.bs = (const uint8_t*)r3d_p(sc[i]);
         c.ids = (const int32_t*)r3d_p(id[i]);
         c.N = (int)rows[i];
-        c.run_tiles = (1u << lrun) / 16u;
+        c.run_tiles = is_trellis(f.kind) ? (1u << lrun) / 16u : 0u;
         c.bits = f.bits;
         c.scale = f.scale;
         const int tiles = (int)(rows[i] / 16);

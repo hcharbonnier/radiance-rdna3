@@ -212,7 +212,12 @@ int mt_for(int M) {
 /* ------------------------------------------------------------------ the shim */
 
 bool form_supported(const Form& f) {
-    /* W0: the computed trellis, L = 16, one scale a row or a bf16 scale a (row, 128). */
+    /* W0: the computed trellis, L = 16, one scale a row or a bf16 scale a (row, 128). W15 adds
+     * the rotated int8 grid (kSigned, 8 bits) under a bf16 scale a (row, 128): the same decoded
+     * lane the trellis uses, so one row accepts both forms of a geometry. */
+    if (f.kind == kSigned)
+        return f.bits == 8 && f.scale == kBf16 && f.lv == 0 && f.L == 0 && f.lrb == 0 &&
+               built(kernel_word(word(f)));
     return f.kind == kTrellisMad && f.L == 16 && f.lrb == 0 &&
            (f.scale == kRowF32 || f.scale == kBf16) && f.bits >= 2 && f.bits <= 7;
 }
@@ -232,9 +237,9 @@ static int launch_fused(const int8_t* a, const float* as, const uint8_t* b, cons
 
 using namespace r3d_iqr;
 
-#define R3D_IQR_GATED_MT_CASE(B, SC)                                                              \
+#define R3D_IQR_GATED_MT_CASE(KIND, B, SC)                                                        \
     do {                                                                                          \
-        using F = FormT<kTrellisMad, B, 0, 16, 0, SC>;                                             \
+        using F = FormT<KIND, B, 0, KIND == kTrellisMad ? 16 : 0, 0, SC>;                         \
         switch (mt) {                                                                             \
             case 1:  return launch_fused<F, 1>(A_, AS_, B_, S_, Q_, SC_, OB_, M, N, K, ap, y_ld,  \
                                                act, run_tiles, stream);                            \
@@ -301,7 +306,8 @@ int r3d_rad_gemm_nt_q_iqr_gated(const RadArgs* a, RadStream s) {
     if (kernel_word(B->dtype) != kernel_word(BS->dtype)) return R3D_NO(RAD_E_DTYPE);
     if (!form_supported(fw)) return R3D_NO(RAD_E_UNSUPPORTED);
     const unsigned lrun = (unsigned)((B->dtype >> 22) & 15u);
-    if (lrun < 4 || (N % (long long)(1u << lrun))) return R3D_NO(RAD_E_SHAPE);
+    if (is_trellis(fw.kind) && (lrun < 4 || (N % (long long)(1u << lrun))))
+        return R3D_NO(RAD_E_SHAPE);
 
     if (r3d_numel(A) < M * K) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(AS) < M * (K / kGroup)) return R3D_NO(RAD_E_SHAPE);
@@ -331,18 +337,22 @@ int r3d_rad_gemm_nt_q_iqr_gated(const RadArgs* a, RadStream s) {
     float* SC_ = (float*)r3d_wp(SC);
     uint16_t* OB_ = r3d_has(OB) ? (uint16_t*)r3d_wp(OB) : nullptr;
 
-#define R3D_IQR_GATED_SC_CASE(B) do {                                                             \
-        if (fw.scale == kRowF32) { R3D_IQR_GATED_MT_CASE(B, kRowF32); }                           \
-        R3D_IQR_GATED_MT_CASE(B, kBf16);                                                          \
+#define R3D_IQR_GATED_SC_CASE(KIND, B) do {                                                       \
+        if (fw.scale == kRowF32) { R3D_IQR_GATED_MT_CASE(KIND, B, kRowF32); }                     \
+        R3D_IQR_GATED_MT_CASE(KIND, B, kBf16);                                                    \
     } while (0)
 
+    if (fw.kind == kSigned) {
+        if (fw.bits != 8) return R3D_NO(RAD_E_UNSUPPORTED);
+        R3D_IQR_GATED_MT_CASE(kSigned, 8, kBf16);
+    }
     switch (fw.bits) {
-        case 2: R3D_IQR_GATED_SC_CASE(2);
-        case 3: R3D_IQR_GATED_SC_CASE(3);
-        case 4: R3D_IQR_GATED_SC_CASE(4);
-        case 5: R3D_IQR_GATED_SC_CASE(5);
-        case 6: R3D_IQR_GATED_SC_CASE(6);
-        case 7: R3D_IQR_GATED_SC_CASE(7);
+        case 2: R3D_IQR_GATED_SC_CASE(kTrellisMad, 2);
+        case 3: R3D_IQR_GATED_SC_CASE(kTrellisMad, 3);
+        case 4: R3D_IQR_GATED_SC_CASE(kTrellisMad, 4);
+        case 5: R3D_IQR_GATED_SC_CASE(kTrellisMad, 5);
+        case 6: R3D_IQR_GATED_SC_CASE(kTrellisMad, 6);
+        case 7: R3D_IQR_GATED_SC_CASE(kTrellisMad, 7);
         default: return R3D_NO(RAD_E_UNSUPPORTED);
     }
 #undef R3D_IQR_GATED_SC_CASE
