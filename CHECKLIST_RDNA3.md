@@ -1,12 +1,51 @@
 # Checklist de clôture — RDNA3 / Qwen3.8 Flash-Next IQR-V4
 
-État au 2026-11-16, branche `rdna3-iqr`, pointe de code `a772d70` (W14–W17
-fusionnés ; Flash-Next servi, kbench 856/856). Sert à suivre l'avancement ; cocher au fur et à
-mesure et dater la ligne. Le détail des décisions et mesures est dans
+État au 2026-11-16, branche `rdna3-iqr`, pointe `fae6c44` (W20 : contrat
+capacité/étendue corrigé ; Flash-Next et 27B vérifiés dans les deux modes
+kbench, 27B multi-séquence servi). Sert à suivre l'avancement ; cocher au fur et
+à mesure et dater la ligne. Le détail des décisions et mesures est dans
 `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md`, `SUIVI_LOTS_RDNA3.md`,
 `HANDOVER_RDNA3_PHASE7.md` et `FLASH_NEXT_AUDIT.md`.
 
 Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
+
+## Reste à faire — synthèse (2026-11-16)
+
+Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
+(« Prochains lots »), les chiffres dans `TABLEAU_REEL_IDEAL_RDNA3.md`.
+
+**P0 — performance Flash-Next (M2 non tenu : η lien 1,7 % de 2 545 tok/s)**
+- [ ] **R20 `hc_read`** — 1,77 ms à M=1 pour 6,55 Mo de poids (η 0,6 % ; la row
+      documente 18,7 µs) et 0,23 ms par ligne au-delà de M=8 : ~40 % du décodage
+      et 47 % du préfill. Action suivante : `--profile-ops true` sur Flash-Next
+      (temps device par op) pour trancher lecture/décodage/latence, puis
+      corriger. **Feu vert requis** : optimisation noyau en pause.
+- [ ] **W24a `qsa_score`** — 83,4 ms à M=512 (103 GFLOP/s, 2 % du pic), ~4 s par
+      préfill 2 048 (item 3.8).
+
+**P1 — cache multi-tour et couverture MoE**
+- [ ] **R21 tier KV hôte** — écrire `gather_rows`/`scatter_rows` device (u8,
+      fragment 4 128 octets) pour `kv_qsa_bkey` ; le tier est refusé au démarrage
+      (`no device gather/scatter for group 1`), donc pas de cache durable,
+      200k impossible.
+- [ ] **R22 snapshots multi-agents** — 0 % de cache servi en rejeu agent
+      (`no_snapshot` ×4, 1 checkpoint/5 tours) ; revoir `geometric-backoff` et la
+      rétention des snapshots.
+- [ ] **R23 tables MoE** — kbench ne pose pas les tables du conteneur (110 cas
+      sautés) ; aligner les tags de format ou passer par une fixture
+      `--record`, puis remplir le temps par row MoE et η lien par noyau.
+- [ ] 2.11/2.12 — formes mixtes par couche et rows `mod4` (seulement si `tp=4`).
+
+**P2 — couverture, doc, clôture**
+- [ ] 5.5 R9 — modèle non-IQR absent de l'hôte (dérogation écrite, à reprendre
+      si un conteneur 2B/4B arrive) ; 4bis.5 vision seulement si la cible inclut
+      l'image (rebuild `RAD_WITH_FFMPEG`).
+- [ ] 5.6 — décider l'ajout de `RAPPORT_RDNA3.md` au dépôt (à jour, hors dépôt).
+- [ ] 1.5 / 5.7 / 8.6 — `docs/OPS.md`, `libr3d/README.md`, limites connues ;
+      2.9 doc de la row MoE ; 3.9 doc des cinq ops QSA.
+- [ ] 8.7 — handover final de phase.
+- [ ] 6.1–6.6 — optimisations différées (non bloquantes).
+- Hors v1 : 7.1 MTP/spéculation, codebook `w4nl` dans `w4a8`.
 
 ## 0. Déjà clos (pour situer le reste)
 
@@ -30,6 +69,18 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 - [x] M1 — 27B texte : décodage 28,4 tok/s (16 tok), 21,2 (819), préfill 301
 - [x] M7 (dense) — tableau rempli pour les rows denses
 - [x] ADR-1 à ADR-6 — écrits dans `docs/adr/`
+- [x] W16/W17 — Flash-Next servi par `libr3d` seul ; tête `logits_gemm_bf16`
+      (échelle 1×128) et formes QSA ; kbench 856/856, 0 divergence
+- [x] W18 — mesures à froid HC/PLE/QSA par row ; η lien calculé (1,7 %)
+- [x] W19 — démo M6 (prompts, 1/4/6 séquences, cache, contention, 16k),
+      robustesse étendue, rejeu 27B et R3 (chargement 2,7 s)
+- [x] W20 — contrat capacité/étendue : R24 corrigé, même faute corrigée dans
+      3 rows router, mode `kbench --band-capacity`, test device épinglé
+- [x] M3 (QSA) — équivalent au dense, 4 ops device vertes
+- [x] M4 — coûts HC/PLE/QSA documentés (MoE par row bloqué, cf. R23)
+- [x] M5 / M6 — Flash-Next texte 1/4/6 séquences, 8k et 16k, démo et
+      robustesse ; deux limites documentées (R21, R22)
+- [!] M2 — η lien **1,7 %** contre 80 % : cause mesurée (`hc_read`), lot W21
 
 ## 1. W1/W2 — formes IQR restantes (prérequis MoE)
 
@@ -38,34 +89,37 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 - [x] 1.2 Formes à ajouter identifiées : **`kSigned` 8** (i8 tourné, tronc),
       **`w4nl`** (table E4M3/64 + f32, tous les `down`, MTP), treillis
       `kTrellisMad` u3/u4/u5 (gate_up, déjà servi), bf16 protégé (déjà servi).
-- [~] 1.3 `form_supported` et noyaux denses : `kTable`/`kGrid` ajoutés et
-      testés (W14), **`kSigned` 8 en cours (W15)**, `w4nl` séparé (2.10).
-- [~] 1.4 Tests device des formes : table/grille couverts ; `kSigned` et `w4nl`
-      à couvrir avec leurs lots.
+- [x] 1.3 `form_supported` et noyaux denses : `kTable`/`kGrid` ajoutés et
+      testés (W14), **`kSigned` 8 livré (W15)**, `w4nl` livré (W15, 2.10).
+- [x] 1.4 Tests device des formes : table/grille, `kSigned` et `w4nl` couverts
+      par leurs lots (W14/W15).
 - [ ] 1.5 Mettre à jour `docs/OPS.md`, `libr3d/README.md` et le tableau des
       tailles de plans pour les formes ajoutées.
 - [x] 1.6 **`kSigned` 8** : `RAD_I8 → kSigned, B=8`, `X(kSigned,8,0,0,0,kBf16)`
       dans `R3D_IQR_FORMS`, acceptation dans les trois familles, décodage i8
       direct, bandes mixtes `kSigned`+`kTrellisMad`. Agent W15 dédié.
-- [~] 1.7 Vérifier l'agrégation par bande : une row qui accepte les deux formes
-      couvre `N=512 K=2560` et `N=2560 K=6144` (MTP 48).
+- [!] 1.7 Vérifier l'agrégation par bande : une row qui accepte les deux formes
+      couvre `N=512 K=2560` et `N=2560 K=6144` (MTP 48). **Hors v1** : MTP 48
+      n'est pas servi (ADR-6), la bande n'existe pas dans le conteneur servi.
 
 ## 2. W5 — MoE IQR / jalon M2 (~4 semaines, chemin critique)
 
-- [~] 2.1 **Référence hôte** de `moe_gemm_iqr` (R4) : `tests/iqr_ref.h` +
-      `tests/moe_iqr_test.cpp` écrits ; la comparaison carte échoue encore
-      (`RAD_E_UNSUPPORTED`, écarts top-k/parts) — agent d'intégration en cours.
+- [x] 2.1 **Référence hôte** de `moe_gemm_iqr` (R4) : `tests/iqr_ref.h` +
+      `tests/moe_iqr_test.cpp` écrits et **réconciliés en W14** (10 formes,
+      0 écart, tolérance 2 ulp).
 - [x] 2.2 Row `moe_gemm_iqr` déclarée (`libr3d/r3d_moe_iqr.hip`), schéma
       `moe_gemm_q`, classes paires/impaires, scratch.
 - [x] 2.3 Run map : tri des lignes, portée par expert, bande ≤ 16 lignes et
       préfill (`moe_iqr_device_test` 15/15 vert).
 - [x] 2.4 Noyau par expert, tuile de 16 lignes, résidence en préfill.
-- [~] 2.5 Mélange de formes : treillis servi ; **`w4nl` et experts bf16
-      protégés restent à faire** (2.10/2.11).
+- [~] 2.5 Mélange de formes : treillis et **`w4nl` livrés (W15)** ; restent les
+      formes mixtes dans une même couche (2.11) et la couverture des experts
+      bf16 protégés.
 - [x] 2.6 Échelles par expert/ligne/bloc, lignes abandonnées, experts à zéro
       ligne, top-k variable (couvert par `moe_iqr_device_test`).
-- [~] 2.7 Tests : synthétiques verts ; référence hôte en cours de
-      réconciliation ; couche réelle du conteneur à faire après 2.10.
+- [~] 2.7 Tests : synthétiques et référence hôte **réconciliés (W14/W15)** ;
+      la couche réelle du conteneur reste à faire, bloquée par le layout des
+      tables MoE dans kbench (R23).
 - [~] 2.8 Mesure M2 : décodage 1 et 4 séquences, préfill 2048/4096, **η lien
       ≥ 80 %**. Fait à froid le 2026-11-16 : η lien = **1,7 %** (42 tok/s), le
       plafond étant `hc_read` (89 tok/s à lui seul), pas le MoE ; le temps par
@@ -120,10 +174,12 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
       0 divergence** (pire rel_l2 1,2e-2). Tête bf16 corrigée (échelle 1×128,
       rel_l2 0,53 → 1,7e-3) et trois formes QSA alignées. Les 78 cas non
       couverts sont hors v1 (MTP 48, `ngram_hint` sans oracle).
-- [~] 4bis.3 Configuration v1 : `num-speculative-tokens: 0` (MTP hors v1),
+- [x] 4bis.3 Configuration v1 : `num-speculative-tokens: 0` (MTP hors v1),
       `placement: expert_tiered`, `host-pool-mib: 43000`, KV i8,
       **`max_mixed_tok ≤ 2048`** (le plan `score` fait 512 MiB à 2048 lignes,
-      1 Gio à 4096 et le plugin refuse), `max-model-len: 8192`.
+      1 Gio à 4096 et le plugin refuse), `max-model-len: 8192`. Vérifiée en W19
+      (serveur démarré avec ces réglages) ; le tier KV hôte reste refusé
+      (R21), c'est une limite du moteur, pas du réglage.
 - [x] 4bis.4 Texte : 1 séquence (30 / 2290 / 4570 tokens) et 4 séquences
       concurrentes servies ; préfill 42 tok/s, décodage 4,0–4,6 tok/s.
 - [ ] 4bis.5 Image / vision si le conteneur la sert (dépend de 4.6).
@@ -171,9 +227,11 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
       l'hôte** (inventaire vérifié : seuls le 27B IQR et Flash-Next IQR).
       Dérogation documentée dans `SUIVI_LOTS_RDNA3.md` §R9 ; à reprendre dès
       qu'un conteneur non-IQR 2B/4B est présent.
-- [ ] 5.6 Mettre à jour `RAPPORT_RDNA3.md` (hors dépôt aujourd'hui) et décider
-      de son ajout au dépôt.
-- [ ] 5.7 Mettre à jour `docs/OPS.md`, `libr3d/README.md` et les limites connues.
+- [~] 5.6 `RAPPORT_RDNA3.md` **mis à jour** (encadré, §7.3 corrigée, §7.5
+      mesures réelles, §9 révisée) ; reste la **décision d'ajout au dépôt**, qui
+      appartient à l'utilisateur.
+- [ ] 5.7 Mettre à jour `docs/OPS.md`, `libr3d/README.md` et les limites connues
+      (dont le contrat capacité/étendue, aujourd'hui dans `AGENTS.md`).
 
 ## 6. Optimisations différées (non bloquantes pour M5/M6)
 
@@ -204,13 +262,18 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 - [~] 8.3 MoE conforme (treillis + `w4nl` + bf16 protégé, écart borné documenté)
       ; le **η lien ≥ 80 %** est mesuré et **non tenu** (1,7 %) — cause
       identifiée (`hc_read`, 47 % du préfill), pas le MoE ; le temps par row MoE
-      reste non mesurable sur ce conteneur.
+      reste non mesurable sur ce conteneur (R23, lot W23).
 - [x] 8.4 QSA identique à la référence et égal au dense sous le seuil (781/819
       checks, kbench 0 divergence).
 - [~] 8.5 Tableau réel/idéal complet, écarts expliqués, RAPPORT à jour :
       Flash-Next, kbench, HC/PLE et QSA par row faits à froid ; η lien calculé ;
-      MoE par row bloqué par le format des tables du conteneur.
-- [ ] 8.6 Documentation des rows, architectures, limites et perf à jour.
+      MoE par row bloqué par le format des tables du conteneur ; reste la
+      décision d'ajout du RAPPORT au dépôt (5.6).
+- [ ] 8.6 Documentation des rows, architectures, limites et perf à jour
+      (`docs/OPS.md`, `libr3d/README.md`).
+- [ ] 8.7 Handover final (phase suivante) et journal à la date de clôture ; le
+      handover courant (`HANDOVER_RDNA3_PHASE7.md` §8) couvre la reprise
+      immédiate.
 - [ ] 8.7 Handover final (phase suivante) et journal à la date de clôture.
 
 ## 9. Ordre de marche suggéré (parallélisable)

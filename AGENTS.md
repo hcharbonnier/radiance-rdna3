@@ -16,6 +16,52 @@
 - Accès SSH, droits, specs de l'hôte et contraintes d'inférence distante :
   voir `API_DISTANTE.md` (référence pour tout travail GPU distant).
 
+## Consignes de travail
+
+- **Autonomie** : continuer jusqu'à un jalon (si vraiment important), une décision à prendre ou une
+  autorisation à obtenir. Ne pas s'arrêter pour un progrès routinier, et ne pas
+  demander confirmation d'une action déjà autorisée.
+- **Outils** : pour lire, éditer ou créer des fichiers **locaux**, utiliser les
+  outils natifs (`read`, `edit`, `write`, `glob`, `grep`) plutôt que le shell.
+  Le shell sert aux builds, tests, git, SSH et au GPU. Les scripts temporaires
+  vont dans `%TEMP%\kilo` (Windows) ou `/tmp` (hôte), pas dans le dépôt.
+- **Sous-agents et parallélisme** :
+  - **Implémentation de code parallélisable** → **Agent Manager**
+    (`agent_manager`, mode `worktree`), à privilégier. **Aucune limite** sur le
+    nombre d'agents : découper selon les zones de code indépendantes (pas de
+    plafond à 3 ou 4).
+  - **Tout travail parallélisable qui n'est pas de l'implémentation** (validation,
+    campagnes de tests, mesures, exploration, doc) **sur la branche courante** →
+    outil `task` uniquement, **jamais** Agent Manager.
+  - **Chaque agent Agent Manager relit son propre travail** (`/review worktree`)
+    avant de conclure, puis **corrige lui-même** les bugs qu'il a trouvés et
+    revérifie. Un agent qui délègue sans relecture n'a pas terminé.
+  - Ne pas créer de session Agent Manager pour du non-code ; une réponse à un
+    message inter-agents se fait via `agent_manager` avec le `replyTo` fourni.
+  - Un seul travail GPU à la fois sur l'hôte (voir `flock`) : le parallélisme
+    porte sur le code et les tests hôte, pas sur des runs carte concurrents.
+- **Décisions de contrat** : avant de durcir ou d'assouplir le contrat d'une row,
+  lire l'implémentation de référence RDNA4 (`libr4d/`) : c'est elle qui a servi
+  à fabriquer les conteneurs. Un contrôle qui n'est pas dans le schéma de la row
+  est un bug de la row, pas du moteur.
+- **Optimisation noyau** : ne pas démarrer de travail d'optimisation sans feu
+  vert explicite de l'utilisateur. Une correction de bug de contrat (comme R24)
+  n'est pas de l'optimisation et peut être faite sans attendre.
+- **Commit** : seulement sur demande explicite, en séparant code et docs
+  (style du dépôt : `libr3d: ...`, `docs: ...`), sans `.gitignore` ni documents
+  hors dépôt. Jamais de push sans demande.
+- **Mesures** : donner le chiffre, la commande et l'état de la carte ; un chiffre
+  throttlé (PPT0/PPT1) est invalide. Comparer à la borne (plancher de lancement,
+  débit mémoire) et pas seulement entre versions.
+- **Arbres hôte** : `w15-main` est l'état `a772d70`, `w20-r24` l'état corrigé
+  (W20). Tout A/B se fait dans un **nouveau** répertoire avec un build neuf.
+- **Documents** : handover courant `HANDOVER_RDNA3_PHASE7.md` ; état détaillé
+  `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md`, `SUIVI_LOTS_RDNA3.md`,
+  `CHECKLIST_RDNA3.md`. `RAPPORT_RDNA3.md`, `PLAN_IMPLEMENTATION_RDNA3.md`,
+  `API_DISTANTE.md` et `HANDOVER_RDNA3.md` restent hors dépôt.
+- **Langue** : documentation et rapports en français ; code et commentaires de
+  code en anglais.
+
 ## Tester un kernel et ses performances : `rad-kbench`
 
 `rad-kbench` (`tools/rad_kbench.cpp`) est l'outil de référence. Il charge les
@@ -123,8 +169,14 @@ flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
   ./build/bin/r3d_selftest ./build/radiance_home/kernels/libr3d.so'
 ```
 
-État de référence de la branche : **159 rows, 0 échec, 15 skips** ;
-`kbench` Flash-Next : **856/856, 0 échec, 0 divergence**.
+État de référence de la branche (W20, commit `fae6c44`) : **159 rows, 0 échec,
+15 skips** ; `kbench` Flash-Next **856/856** et 27B **605/605**, 0 échec,
+0 divergence, **dans les deux modes** (défaut et `--band-capacity`). Test de
+contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band`.
+
+Recette 27B (dense, IQR) : `--kv-cache-dtype i8 --num-speculative-tokens 0`
+(le drafter h128 fenêtré réclame bf16), `--max-num-seqs 4` — le multi-séquence
+est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill ≈ 318 tok/s).
 
 ## Pièges connus
 
@@ -134,4 +186,8 @@ flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
   (`readlink /proc/<pid>/exe`).
 - Les rows MTP 48 et `ngram_hint` sont hors v1 : leurs cas « Not covered » ne
   sont pas des régressions.
+- Le paramètre rangé d'une row (`M`) est un **plafond de bande**, jamais le
+  nombre de lignes du pas : l'étendue est sur les tenseurs. Une row qui compare
+  les deux casse le multi-séquence du moteur (bug R24, corrigé en W20) ;
+  `--band-capacity` couvre cette classe.
 - Ne pas lancer deux benchmarks ou un benchmark pendant qu'un agent teste.

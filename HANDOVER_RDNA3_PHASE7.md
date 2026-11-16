@@ -1,7 +1,8 @@
-# Handover — RDNA3, phase 7 (W14–W17 livrés)
+# Handover — RDNA3, phase 7 (W14–W20 livrés)
 
-2026-11-16. Branche `rdna3-iqr`, pointe de code `a772d70`. Ce document remplace
-`HANDOVER_RDNA3_PHASE6.md` pour l'état courant.
+2026-11-16. Branche `rdna3-iqr`, pointe `fae6c44` (W20 : contrat
+capacité/étendue). Ce document remplace `HANDOVER_RDNA3_PHASE6.md` pour l'état
+courant ; §8 donne la reprise immédiate.
 
 ## 1. État vérifié
 
@@ -9,7 +10,9 @@
 |---|---|
 | `r3d_selftest` complet | **159 rows, 0 échec, 15 skips** |
 | Tests device | `iqr_device_test`, `logits_bf16_device_test`, 4 tests QSA, `moe_iqr_test`, `moe_iqr_device_test`, `moe_w4nl`, `kv_store_b4`, `rope` h128, router, `gemm_nt` N=1, vision, GDN had : **tous verts** |
-| kbench Flash-Next (`--kernels libr3d:libref`) | **856/856, 0 échec, 0 divergence**, pire rel_l2 1,2e-2 |
+| kbench Flash-Next (`--kernels libr3d:libref`) | **856/856, 0 échec, 0 divergence**, pire rel_l2 1,2e-2 ; **856/856 aussi en `--band-capacity`** (W20) |
+| kbench 27B | **605/605, 0 échec** dans les deux modes (W20), pire rel_l2 3,6e-3 |
+| Contrat capacité (W20) | `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` : rouge sur `a772d70`, vert sur `fae6c44` |
 | Mesures à froid W18 (HC/PLE/QSA par row) | 182 + 147 cas, 0 échec ; `hc_read` **1,77 ms à M=1** (η 0,6 %), η lien **1,7 %**, MoE par row bloqué (format du conteneur) |
 | Démo serveur M6 / W19 | préfill 38,7–41,9 tok/s, décodage 4,41 (1 séq.) / 15,5 (4) / 22,1 (6) tok/s ; cache ×12 sur prompt identique, **0 % en rejeu agent** ; **tier KV hôte refusé** ; 4 décodeurs ×7,0 à côté d'un préfill |
 | Rejeu 27B / W19–W20 | chargement 15,87 GiB en 2,7 s ; `SEQS=1` préfill 318,8 tok/s (844), décodage 23,2 / 29,4 ; **`SEQS=4` corrigé** (W20) : préfill 317,5 tok/s, 4 requêtes à 67,3 tok/s agrégés |
@@ -18,7 +21,7 @@
 | Flash-Next texte | préfill 42 tok/s (2 290 et 4 570 tok), décodage 4,0–4,6 tok/s, 4 séquences concurrentes OK |
 | Robustesse Flash-Next | prompt 12 001 tok → HTTP 400 clair, serveur vivant ; redémarrages propres |
 
-## 2. Ce que W14–W17 ont livré
+## 2. Ce que W14–W20 ont livré
 
 - **QSA complet** : `qsa_work`, `qsa_block_key`, `qsa_score`, `qsa_select`
   (plus `tail_store`), tests libref ; formes alignées sur libref (`nsel`
@@ -40,6 +43,15 @@
 - **W17** : tête `logits_gemm_bf16` — échelle par ligne `1x128` indexée comme
   une grille 128×128 (rel_l2 0,53 → **1,7e-3**) ; formes QSA. Nouveau test
   `logits_bf16_device_test`.
+- **W18** : mesures à froid HC/PLE/QSA par row, 0 échec, sans throttler ;
+  η lien calculé (1,7 %) et cause attribuée à `hc_read`.
+- **W19** : démo M6 (prompts distincts, 1/4/6 séquences, cache de préfixe,
+  contention, 16k), robustesse étendue, rejeu 27B (R3 clos).
+- **W20** : **contrat capacité/étendue** (R24) — le paramètre rangé d'une row est
+  un plafond de bande, l'étendue est sur les tenseurs. Corrigé dans
+  `logits_gemm_vocab_iqr` et dans `router_topk`, `router_topk_scatter`,
+  `router_sigmoid_topk` (trouvés par le nouveau `kbench --band-capacity`).
+  Test device épinglé ; 27B multi-séquence servi (67,3 tok/s agrégés).
 
 ## 3. Flash-Next — configuration v1
 
@@ -107,6 +119,13 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
   pas d'une grille supposée.
 - **kbench « Not covered »** : les 78 cas MTP/`ngram_hint` ne sont pas des
   régressions.
+- **Paramètre rangé = capacité** : `M` dans les args est le plafond de la bande
+  (`max_seqs × (1 + spec)`), jamais le nombre de lignes du pas ; l'étendue est
+  sur les tenseurs. Une row qui compare les deux refuse un pas plus étroit que sa
+  bande et le moteur arrête le modèle (R24). Tester avec `--band-capacity`.
+- **Tier KV hôte** : refusé au démarrage (« no device gather/scatter for group
+  1 ») ; ne pas conclure à une mauvaise configuration, c'est une row manquante
+  (R21).
 
 ## 6. Reste à faire
 
@@ -180,3 +199,40 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
 `API_DISTANTE.md`, `HANDOVER_RDNA3.md`, `PLAN_IMPLEMENTATION_RDNA3.md`,
 `RAPPORT_RDNA3.md` et `external-docs/` restent hors dépôt (déjà untracked ;
 PDF ISA AMD sous copyright).
+
+## 8. Pour l'agent suivant
+
+Lire, dans cet ordre : ce fichier, `CHECKLIST_RDNA3.md` § « Reste à faire —
+synthèse », `SUIVI_LOTS_RDNA3.md` § « Prochains lots », puis
+`TABLEAU_REEL_IDEAL_RDNA3.md` § Flash-Next et § M6. `AGENTS.md` porte le
+protocole kbench et les consignes de travail.
+
+**Où en est le programme.** Le périmètre v1 est livré et vérifié : Flash-Next
+texte et 27B servis, kbench 856/856 et 605/605 dans les deux modes. Ce qui reste
+n'est plus de la faisabilité mais de la performance, de la couverture et de la
+doc. Ne pas rouvrir les contrats clos (R17–R19, R24) sans une mesure qui les
+contredit.
+
+**Ordre de travail recommandé.**
+
+1. **W21 `hc_read` (R20)** — le seul levier majeur : 1,77 ms à M=1 (η 0,6 %) et
+   0,23 ms/ligne, ~40 % du décodage et 47 % du préfill. Commencer par
+   `--profile-ops true` (temps device par op) sur Flash-Next ; la forme
+   deux-grilles et la température sont déjà écartées. **Demander le feu vert**
+   avant de toucher au noyau.
+2. **W22 cache (R21, R22)** — rows `gather_rows`/`scatter_rows` device pour
+   `kv_qsa_bkey` afin d'activer le tier KV hôte, puis snapshots en rejeu
+   multi-agents. C'est ce qui débloque 200k et le multi-tour long.
+3. **W23 MoE (R23)** — poser les tables du conteneur dans kbench (tags de format
+   ou fixture `--record`), puis mesurer le temps par row et l'η lien par noyau.
+4. **W24 QSA et doc** — `qsa_score` à M=512, doc OPS/README, décision sur
+   `RAPPORT_RDNA3.md`, handover final.
+
+**Décisions qui appartiennent à l'utilisateur** : (1) feu vert pour
+l'optimisation noyau (W21) ; (2) autorisation d'écrire les rows du tier KV
+(W22) ; (3) ajout de `RAPPORT_RDNA3.md` au dépôt ; (4) vision, seulement si la
+cible l'inclut.
+
+**Discipline de mesure.** Un chiffre sans commande, sans horloge et sans état de
+la carte ne compte pas. Carte froide, `flock`, un seul processus, build neuf pour
+tout A/B, serveur arrêté avant reconstruction, `/proc/<pid>/exe` vérifié.
