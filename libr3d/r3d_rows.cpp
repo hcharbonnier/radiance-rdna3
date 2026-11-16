@@ -1597,9 +1597,16 @@ static const RadConstraint cMlaAttnPaged[] = {
 
 /* The 27B bands: an int8 slot cache at head_dim 256 and 16-token pages, the cos/sin table the
  * fused prologue reads (rot 64, theta 1e7, 64 rows), and imrope with Qwen3-VL's 11 11 10
- * sections at 24 query heads over 4 KV heads. */
+ * sections at 24 query heads over 4 KV heads.
+ *
+ * Flash-Next's 13 attention layers page the same int8 slot cache at 4 tokens a block
+ * (FLASH_NEXT_AUDIT.md §7.2: head_dim 256, n_head_kv 2, block_size 4, M 4096). The store's
+ * addressing already reads block_size as an argument, so the band is a second row over the same
+ * entry points, not a second kernel: the 16-token row and its bytes stay as they were. */
 static const RadConstraint cKvI8[] = { C_IN("kv_dtype", "i8"), C_EQ("head_dim", 256),
                                        C_EQ("block_size", 16) };
+static const RadConstraint cKvI8B4[] = { C_IN("kv_dtype", "i8"), C_EQ("head_dim", 256),
+                                         C_EQ("block_size", 4) };
 static const RadConstraint cRopeTableF32[] = { C_IN("dtype", "f32"), C_EQ("rot", 64),
                                                C_GE("M", 1), C_LE("M", 64) };
 /* The 27B calls imrope once for q (24 heads, no KV) and once for k (4 heads, no KV); the fused
@@ -3912,6 +3919,20 @@ static const RadKernelInfo kKernels[] = {
   "bf16 k and v, i32 slot_mapping, i8 cache with per-slot f16 K/V scales",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cKvI8), NOTUNE,
+  nullptr, nullptr, r3d_rad_kv_store, nullptr, nullptr, nullptr, r3d_shape_kv_store_i8 },
+
+/* Flash-Next's 4-token pages: the same int8 slot layout and quantisation as `kv_store_i8`, with
+ * the slot split by 4 rather than 16. Kept a separate row because the block size is part of the
+ * KV group's geometry; the kernel is the same one, so a slot's bytes are unchanged. */
+{ "kv_store_i8_b4", "kv_store", "attn",
+  "K and V into an int8 paged cache at 4-token pages: each head stores 256 K codes, 256 V codes "
+  "and the two f16 scales, the scale the head's absmax / 127 rounded to f16 and the codes "
+  "round(x/scale)",
+  "head_dim 256; block_size 4; a wave a (token, KV head); a negative slot skipped; a zero head "
+  "stores scale 0 and codes 0",
+  "bf16 k and v, i32 slot_mapping, i8 cache with per-slot f16 K/V scales",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cKvI8B4), NOTUNE,
   nullptr, nullptr, r3d_rad_kv_store, nullptr, nullptr, nullptr, r3d_shape_kv_store_i8 },
 
 { "rope_table_f32", "rope_table", "attn",

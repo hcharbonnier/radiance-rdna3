@@ -180,7 +180,7 @@ endif()
 if(TARGET libr3d AND RAD_HIP_FOUND)
   set(RAD_TESTS_WITH_R3D_DEVICE iqr_device_test ple_hc_device_test qsa_block_key_device_test
                                 qsa_score_device_test qsa_select_device_test qsa_work_device_test
-                                moe_iqr_device_test moe_iqr_test)
+                                moe_iqr_device_test moe_iqr_test kv_store_b4_device_test)
   set(RAD_TESTS_WITH_R3D_HOST hc_layout_test)
 else()
   list(FILTER RAD_TESTS EXCLUDE REGEX "/iqr_device_test\\.cpp$")
@@ -191,6 +191,7 @@ else()
   list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_select_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_work_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/moe_iqr_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/kv_store_b4_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/hc_layout_test\\.cpp$")
 endif()
 foreach(t ${RAD_TESTS})
@@ -378,7 +379,8 @@ if(RAD_HIP_FOUND)
   # The IQR GEMM, the PLE/HC ladder, the QSA rows and the routed IQR GEMM against their host
   # references, on the card the library was built for.
   foreach(n iqr_device_test ple_hc_device_test qsa_block_key_device_test qsa_score_device_test
-            qsa_select_device_test qsa_work_device_test moe_iqr_device_test moe_iqr_test)
+            qsa_select_device_test qsa_work_device_test moe_iqr_device_test moe_iqr_test
+            kv_store_b4_device_test)
     if(TARGET ${n})
       add_test(NAME ${n}_card COMMAND ${n})
       set_tests_properties(${n}_card PROPERTIES
