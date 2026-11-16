@@ -9,6 +9,15 @@ gfx1036. Modèle : `<work-root>/models/qwen3.8-next-flash-iqr-v4.rad`,
 Ce document est un audit. Aucun code produit n'a été ajouté au dépôt, le modèle et
 `data/` n'ont pas été modifiés, et aucun benchmark de performance n'a été lancé.
 
+> **Mise à jour du périmètre (2026-11-16, ADR-7).** Les conclusions de périmètre
+> de cet audit ne sont plus celles du programme : la **vision** et le **MTP de
+> Flash-Next** entrent dans la cible. Les constats de forme restent exacts (au
+> moment de l'audit, `mtp_enter` et `logit_rerank` n'avaient aucune row
+> `libr3d`), mais ils deviennent le travail du lot W25 (deux rows MTP +
+> couverture kbench), et non une exclusion. Côté vision, `gemm_nt_bias_bf16` et
+> `grid_embed_bf16` ont été livrées depuis (W15) ; il ne manque que le décodage
+> média (build FFMPEG, lot W26).
+
 ## 0. Résumé exécutif
 
 - Le conteneur est bien un Flash-Next : 48 couches dont 12 `full_attention` (3, 7, …,
@@ -307,7 +316,8 @@ Les rows MoE existantes sont :
 
 `gemm_nt_bias` et `grid_embed` sont les ops de la tour vision ; elles n'ont pas de row
 device dans ce build, même si W10 annonce 142 rows vision vertes. `mtp_enter` et
-`logit_rerank` sont hors périmètre v1 (ADR-6) mais présents dans le conteneur.
+`logit_rerank` n'avaient pas de row device au moment de l'audit ; l'ADR-7
+(2026-11-16) les remet dans la cible, et leur écriture est le lot W25.
 
 ## 5. MoE IQR : formes, tailles, experts protégés
 
@@ -488,10 +498,10 @@ Points importants :
 | `router_gemm_topk_scatter` | `M<=64`, `n_expert=512`, `top_k=10`, `protect`, bf16 | hôte seulement | row device fusionnée, ou garder la paire `router_gemm` + `router_topk_scatter` |
 | `gemm_nt` | `N=1`, `K=2560`, `M=2048` (shared gate, préfill) | hôte seulement | row GEMV préfill, ou padding N |
 | `gemm_nt_q` | i8 simple tourné, bandes `N=512/1280/2560/…` | hôte seulement | aucune nouvelle row : étendre `gemm_iqr_*` à `kSigned` 8 |
-| `gemm_nt_bias` | vision | hôte seulement | row device vision |
-| `grid_embed` | vision | hôte seulement | row device vision |
-| `mtp_enter` | MTP | hôte seulement | hors v1 (désactiver la spéculation) |
-| `logit_rerank` | MTP | hôte seulement | hors v1 |
+| `gemm_nt_bias` | vision | aucune row à l'audit (livrée W15 : `gemm_nt_bias_bf16`) | — (reste le décodage média, W26) |
+| `grid_embed` | vision | aucune row à l'audit (livrée W15 : `grid_embed_bf16`) | — (reste le décodage média, W26) |
+| `mtp_enter` | MTP | hôte seulement | row device à écrire (ADR-7, W25) |
+| `logit_rerank` | MTP | hôte seulement | row device à écrire (ADR-7, W25) |
 
 ### 7.3 Ce qui est déjà servi
 
@@ -519,11 +529,15 @@ Points importants :
    experts `w4nl` (tous les `down`, plus le MTP). Sans la row `w4nl`, ces 25 590
    poids tombent sur `libavx` ou ne se déclarent pas. La case §7.2 doit être
    rouverte pour Flash-Next, sinon le modèle ne peut pas être servi par `libr3d`.
-4. **MTP hors v1.** `mtp_enter` et `logit_rerank` n'ont pas de row device. Le
-   conteneur demande 3 tokens de spéculation. Il faut `num-speculative-tokens: 0`
-   pour le run v1, ce qui retire aussi la couche 48 et ses poids `w4nl`/IQR.
-5. **Vision.** `gemm_nt_bias` et `grid_embed` n'ont pas de row device. Si §4.3
-   (image) est requis, W10 n'est pas suffisant pour ce conteneur.
+4. **MTP — dans la cible depuis l'ADR-7.** `mtp_enter` et `logit_rerank` n'ont
+   pas de row device. Le conteneur demande 3 tokens de spéculation ; tant que
+   les deux rows manquent, le run garde `num-speculative-tokens: 0`, ce qui
+   retire aussi la couche 48 et ses poids `w4nl`/IQR. Les experts du MTP 48
+   sont déjà servis (`moe_gemm_w4nl`).
+5. **Vision — dans la cible depuis l'ADR-7.** `gemm_nt_bias` et `grid_embed`
+   n'avaient pas de row device à l'audit ; elles sont servies depuis W15
+   (`gemm_nt_bias_bf16`, `grid_embed_bf16`), comme `attn_dense` hd72. Ce qui
+   manque est le décodage média : rebuild avec FFMPEG et un tour image (W26).
 6. **`moe_gemm_iqr` n'a pas de référence hôte** (R4) : `libref` n'implémente pas
    la row. Il faut la référence avant de valider le noyau device, comme prévu en
    W5.
@@ -567,8 +581,9 @@ Points importants :
 8. **`router_gemm_topk_scatter`** device avec `protect` (décodage), ou accepter
    deux lancements `router_gemm` + `router_topk_scatter` déjà servis.
 9. **`gemm_nt` N=1 préfill** (shared gate) : row GEMV ou padding N.
-10. **Vision** `gemm_nt_bias` / `grid_embed` si §4.3 ; **MTP** `mtp_enter` /
-    `logit_rerank` seulement si la spéculation revient dans le périmètre.
+10. **Vision** : `gemm_nt_bias`/`grid_embed` servies depuis W15, reste le
+    décodage média (W26) ; **MTP** `mtp_enter` / `logit_rerank` (W25) — les deux
+    sont dans la cible depuis l'ADR-7.
 
 ## 10. Réponse courte
 
@@ -587,5 +602,6 @@ Points importants :
 9. 10 experts bf16 protégés (34: 407/496 ; 44: 292/350 ; 46: 290/392 ;
    47: 122/143/399/445) sont servis par `moe_gemm_bf16`, mais leur layer émet
    aussi IQR + w4nl.
-10. Risques : `w4nl` hors v1, MTP/vision hors v1, plan QSA 512 Mio au contexte
-    natif, et graphe obtenu avec deux contournements de debug.
+10. Risques : plan QSA 512 Mio au contexte natif, graphe obtenu avec deux
+    contournements de debug ; `w4nl`, MTP et vision ne sont plus des exclusions
+    (ADR-7) mais du travail (W25, W26, checklist §7.2).

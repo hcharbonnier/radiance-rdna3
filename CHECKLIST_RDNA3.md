@@ -3,10 +3,12 @@
 État au 2026-11-16, branche `rdna3-iqr`, pointe `7338226` (R21 : rows u8
 `gather_rows`/`scatter_rows`, tier KV hôte actif ; l'état W20 856/856 et
 605/605 reste la référence, `gather_rows`/`scatter_rows` re-mesurés 48/48 et
-84/84 sans divergence). Sert à suivre l'avancement ; cocher au fur et à mesure
+84/84 sans divergence). **Périmètre révisé le 2026-11-16** : la vision et le
+MTP de Flash-Next entrent dans la cible (ADR-7, qui supersède l'ADR-6), suivis
+en R25 et R26. Sert à suivre l'avancement ; cocher au fur et à mesure
 et dater la ligne. Le détail des décisions et mesures est dans
 `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md`, `SUIVI_LOTS_RDNA3.md`,
-`HANDOVER_RDNA3_PHASE7.md` et `FLASH_NEXT_AUDIT.md`.
+`HANDOVER_RDNA3_PHASE7.md`, `FLASH_NEXT_AUDIT.md` et `docs/adr/`.
 
 Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 
@@ -24,25 +26,32 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [ ] **W24a `qsa_score`** — 83,4 ms à M=512 (103 GFLOP/s, 2 % du pic), ~4 s par
       préfill 2 048 (item 3.8).
 
-**P1 — cache multi-tour et couverture MoE**
+**P1 — cache multi-tour, périmètre servi, couverture MoE**
 - [ ] **R22 snapshots multi-agents** — 0 % de cache servi en rejeu agent
       (`no_snapshot` ×4, 1 checkpoint/5 tours) ; revoir `geometric-backoff` et la
       rétention des snapshots.
 - [ ] **R23 tables MoE** — kbench ne pose pas les tables du conteneur (110 cas
       sautés) ; aligner les tags de format ou passer par une fixture
       `--record`, puis remplir le temps par row MoE et η lien par noyau.
+- [ ] **R25 MTP Flash-Next (ADR-7)** — écrire `mtp_enter` et `logit_rerank`
+      en device dans `libr3d` (mêmes contrats que `libr4d`), puis servir avec
+      `num-speculative-tokens > 0`, couvrir les cas MTP 48 de kbench et mesurer
+      le gain de décodage. Le 27B reste à 0 (drafter h128 en bf16).
+- [ ] **R26 vision servie (ADR-7)** — rebuild `-DRAD_WITH_FFMPEG=ON`, corpus
+      d'images sur l'hôte, un tour image de bout en bout, `capabilities.image`
+      à vrai.
 - [ ] 2.11/2.12 — formes mixtes par couche et rows `mod4` (seulement si `tp=4`).
 
 **P2 — couverture, doc, clôture**
 - [ ] 5.5 R9 — modèle non-IQR absent de l'hôte (dérogation écrite, à reprendre
-      si un conteneur 2B/4B arrive) ; 4bis.5 vision seulement si la cible inclut
-      l'image (rebuild `RAD_WITH_FFMPEG`).
+      si un conteneur 2B/4B arrive).
 - [ ] 5.6 — décider l'ajout de `RAPPORT_RDNA3.md` au dépôt (à jour, hors dépôt).
 - [ ] 1.5 / 5.7 / 8.6 — `docs/OPS.md`, `libr3d/README.md`, limites connues ;
       2.9 doc de la row MoE ; 3.9 doc des cinq ops QSA.
 - [ ] 8.7 — handover final de phase.
 - [ ] 6.1–6.6 — optimisations différées (non bloquantes).
-- Hors v1 : 7.1 MTP/spéculation, codebook `w4nl` dans `w4a8`.
+- Hors v1 : codebook `w4nl` dans `w4a8` seulement (MTP et vision sont revenus
+  dans la cible par l'ADR-7).
 
 ## 0. Déjà clos (pour situer le reste)
 
@@ -65,7 +74,8 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       les tests device W15 verts, `moe_iqr_test` et `moe_w4nl` verts.
 - [x] M1 — 27B texte : décodage 28,4 tok/s (16 tok), 21,2 (819), préfill 301
 - [x] M7 (dense) — tableau rempli pour les rows denses
-- [x] ADR-1 à ADR-6 — écrits dans `docs/adr/`
+- [x] ADR-1 à ADR-7 — écrits dans `docs/adr/` (ADR-7 du 2026-11-16 : vision et
+      MTP de Flash-Next dans la cible ; supersède l'ADR-6 et complète l'ADR-5)
 - [x] W16/W17 — Flash-Next servi par `libr3d` seul ; tête `logits_gemm_bf16`
       (échelle 1×128) et formes QSA ; kbench 856/856, 0 divergence
 - [x] W18 — mesures à froid HC/PLE/QSA par row ; η lien calculé (1,7 %)
@@ -101,8 +111,8 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       dans `R3D_IQR_FORMS`, acceptation dans les trois familles, décodage i8
       direct, bandes mixtes `kSigned`+`kTrellisMad`. Agent W15 dédié.
 - [!] 1.7 Vérifier l'agrégation par bande : une row qui accepte les deux formes
-      couvre `N=512 K=2560` et `N=2560 K=6144` (MTP 48). **Hors v1** : MTP 48
-      n'est pas servi (ADR-6), la bande n'existe pas dans le conteneur servi.
+      couvre `N=512 K=2560` et `N=2560 K=6144` (MTP 48). **Requis depuis
+      l'ADR-7** : MTP 48 est servi, donc la bande existe dans le run.
 
 ## 2. W5 — MoE IQR / jalon M2 (~4 semaines, chemin critique)
 
@@ -175,16 +185,22 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [x] 4bis.2c `kbench` de contrôle après W17 : **856/856 cas, 0 échec,
       0 divergence** (pire rel_l2 1,2e-2). Tête bf16 corrigée (échelle 1×128,
       rel_l2 0,53 → 1,7e-3) et trois formes QSA alignées. Les 78 cas non
-      couverts sont hors v1 (MTP 48, `ngram_hint` sans oracle).
-- [x] 4bis.3 Configuration v1 : `num-speculative-tokens: 0` (MTP hors v1),
-      `placement: expert_tiered`, `host-pool-mib: 43000`, KV i8,
-      **`max_mixed_tok ≤ 2048`** (le plan `score` fait 512 MiB à 2048 lignes,
-      1 Gio à 4096 et le plugin refuse), `max-model-len: 8192`. Vérifiée en W19
-      (serveur démarré avec ces réglages) ; le tier KV hôte est actif depuis
-      R21, avec les deux groupes paginés de Flash-Next.
+      couverts étaient les tables MTP 48 et `ngram_hint` : **MTP 48 est
+      exigible depuis l'ADR-7** (R25), `ngram_hint` reste sans oracle et n'est
+      pas une régression.
+- [x] 4bis.3 Configuration v1 : `placement: expert_tiered`, `host-pool-mib:
+      43000`, KV i8, **`max_mixed_tok ≤ 2048`** (le plan `score` fait 512 MiB
+      à 2048 lignes, 1 Gio à 4096 et le plugin refuse), `max-model-len: 8192`.
+      Vérifiée en W19 (serveur démarré avec ces réglages) ; le tier KV hôte est
+      actif depuis R21, avec les deux groupes paginés de Flash-Next. Le
+      `num-speculative-tokens: 0` de l'ADR-6 n'est plus la configuration servie
+      dès que R25 est livré (ADR-7) ; il reste le repli entre-temps.
 - [x] 4bis.4 Texte : 1 séquence (30 / 2290 / 4570 tokens) et 4 séquences
       concurrentes servies ; préfill 42 tok/s, décodage 4,0–4,6 tok/s.
-- [ ] 4bis.5 Image / vision si le conteneur la sert (dépend de 4.6).
+- [ ] 4bis.5 Image / vision : **dans la cible depuis l'ADR-7** (R26) — rebuild
+      `-DRAD_WITH_FFMPEG=ON`, un corpus d'images, un tour image servi, et
+      `capabilities.image` à vrai. La tour elle-même est portée (W10) et ses
+      rows sont vertes.
 - [x] 4bis.6 Robustesse : prompt de 12 002 tokens refusé proprement (HTTP 400,
       message explicite avec le nombre de tokens à couper) et serveur toujours
       vivant ; `max_tokens` hors contexte plafonné à 8 191 (pas de 400) et
@@ -195,9 +211,9 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       présents (PCIe sous max, swap, governor) sont ceux de l'hôte.
 - [x] 4bis.8 Démo reproductible (script, prompts, lots) et documentation :
       `m6demo.py`/`m6tail.py`/`m6prefix.py`/`m6grow.py` + `agentreplay.py` +
-      `fnconc.sh` ; résultats dans `TABLEAU_REEL_IDEAL_RDNA3.md` §M6. Deux
-      limites documentées : tier KV hôte refusé (gather/scatter du groupe QSA) et
-      0 % de cache en rejeu multi-agents (`no_snapshot`).
+      `fnconc.sh` ; résultats dans `TABLEAU_REEL_IDEAL_RDNA3.md` §M6. Limites
+      documentées : tier KV hôte (résolu depuis R21) et 0 % de cache en rejeu
+      multi-agents (`no_snapshot`).
 - [x] 4bis.9 Mise à jour de `SUIVI_LOTS_RDNA3.md` (W18/W19, M2→M6, risques
       R19–R23) et du journal.
 
@@ -246,19 +262,20 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [ ] 6.5 Déduplication `dot4_i8`/`i8_codes4`/`wave_max_f` (risque de dérive).
 - [ ] 6.6 Vérifier la reproductibilité des builds (builds neufs pour tout A/B).
 
-## 7. Hors périmètre v1 (acté par les ADR)
+## 7. Périmètre v1 — points tranchés par les ADR
 
-- [ ] 7.1 MTP / `mtp_enter` / `logit_rerank` / spéculation (ADR-6 : hors v1 ;
-      le run v1 fixe `num-speculative-tokens: 0`, ce qui retire aussi la couche 48).
+- [x] 7.1 MTP / spéculation — **réintégré dans la cible le 2026-11-16**
+      (ADR-7, qui supersède l'ADR-6) ; le travail est suivi en R25 et le repli
+      `num-speculative-tokens: 0` reste valable jusqu'à livraison des rows.
 - [x] 7.2 `w4nl` **n'est plus hors périmètre** : l'audit montre 25 590 poids
       experts `down` en `w4nl` ; la row est requise pour servir Flash-Next par
       `libr3d` (voir 2.10). Seul le codebook `w4nl` dans `w4a8` reste optionnel.
 
 ## 8. Critères de clôture du projet
 
-- [x] 8.1 `r3d_selftest` **159/0/15**, `iqr_device_test`, `logits_bf16_device_test`,
-      `moe_iqr_test`, `moe_w4nl` et les quatre tests QSA verts ; kbench
-      Flash-Next **856/856, 0 échec, 0 divergence**.
+- [x] 8.1 `r3d_selftest` **161/0/15**, `iqr_device_test`, `logits_bf16_device_test`,
+      `moe_iqr_test`, `moe_w4nl`, `gather_rows_u8` et les quatre tests QSA
+      verts ; kbench Flash-Next **856/856, 0 échec, 0 divergence**.
 - [x] 8.2 Flash-Next démarre et génère (texte, 1 et 4 séquences, préfills
       2048/4096) sans fallback ni avertissement nouveau.
 - [~] 8.3 MoE conforme (treillis + `w4nl` + bf16 protégé, écart borné documenté)
@@ -276,7 +293,12 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [ ] 8.7 Handover final (phase suivante) et journal à la date de clôture ; le
       handover courant (`HANDOVER_RDNA3_PHASE7.md` §8) couvre la reprise
       immédiate.
-- [ ] 8.7 Handover final (phase suivante) et journal à la date de clôture.
+- [ ] 8.8 **Vision servie (ADR-7)** : build `RAD_WITH_FFMPEG=ON`,
+      `capabilities.image` à vrai, un tour image accepté et répondu, et la
+      limite retirée de `TABLEAU_REEL_IDEAL_RDNA3.md`.
+- [ ] 8.9 **MTP Flash-Next (ADR-7)** : `mtp_enter` et `logit_rerank` en device,
+      run avec `num-speculative-tokens > 0`, cas MTP 48 couverts par kbench
+      (0 « Not covered » sur le MTP), gain de décodage mesuré et consigné.
 
 ## 9. Ordre de marche suggéré (parallélisable)
 

@@ -34,14 +34,16 @@
 | M2 — η lien ≥ 80 % | **non tenu : 1,7 %** (42 tok/s contre 2 545) | fin S10 | le plafond mesuré est `hc_read` (89 tok/s), pas le MoE |
 | M3 — QSA | **atteint** : équivalent au dense, 103 GFLOP/s à M=512 | fin S10 | `qsa_score` reste le poste QSA à optimiser |
 | M4 — coûts documentés | **atteint** : HC, PLE, QSA par row à froid | fin S10 | MoE par row bloqué (format des tables) |
-| M5 — Flash-Next texte | **atteint** : 1/4/6 séquences, 8k et 16k, robustesse | fin S12 | vision hors démo (build sans FFMPEG) |
+| M5 — Flash-Next texte | **atteint** : 1/4/6 séquences, 8k et 16k, robustesse | fin S12 | vision **dans la cible depuis l'ADR-7** (W26) |
 | M6 — démo serveur | **atteint avec une limite** | fin S12 | R21 résolu (tier KV actif) ; snapshots absents en rejeu multi-agents (R22) |
 
-## Prochains lots (W21–W24)
+## Prochains lots (W21–W26)
 
 État : W0–W20 livrés, R21 (la moitié « tier KV » de W22) livré ; M0, M1, M3,
-M4, M5, M6 atteints ; **M2 non tenu** (η lien 1,7 %). L'ordre ci-dessous est
-celui de la valeur décroissante.
+M4, M5, M6 atteints ; **M2 non tenu** (η lien 1,7 %). **Périmètre révisé le
+2026-11-16** (ADR-7) : la vision et le MTP de Flash-Next entrent dans la cible ;
+l'ADR-6 est supersédé et `num-speculative-tokens: 0` n'est plus qu'un repli.
+L'ordre ci-dessous est celui de la valeur décroissante.
 
 | lot | contenu | entrée | critère de sortie |
 |---|---|---|---|
@@ -49,9 +51,11 @@ celui de la valeur décroissante.
 | **W22 — cache multi-tour (R21, R22)** | **R21 fait** : rows `gather_rows`/`scatter_rows` device u8 pour les fragments KV opaques (4 128 octets), test `gather_rows_u8_device_test` ; **reste R22** : politique de snapshots en rejeu agent | tier actif sur Flash-Next (2 groupes, 51,38 Kio/entrée) et 27B (516 Kio/entrée), copie + restauration vérifiées ; 0 % en rejeu agent | tier KV actif ; conversation de 3 tours > 0 token servi ; 32k tenu ; `no_snapshot` disparaît |
 | **W23 — MoE mesurable (R23)** | aligner les tags de format conteneur ↔ hook de layout, ou fixture `--record` ; puis temps par row et η lien par noyau | 110 cas `moe_gemm_q` sautés | kbench couvre `moe_gemm_q` sur le conteneur ; η lien MoE calculé ; 2.11/2.12 tranchés |
 | **W24 — QSA et clôture doc** | `qsa_score` à M=512 (3.8), doc des 5 ops QSA (3.9), `docs/OPS.md` + `libr3d/README.md` (1.5/5.7/8.6), `RAPPORT` (5.6), handover final (8.7) | 83,4 ms à M=512 (2 % du pic) | `qsa_score` ≥ 20 % du pic ou cause écrite ; doc publiée ; décision d'ajout du RAPPORT prise |
+| **W25 — MTP Flash-Next (R25, ADR-7)** | rows device `mtp_enter` et `logit_rerank` dans `libr3d` (contrats de `libr4d`), tests device ; puis `num-speculative-tokens > 0` et couverture MTP 48 de kbench | plugin `qwen4exp_fp8` déclare les trois ops MTP à `NS > 0` ; libr3d n'a aucune des deux rows ; 78 cas kbench « Not covered » dont le MTP 48 | MTP servi ; kbench MTP 48 couvert (0 « Not covered » MTP) ; gain de décodage mesuré ; 27B inchangé (`NS=0`) |
+| **W26 — vision servie (R26, ADR-7)** | build `-DRAD_WITH_FFMPEG=ON`, corpus d'images, un tour image de bout en bout, `capabilities.image` à vrai | W10 a porté la tour et ses rows ; le build n'a pas FFMPEG | un tour image accepté et répondu ; `capabilities.image=true` ; limite retirée des tableaux |
 
-Hors v1 et non planifiés : MTP/spéculation (7.1), codebook `w4nl` dans `w4a8`,
-vision si la cible ne l'inclut pas (4bis.5).
+Hors v1 et non planifié : codebook `w4nl` dans `w4a8` seulement. Le MTP et la
+vision sont revenus dans la cible le 2026-11-16 (ADR-7).
 
 ## Risques ouverts
 
@@ -108,8 +112,10 @@ vision si la cible ne l'inclut pas (4bis.5).
   5 074 questions. Les 372 combinaisons non résolues sont des replis hôte.
 - **R14** — Déploiement Flash-Next : le plan `qsa_score` fait 512 Mio à 2048
   lignes et 1 Gio à 4096 (le plugin refuse) ; garder `max_mixed_tok ≤ 2048` ou
-  baisser `max-model-len`. La v1 fixe `num-speculative-tokens: 0` (MTP hors
-  périmètre), `placement: expert_tiered`, `host-pool-mib: 43000`.
+  baisser `max-model-len`. La v1 fixe `placement: expert_tiered`,
+  `host-pool-mib: 43000`. `num-speculative-tokens: 0` (ADR-6) n'est plus la
+  configuration cible : le MTP revient avec l'ADR-7 et R25, et 0 reste le repli
+  jusqu'à livraison des rows.
 - **R15** — *résolu* : `moe_iqr_test` demandait une classe impaire plus étroite
   que la row refuse par contrat ; les plans carte sont passés à classes égales
   et le refus est épinglé. 10 formes, 0 écart (tolérance 2 ulp).
@@ -148,3 +154,16 @@ vision si la cible ne l'inclut pas (4bis.5).
   not serve » sur `w4nl`), donc le temps par row MoE et η lien par noyau ne
   sont pas mesurables sur cet artefact ; aligner les tags de format ou passer
   par une fixture `--record`.
+- **R25** — MTP Flash-Next **dans la cible** (ADR-7) : le plugin déclare
+  `mtp_enter`, `mtp_couple_propose` et `logit_rerank` à `NS > 0`, et `libr3d`
+  ne sert aucune des deux rows device (`mtp_enter`, `logit_rerank`) ; le run
+  reste donc replié sur `num-speculative-tokens: 0` tant que W25 n'est pas
+  livré. Les experts du MTP 48 (`w4nl` `u4`) sont déjà servis par
+  `moe_gemm_w4nl` ; restent les deux rows et la couverture kbench des cas MTP.
+  Le 27B n'est pas concerné (son drafter h128 exige un KV bf16).
+- **R26** — Vision **dans la cible** (ADR-7) : la tour est portée (W10,
+  `attn_dense` hd72, `gemm_nt_bias`, `grid_embed`, `patch_*`) et ses rows sont
+  vertes, mais le build servi n'a pas `RAD_WITH_FFMPEG`
+  (`capabilities.image=false`), donc aucun tour image n'est possible. Rebuild
+  avec `-DRAD_WITH_FFMPEG=ON`, corpus d'images sur l'hôte, un tour de bout en
+  bout.

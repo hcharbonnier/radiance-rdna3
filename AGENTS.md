@@ -191,8 +191,10 @@ est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill ≈ 318 tok/s
 - Un `.so` remplacé pendant qu'un serveur tourne : tuer le serveur avant de reconstruire.
 - Vérifier que le processus qui répond sur le port est bien le binaire visé
   (`readlink /proc/<pid>/exe`).
-- Les rows MTP 48 et `ngram_hint` sont hors v1 : leurs cas « Not covered » ne
-  sont pas des régressions.
+- Les cas `ngram_hint` restent sans oracle : leur « Not covered » n'est pas une
+  régression. Les cas **MTP 48** sont en revanche exigibles depuis l'ADR-7
+  (2026-11-16, vision et MTP de Flash-Next dans la cible) : un MTP non couvert
+  est un manque à combler (lot W25), pas une exclusion.
 - Le paramètre rangé d'une row (`M`) est un **plafond de bande**, jamais le
   nombre de lignes du pas : l'étendue est sur les tenseurs. Une row qui compare
   les deux casse le multi-séquence du moteur (bug R24, corrigé en W20) ;

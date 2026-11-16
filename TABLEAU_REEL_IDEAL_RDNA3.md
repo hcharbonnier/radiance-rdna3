@@ -346,6 +346,9 @@ reste hors démonstration : il faudrait ~10 × plus de pool (et le tier KV hôte
   gather/scatter du groupe QSA bkey) : le cache ne survit pas à une éviction, donc une
   session de 200k tokens re-préfille à chaque tour.
 - L'image/vision : `capabilities.image=false` (build sans `RAD_WITH_FFMPEG`).
+  **Dans la cible depuis l'ADR-7** : reste le lot W26 (build FFMPEG, tour image).
+- Le MTP de Flash-Next : `num-speculative-tokens: 0` et pas de row device pour
+  `mtp_enter`/`logit_rerank`. **Dans la cible depuis l'ADR-7** : lot W25.
 
 ## Lecture
 

@@ -1,6 +1,8 @@
 # ADR-5 — Vision tower in the first milestone
 
-- Status: accepted (2026-11-15)
+- Status: accepted (2026-11-15); completed by ADR-7 (2026-11-16) — the tower is
+  now required in the served target, and the media-free artifact stays a test
+  artifact only.
 - Deciders: user, programme lead
 
 ## Context

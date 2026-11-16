@@ -802,6 +802,36 @@ après scatter) :
 
 Reste de W22 : R22 (snapshots en rejeu multi-agents), inchangé.
 
+## 2026-11-16 — décision de périmètre : vision et MTP de Flash-Next dans la v1
+
+Décision utilisateur, consignée dans **`docs/adr/ADR-0007-v1-vision-and-mtp.md`**
+(qui supersède l'ADR-6 et complète l'ADR-5) :
+
+- **Vision incluse.** La tour est portée depuis W10 et complétée par W15
+  (`gemm_nt_bias_bf16`, `grid_embed_bf16`) ; ses rows sont vertes. Le blocage
+  restant n'est pas un noyau mais le décodage média : le build servi n'a pas
+  `RAD_WITH_FFMPEG` (`capabilities.image=false`). Lot **W26** : rebuild
+  `-DRAD_WITH_FFMPEG=ON`, corpus d'images, un tour image de bout en bout,
+  `capabilities.image` à vrai. L'artefact sans média de l'ADR-5 reste permis
+  comme artefact de test, il ne satisfait plus la cible.
+- **MTP de Flash-Next inclus.** Le plugin `qwen4exp_fp8` déclare `mtp_enter`,
+  `mtp_couple_propose` et `logit_rerank` dès `num-speculative-tokens > 0` ;
+  `libr3d` n'a de row device ni pour `mtp_enter` ni pour `logit_rerank`
+  (`libr4d`, `libavx` et `libref` les ont). Lot **W25** : écrire les deux rows
+  sur les contrats de `libr4d`, les tester, servir à `NS > 0`, et couvrir les
+  cas MTP 48 de kbench — qui deviennent un critère de clôture au lieu d'un
+  « Not covered ». Les experts du MTP 48 (`w4nl` `u4`) sont déjà servis par
+  `moe_gemm_w4nl`.
+- **27B inchangé** : `num-speculative-tokens: 0` et KV i8, son drafter h128
+  fenêtré exigeant un KV bf16. La décision porte sur le MTP de Flash-Next.
+- `ngram_hint` reste sans oracle : son « Not covered » n'est pas une
+  régression ; celui du MTP 48 en est un désormais.
+
+Conséquences pratiques : `num-speculative-tokens: 0` n'est plus « la
+configuration v1 » mais le repli jusqu'à W25 ; la clôture gagne deux critères
+(8.8 vision servie, 8.9 MTP servi et couvert). Les docs de suivi (checklist,
+suivi des lots, handover, audit, plan, rapport) portent la révision.
+
 
 
 

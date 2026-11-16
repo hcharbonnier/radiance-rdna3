@@ -1,6 +1,7 @@
 # ADR-6 — MTP is out of scope for v1
 
-- Status: accepted (2026-11-15)
+- Status: superseded (2026-11-16) — the Flash-Next MTP head is back in the
+  target, see ADR-7. Kept for the reasoning and for the fallback it defines.
 - Deciders: programme lead
 
 ## Context
