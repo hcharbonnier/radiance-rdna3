@@ -133,6 +133,12 @@ int r3d_gather_rows(long x, long idx, long y, int M, int n, int x_ld, int y_ld, 
                     long long src_rows, long stream);
 int r3d_scatter_rows(long v, long idx, long x, int M, int n, int v_ld, int x_ld, int dt,
                      long long dst_rows, long stream);
+/* The byte moves: the u8 row pair, opaque rows copied whole rather than through a codec. `n` and
+ * both pitches are bytes and must be whole dwords. */
+int r3d_gather_rows_u8(long x, long idx, long y, int M, int n, int x_ld, int y_ld,
+                       long long src_rows, long stream);
+int r3d_scatter_rows_u8(long v, long idx, long x, int M, int n, int v_ld, int x_ld,
+                        long long dst_rows, long stream);
 
 /* ================================================================== r3d_quant_fp8.hip
  *

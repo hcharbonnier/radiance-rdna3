@@ -907,6 +907,37 @@ __global__ __launch_bounds__(THR) void scatter_rows_kernel(
     for (uint32_t i = threadIdx.x; i < n; i += THR) st_elem(dt, xr, i, ld_elem(dt, vr, i));
 }
 
+/* Opaque byte rows: the tier's KV fragments. ld_elem/st_elem would put every byte through the
+ * E4M3 codec, and a NaN payload need not survive that round trip; these copy the bytes whole, one
+ * dword a thread. The registry constrains `n` to a multiple of 4, and the launcher refuses a pitch
+ * that is not, so there is no ragged tail. */
+template <int THR>
+__global__ __launch_bounds__(THR) void gather_rows_u8_kernel(
+    const uint32_t* __restrict__ x, const int32_t* __restrict__ idx, uint32_t* __restrict__ y,
+    uint32_t n4, uint32_t x_ld4, uint32_t y_ld4, int64_t src_rows) {
+    const uint32_t m = blockIdx.x;
+    const int32_t r = ldg_i32(idx + m);
+    uint32_t* __restrict__ yr = y + (size_t)m * y_ld4;
+    if (r < 0 || (src_rows > 0 && (int64_t)r >= src_rows)) {
+        for (uint32_t i = threadIdx.x; i < n4; i += THR) yr[i] = 0;
+        return;
+    }
+    const uint32_t* __restrict__ xr = x + (size_t)r * x_ld4;
+    for (uint32_t i = threadIdx.x; i < n4; i += THR) yr[i] = ldg_u32(xr + i);
+}
+
+template <int THR>
+__global__ __launch_bounds__(THR) void scatter_rows_u8_kernel(
+    const uint32_t* __restrict__ v, const int32_t* __restrict__ idx, uint32_t* __restrict__ x,
+    uint32_t n4, uint32_t v_ld4, uint32_t x_ld4, int64_t dst_rows) {
+    const uint32_t m = blockIdx.x;
+    const int32_t r = ldg_i32(idx + m);
+    if (r < 0 || (dst_rows > 0 && (int64_t)r >= dst_rows)) return;
+    const uint32_t* __restrict__ vr = v + (size_t)m * v_ld4;
+    uint32_t* __restrict__ xr = x + (size_t)r * x_ld4;
+    for (uint32_t i = threadIdx.x; i < n4; i += THR) xr[i] = ldg_u32(vr + i);
+}
+
 }  /* namespace */
 
 /* ================================================================== the launchers
@@ -1465,6 +1496,36 @@ extern "C" int r3d_scatter_rows(long v, long idx, long x, int M, int n, int v_ld
     R3D_ROW2(scatter_rows_kernel, row_threads(n), M, stream, (const void*)(uintptr_t)v,
              (const int32_t*)(uintptr_t)idx, (void*)(uintptr_t)x, (uint32_t)n, (uint32_t)v_ld,
              (uint32_t)x_ld, dt, es, (int64_t)dst_rows);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+/* The byte moves. `n` and both pitches are byte counts, divided down to dwords here; a pitch that
+ * is not a whole dword is refused rather than read one byte past a row. */
+extern "C" int r3d_gather_rows_u8(long x, long idx, long y, int M, int n, int x_ld, int y_ld,
+                                  long long src_rows, long stream) {
+    if (!x || !idx || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!x_ld) x_ld = n;
+    if (!y_ld) y_ld = n;
+    if (x_ld < n || y_ld < n) return -3;
+    if ((n | x_ld | y_ld) & 3) return -3;
+    R3D_ROW2(gather_rows_u8_kernel, row_threads(n), M, stream, (const uint32_t*)(uintptr_t)x,
+             (const int32_t*)(uintptr_t)idx, (uint32_t*)(uintptr_t)y, (uint32_t)(n / 4),
+             (uint32_t)(x_ld / 4), (uint32_t)(y_ld / 4), (int64_t)src_rows);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r3d_scatter_rows_u8(long v, long idx, long x, int M, int n, int v_ld, int x_ld,
+                                   long long dst_rows, long stream) {
+    if (!v || !idx || !x) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!v_ld) v_ld = n;
+    if (!x_ld) x_ld = n;
+    if (v_ld < n || x_ld < n) return -3;
+    if ((n | v_ld | x_ld) & 3) return -3;
+    R3D_ROW2(scatter_rows_u8_kernel, row_threads(n), M, stream, (const uint32_t*)(uintptr_t)v,
+             (const int32_t*)(uintptr_t)idx, (uint32_t*)(uintptr_t)x, (uint32_t)(n / 4),
+             (uint32_t)(v_ld / 4), (uint32_t)(x_ld / 4), (int64_t)dst_rows);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -2198,6 +2259,15 @@ extern "C" int r3d_rad_gather_rows(const RadArgs* a, RadStream s) {
     if (y_ld < 0 || x_ld < 0) return R3D_NO(RAD_E_STRIDE);
     if (!row_count_ok(M) || Mx <= 0 || r3d_numel(idx) < M) return R3D_NO(RAD_E_SHAPE);
 
+    /* A `dtype` of u8 names opaque byte rows, not the E4M3 codes ld_elem would decode: the tier's
+     * KV fragments must come back bit for bit. */
+    if (dt == R3D_DT_U8) {
+        if ((n | x_ld | y_ld) & 3) return R3D_NO(RAD_E_UNSUPPORTED);
+        return r3d_launch_ok(r3d_gather_rows_u8(r3d_addr(x), r3d_addr(idx), r3d_addr(y),
+                                                (int)M, (int)n, (int)x_ld, (int)y_ld, Mx,
+                                                (long)(uintptr_t)s));
+    }
+
     /* The source plane's row count, which the shim sees in the descriptor and the kernel cannot:
      * an index at or past it is libref's refused step and takes the zero row here. */
     return r3d_launch_ok(r3d_gather_rows(r3d_addr(x), r3d_addr(idx), r3d_addr(y), (int)M, (int)n,
@@ -2222,6 +2292,14 @@ extern "C" int r3d_rad_scatter_rows(const RadArgs* a, RadStream s) {
     const long long x_ld = r3d_rows_pitch(x, n, &Mx);
     if (v_ld < 0 || x_ld < 0) return R3D_NO(RAD_E_STRIDE);
     if (!row_count_ok(M) || Mx <= 0 || r3d_numel(idx) < M) return R3D_NO(RAD_E_SHAPE);
+
+    /* Opaque byte rows, as in the gather: a scatter into the tier's pool must keep every byte. */
+    if (dt == R3D_DT_U8) {
+        if ((n | v_ld | x_ld) & 3) return R3D_NO(RAD_E_UNSUPPORTED);
+        return r3d_launch_ok(r3d_scatter_rows_u8(r3d_addr(v), r3d_addr(idx), r3d_addr(x),
+                                                 (int)M, (int)n, (int)v_ld, (int)x_ld, Mx,
+                                                 (long)(uintptr_t)s));
+    }
 
     /* The destination plane's row count, from the descriptor: an index at or past it writes past
      * the plane, which is the one thing a scatter must not do, so the kernel drops the row. */

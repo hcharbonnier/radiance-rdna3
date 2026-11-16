@@ -412,6 +412,9 @@ static void check_shapes() {
                             PS("dtype", "bf16") } },
         { "gather_rows", { PI("M", 8), PI("n", 4096), PS("dtype", "bf16") } },
         { "scatter_rows", { PI("M", 8), PI("n", 4096), PS("dtype", "bf16") } },
+        /* The tier's byte rows, at a 4-token page's 4128-byte QSA fragment. */
+        { "gather_rows", { PI("M", 8), PI("n", 4128), PS("dtype", "u8") } },
+        { "scatter_rows", { PI("M", 8), PI("n", 4128), PS("dtype", "u8") } },
         { "quant_act_fp8", { PI("M", 8), PI("n", 4096), PI("group", 128), PS("dtype", "bf16") } },
         { "quant_act_i8", { PI("M", 8), PI("n", 4096), PI("group", 128), PS("dtype", "bf16") } },
         { "quant_act_i8g", { PI("M", 8), PI("n", 4096), PI("group", 128), PS("dtype", "bf16") } },

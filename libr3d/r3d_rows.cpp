@@ -1751,6 +1751,9 @@ static const RadConstraint cLogitsVocabIqr[] = { C_IN("dtype", "bf16"), C_DIV("n
 static const RadConstraint cGatherBf16[]   = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
 static const RadConstraint cGatherF32[]    = { C_IN("dtype", "f32"), C_DIV("n", 2) };
 static const RadConstraint cScatterBf16[]  = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
+/* Opaque byte rows: the KV tier's fragments, copied whole and never through the E4M3 codec. A
+ * dword a thread, so the row is a whole number of dwords. */
+static const RadConstraint cOpaqueRowU8[]  = { C_IN("dtype", "u8"), C_DIV("n", 4) };
 
 /* The quantisers: the scale group is the checkpoint's block, 128, and a row wide enough that a
  * wave's four-elements-a-lane store is whole. */
@@ -2455,6 +2458,23 @@ static const RadKernelInfo kKernels[] = {
   "bf16 rows, i32 indices",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cScatterBf16), NOTUNE,
+  nullptr, nullptr, r3d_rad_scatter_rows, nullptr, nullptr, nullptr, r3d_shape_scatter_rows },
+
+/* Opaque byte rows, the KV tier's traffic: one layer's fragment of one block, copied without an
+ * arithmetic round trip. The u8 pair is separate from the bf16/f32 rows because ld_elem's E4M3
+ * codec need not preserve a NaN payload, and a KV fragment is bytes, not values. */
+{ "gather_rows_u8", "gather_rows", "elem", "y[r] = x[idx[r]] over opaque bytes",
+  "n a multiple of 4; a workgroup a row, four bytes a thread",
+  "u8 rows, i32 indices",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cOpaqueRowU8), NOTUNE,
+  nullptr, nullptr, r3d_rad_gather_rows, nullptr, nullptr, nullptr, r3d_shape_gather_rows },
+
+{ "scatter_rows_u8", "scatter_rows", "elem", "x[idx[r]] = v[r] over opaque bytes",
+  "n a multiple of 4; distinct indices; a workgroup a row, four bytes a thread",
+  "u8 rows, i32 indices",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cOpaqueRowU8), NOTUNE,
   nullptr, nullptr, r3d_rad_scatter_rows, nullptr, nullptr, nullptr, r3d_shape_scatter_rows },
 
 /* ------------------------------------------------------------------ r3d_quant_fp8.hip
