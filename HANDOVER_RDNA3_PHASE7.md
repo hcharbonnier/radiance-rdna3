@@ -1,25 +1,26 @@
-# Handover — RDNA3, phase 7 (W14–W20, R21 et R26 livrés)
+# Handover — RDNA3, phase 7 (W14–W20, R21, R22, R25 et R26 livrés)
 
-2026-11-16. Branche `rdna3-iqr`, état code `7338226` (W20 : contrat
-capacité/étendue ; R21 : tier KV hôte ; R26 : vision servie). **Périmètre
-révisé le 2026-11-16** : la vision et le MTP de Flash-Next entrent dans la
-cible (ADR-7, qui supersède l'ADR-6) ; la vision est livrée, le MTP reste à
-faire (W25). Ce document remplace
+2026-11-16. Branche `rdna3-iqr`, état code `1d90bae` (W20 : contrat
+capacité/étendue ; R21 : tier KV hôte ; R22 : snapshots courts ; R25 : MTP
+servi ; R26 : vision servie). **Périmètre révisé le 2026-11-16** : la vision et
+le MTP de Flash-Next entrent dans la cible (ADR-7, qui supersède l'ADR-6) et
+sont **livrés**. Ce document remplace
 `HANDOVER_RDNA3_PHASE6.md` pour l'état courant ; §8 donne la reprise immédiate.
 
 ## 1. État vérifié
 
 | Vérification | Résultat |
 |---|---|
-| `r3d_selftest` complet | **161 rows, 0 échec, 15 skips** |
-| Tests device | `iqr_device_test`, `logits_bf16_device_test`, 4 tests QSA, `moe_iqr_test`, `moe_iqr_device_test`, `moe_w4nl`, `kv_store_b4`, `gather_rows_u8`, `rope` h128, router, `gemm_nt` N=1, vision, GDN had : **tous verts** |
-| kbench Flash-Next (`--kernels libr3d:libref`) | **856/856, 0 échec, 0 divergence**, pire rel_l2 1,2e-2 ; **856/856 aussi en `--band-capacity`** (W20) |
+| `r3d_selftest` complet | **164 rows, 0 échec, 15 skips** |
+| Tests device | `iqr_device_test`, `logits_bf16_device_test`, 4 tests QSA, `moe_iqr_test`, `moe_iqr_device_test`, `moe_w4nl`, `kv_store_b4`, `gather_rows_u8`, `mtp_enter_e4m3`, `logit_rerank_iqr`, `rope` h128, router, `gemm_nt` N=1, vision, GDN had : **tous verts** |
+| kbench Flash-Next (`--kernels libr3d:libref`) | **872/872, 0 échec, 0 divergence**, pire rel_l2 1,206e-2 ; **872/872 aussi en `--band-capacity`** (W25) |
 | kbench 27B | **605/605, 0 échec** dans les deux modes (W20), pire rel_l2 3,6e-3 |
 | Contrat capacité (W20) | `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` : rouge sur `a772d70`, vert sur `fae6c44` |
 | R21 tier KV (W22a) | rows u8 `gather_rows`/`scatter_rows` ; Flash-Next **2 groupes, 51,38 Kio/entrée**, 27B **1 groupe, 516 Kio** ; rejeu 27B : `to_host` 471, `promoted` 245, 0 échec (hash de vérification actif) |
-| R26 vision (W26) | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3, ffmpeg 8.0) ; tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16 384 patches ; `capabilities.image=true` ; 512² : 256 tokens image (281 avec le texte), TTFT 8,19 s ; 1024² : 1 024 tokens, TTFT 28,73 s ; 2048² : 4 096 tokens, TTFT 121,5 s ; 3000² redimensionnée ; 18 cas de robustesse (2 images, alpha/JPEG, 4 × 400) sans fuite ; 480/480 cas vision et 856/856 kbench, 0 divergence |
+| R25 MTP (W25) | rows `mtp_enter_e4m3`, `logit_rerank_iqr`/`_i8` ; selftest 164 ; kbench **872/872** (FN) et 605/605 (27B) dans les deux modes ; NS=3 servi : **4,51 → 8,21 tok/s (1,82×)**, texte identique, acceptation 40,3 % (66/61/37 % aux profondeurs 1–3) |
+| R26 vision (W26) | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3, ffmpeg 8.0) ; tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16 384 patches ; `capabilities.image=true` ; 512² : 256 tokens image (281 avec le texte), TTFT 8,19 s ; 1024² : 1 024 tokens, TTFT 28,73 s ; 2048² : 4 096 tokens, TTFT 121,5 s ; 3000² redimensionnée ; 18 cas de robustesse (2 images, alpha/JPEG, 4 × 400) sans fuite ; 480/480 cas vision et 872/872 kbench, 0 divergence |
 | R22 snapshots (W22b) | ancre de queue sous le premier intervalle ; rejeu 9 tours : tokens servis 24 % → **52,6 %**, préfill recalculé −37 %, `no_snapshot` 6 → 2, checkpoints 1 → 7 ; `sched_test` 548 782 checks, `engine_e2e_test` et tests device verts |
-| Périmètre v1 (2026-11-16) | vision **livrée** (W26 : image 512²/1024² servie, `capabilities.image=true`) ; MTP Flash-Next **inclus** (ADR-7) et restant à livrer (W25, rows `mtp_enter`/`logit_rerank`) ; le 27B reste à `NS=0` |
+| Périmètre v1 (2026-11-16) | vision **livrée** (W26) et MTP Flash-Next **livré** (W25 : NS=3, 1,82×) ; le 27B reste à `NS=0` |
 | Mesures à froid W18 (HC/PLE/QSA par row) | 182 + 147 cas, 0 échec ; `hc_read` **1,77 ms à M=1** (η 0,6 %), η lien **1,7 %**, MoE par row bloqué (format du conteneur) |
 | Démo serveur M6 / W19 | préfill 38,7–41,9 tok/s, décodage 4,41 (1 séq.) / 15,5 (4) / 22,1 (6) tok/s ; cache ×12 sur prompt identique ; **R22 résolu** : rejeu 9 tours 24 % → 52,6 % de tokens servis, `no_snapshot` 6 → 2 ; 4 décodeurs ×7,0 à côté d'un préfill |
 | Rejeu 27B / W19–W20 | chargement 15,87 GiB en 2,7 s ; `SEQS=1` préfill 318,8 tok/s (844), décodage 23,2 / 29,4 ; **`SEQS=4` corrigé** (W20) : préfill 317,5 tok/s, 4 requêtes à 67,3 tok/s agrégés |
@@ -91,15 +92,14 @@ faire (W25). Ce document remplace
 
 ```
 P=8200 M=<work-root>/models/qwen3.8-next-flash-iqr-v4.rad \
-TP=1 NS=0 MLEN=8192 HOSTPOOL=43000 KVHOST=1024 MNBT=2048 \
+TP=1 NS=3 MLEN=8192 HOSTPOOL=43000 KVHOST=1024 MNBT=2048 \
 scripts/fnserve.sh
 ```
 
-- `num-speculative-tokens: 0` : **repli**, plus la configuration cible. Le MTP
-  de Flash-Next est dans le périmètre depuis l'ADR-7 (2026-11-16) ; il attend
-  les rows device `mtp_enter` et `logit_rerank` (W25). Tant qu'elles manquent,
-  la couche 48 et `mtp.draft_head` restent hors run, et les cas kbench MTP 48
-  sont « Not covered ».
+- `num-speculative-tokens: 3` : configuration servie depuis W25/R25 (MTP du
+  Flash-Next, 1,82× le décodage à texte identique, acceptation 40,3 %).
+  `NS=0` reste le repli de comparaison. Les tables MTP 48 restent à couvrir
+  par kbench via R23.
 - `max-num-batched-tokens: 2048` : le plan `qsa_score` fait 512 Mio à 2 048
   lignes et 1 Gio à 4 096, que le plugin refuse.
 - `placement: expert_tiered`, `host-pool-mib: 43000`, `kv-cache-dtype: i8`.
@@ -151,8 +151,15 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
 - **Échelles de tête** : une tête quantifiée peut avoir une échelle par ligne
   (`1x128`), pas seulement `128x128` ; l'indexation doit venir du bloc encodé,
   pas d'une grille supposée.
-- **kbench « Not covered »** : `ngram_hint` reste sans oracle ; le MTP 48 est
-  exigible depuis l'ADR-7 (lot W25), donc son « Not covered » est un manque.
+- **kbench « Not covered »** : `ngram_hint` reste sans oracle ; les tables
+  MTP 48 (`moe_gemm_q`) restent à poser via R23. Les rows MTP
+  (`mtp_enter`, `logit_rerank`) sont, elles, couvertes (872 cas).
+- **Spéculation** : Flash-Next à `NS=3`, acceptation ~40 % (66/61/37 % aux
+  profondeurs 1–3), 1,82× le décodage, texte identique. Le 27B reste à
+  `NS=0`. Un poids **joint** (`rad.planes`) d'une row device peut vivre en
+  VRAM : un shim ne doit pas lire son en-tête sur l'hôte (SIGSEGV ; W25 a
+  corrigé `gemm_nt_q_w2a8_m16`). Le bras `w2a8` doit aussi choisir un MT dont
+  le chunk divise K (M=1/K=2560 → MT=4).
 - **Média** : un build sans `-DRAD_WITH_FFMPEG=ON` refuse toute image
   (`capabilities.image=false`) ; l'hôte exige les paquets `libav*-dev`
   (`pkg-config --modversion libavformat`), et `<gpu-user>` n'a pas `sudo`.
@@ -240,13 +247,13 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
    testé : la vidéo (annoncée par le processeur) et l'audio. Le corpus de
    démonstration vit hors dépôt dans `<work-root>/images` ; les paquets
    `libav*-dev` sont requis et `sudo` n'est pas accordé à `<gpu-user>`.
-7. **Nettoyage code (non fait)** : traces `r3d_trace_on` ajoutées au bring-up
-   (gated mais répétées par couche) et déduplication `dot4_i8`/`i8_codes4` ; à
-   faire avec la prochaine passe code, pas avec les mesures.
+7. **Nettoyage code — livré** : `dot4_i8`/`i8_codes4` partagés dans
+   `r3d_common.h`, traces de bring-up retirées (W25, branche
+   `rdna3-cleanup-helpers`).
 8. **Hors v1** : codebook `w4nl` dans `w4a8` seulement. Le MTP de Flash-Next
-   est revenu dans la cible (ADR-7) : il attend `mtp_enter` et `logit_rerank`
-   en device dans `libr3d` (W25), puis `num-speculative-tokens > 0` et la
-   couverture kbench des cas MTP 48. Le 27B garde `NS=0` (drafter h128 bf16).
+   est **livré** (W25) : rows device, service à `NS=3`, 1,82× le décodage ;
+   seule la couverture kbench des tables MTP 48 reste attachée à R23. Le 27B
+   garde `NS=0` (drafter h128 bf16).
 
 ## 7. Non ajouté volontairement
 
@@ -262,29 +269,22 @@ synthèse », `SUIVI_LOTS_RDNA3.md` § « Prochains lots », puis
 protocole kbench et les consignes de travail.
 
 **Où en est le programme.** Flash-Next texte et vision sont servis, le 27B
-aussi, kbench 856/856 et 605/605 dans les deux modes, le tier KV hôte fonctionne
-(R21) et un tour image passe (R26). Le périmètre v1 a été **élargi le
-2026-11-16** (ADR-7) : la vision est livrée, le MTP de Flash-Next reste à
-livrer. Ne pas rouvrir les contrats clos (R17–R19, R24) sans une mesure qui les
-contredit.
+aussi, kbench 872/872 et 605/605 dans les deux modes, le tier KV hôte fonctionne
+(R21), un tour image passe (R26) et le MTP de Flash-Next est servi (R25,
+1,82× le décodage). Le périmètre v1 a été **élargi le 2026-11-16** (ADR-7) :
+la vision et le MTP sont **livrés**. Ne pas rouvrir les contrats clos
+(R17–R19, R24) sans une mesure qui les contredit.
 
 **Ordre de travail recommandé.** L'optimisation noyau est en pause faute de feu
-vert : W25 passe devant, et W21 reprend la première place dès que le feu vert
-est donné.
+vert ; W21 reprend la première place dès que le feu vert est donné.
 
-1. **W25 MTP (R25)** — écrire `mtp_enter` et `logit_rerank` en device dans
-   `libr3d` sur les contrats de `libr4d`, les tester, puis servir à
-   `num-speculative-tokens > 0` et couvrir les cas MTP 48 de kbench. La
-   spéculation amortit le coût d'un pas sur plusieurs tokens, donc elle paie
-   même sans toucher aux noyaux, et la couverture MTP est un critère de clôture
-   (8.9).
-2. **W21 `hc_read` (R20)** — le plus gros levier de performance dès que le feu
+1. **W21 `hc_read` (R20)** — le plus gros levier de performance dès que le feu
    vert est donné : 1,77 ms à M=1 (η 0,6 %) et 0,23 ms/ligne, ~40 % du décodage
    et 47 % du préfill. Commencer par `--profile-ops true` (temps device par op)
    sur Flash-Next ; la forme deux-grilles et la température sont déjà écartées.
-3. **W23 MoE (R23)** — poser les tables du conteneur dans kbench (tags de format
+2. **W23 MoE (R23)** — poser les tables du conteneur dans kbench (tags de format
    ou fixture `--record`), puis mesurer le temps par row et l'η lien par noyau.
-4. **W24 QSA et doc** — `qsa_score` à M=512, doc OPS/README, décision sur
+3. **W24 QSA et doc** — `qsa_score` à M=512, doc OPS/README, décision sur
    `RAPPORT_RDNA3.md`, handover final.
 
 **Décisions qui appartiennent à l'utilisateur** : (1) feu vert pour

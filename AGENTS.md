@@ -179,17 +179,20 @@ flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
   ./build/tests/sched_test && ./build/tests/engine_e2e_test && \
   ./build/tests/iqr_device_test && ./build/tests/logits_bf16_device_test && \
   ./build/tests/gather_rows_u8_device_test && ./build/tests/vision_rows_device_test && \
+  ./build/tests/mtp_enter_e4m3_device_test && ./build/tests/logit_rerank_iqr_device_test && \
   ./build/bin/r3d_selftest ./build/radiance_home/kernels/libr3d.so'
 ```
 
-État de référence de la branche (R21 + R22 + R26, merge `68d0e52`) : **161
+État de référence de la branche (R21 + R22 + R25 + R26, merge `1d90bae`) : **164
 rows, 0 échec, 15 skips** ; `sched_test` **548 782 checks, 0 échec** et
 `engine_e2e_test` **909 checks, 0 échec** (3 skips) ; `kbench` Flash-Next
-**856/856** et 27B **605/605**, 0 échec,
+**872/872** et 27B **605/605**, 0 échec,
 0 divergence, **dans les deux modes** (défaut et `--band-capacity`). Test de
 contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
 `gather_rows_u8_device_test` couvre les rows u8 du tier KV (fragment 4 128 octets,
-octets opaques, pitches larges). Vision : build **`-DRAD_WITH_FFMPEG=ON`**
+octets opaques, pitches larges) ; `mtp_enter_e4m3_device_test` et
+`logit_rerank_iqr_device_test` couvrent le MTP (22 + 36 checks). MTP servi à
+`NS=3` : 4,51 → 8,21 tok/s (1,82×), texte identique, acceptation 40,3 %. Vision : build **`-DRAD_WITH_FFMPEG=ON`**
 (libavformat 62.3), `capabilities.image=true`, image 512² → 256 tokens,
 1024² → 1 024, 2048² → 4 096 (un pass complet, TTFT ~121 s) ; au-delà de
 `image-max-pixels` l'image est réduite à 2048², pas refusée. La tour
@@ -218,6 +221,12 @@ est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill ≈ 318 tok/s
   régression. Les cas **MTP 48** sont en revanche exigibles depuis l'ADR-7
   (2026-11-16, vision et MTP de Flash-Next dans la cible) : un MTP non couvert
   est un manque à combler (lot W25), pas une exclusion.
+- **MTP** : Flash-Next se sert à `NS=3` (1,82× le décodage, texte identique,
+  acceptation ~40 %) ; le 27B reste à `NS=0` (drafter h128 bf16). Un poids
+  joint `rad.planes` d'une row device peut vivre en VRAM : un shim ne doit pas
+  lire son en-tête sur l'hôte (SIGSEGV, corrigé dans `gemm_nt_q_w2a8_m16`),
+  et le MT du bras `w2a8` doit avoir un chunk qui divise K (M=1/K=2560 → MT=4).
+  Les tables MTP 48 restent « Not covered » par kbench (R23), pas les rows.
 - Le paramètre rangé d'une row (`M`) est un **plafond de bande**, jamais le
   nombre de lignes du pas : l'étendue est sur les tenseurs. Une row qui compare
   les deux casse le multi-séquence du moteur (bug R24, corrigé en W20) ;

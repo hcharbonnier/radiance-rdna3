@@ -37,14 +37,14 @@
 | M5 — Flash-Next texte | **atteint** : 1/4/6 séquences, 8k et 16k, robustesse ; **vision livrée** (W26) | fin S12 | image 512²/1024² servie, `capabilities.image=true` |
 | M6 — démo serveur | **atteint** | fin S12 | R21 (tier KV) et R22 (snapshots courts) résolus ; vision livrée (W26) |
 
-## Prochains lots (W21–W25)
+## Prochains lots (W21–W24)
 
-État : W0–W20 livrés, **W22 (R21 et R22) livré**, **W26 (vision) livré** ;
-M0, M1, M3, M4, M5, M6 atteints ; **M2 non tenu** (η lien 1,7 %).
-**Périmètre révisé le 2026-11-16** (ADR-7) : la vision et le MTP de Flash-Next
-entrent dans la cible ; la vision est faite, l'ADR-6 est supersédé et
-`num-speculative-tokens: 0` n'est plus qu'un repli. L'ordre ci-dessous est
-celui de la valeur décroissante.
+État : W0–W20 livrés, **W22 (R21 et R22) livré**, **W25 (MTP) livré**,
+**W26 (vision) livré** ; M0, M1, M3, M4, M5, M6 atteints ; **M2 non tenu**
+(η lien 1,7 %). **Périmètre révisé le 2026-11-16** (ADR-7) : la vision et le
+MTP de Flash-Next entrent dans la cible ; tous deux sont livrés, l'ADR-6 est
+supersédé et `num-speculative-tokens: 0` n'est plus qu'un repli. L'ordre
+ci-dessous est celui de la valeur décroissante.
 
 | lot | contenu | entrée | critère de sortie |
 |---|---|---|---|
@@ -52,7 +52,7 @@ celui de la valeur décroissante.
 | **W22 — cache multi-tour (R21, R22)** — **fait** | R21 : rows u8 `gather_rows`/`scatter_rows` (fragments KV opaques, 4 128 octets), test `gather_rows_u8_device_test` ; R22 : ancre de queue pour un prompt sous le premier intervalle, rejeu 9 tours 24 % → **52,6 %** de tokens servis, `no_snapshot` 6 → 2, checkpoints 1 → 7 | tier actif sur Flash-Next (2 groupes, 51,38 Kio/entrée) et 27B (516 Kio/entrée) ; **0 % en rejeu agent** avant R22 | tier KV actif ; conversation de 3 tours > 0 token servi ; 32k tenu ; `no_snapshot` disparaît (hors premiers tours de sous-agents) |
 | **W23 — MoE mesurable (R23)** | aligner les tags de format conteneur ↔ hook de layout, ou fixture `--record` ; puis temps par row et η lien par noyau | 110 cas `moe_gemm_q` sautés | kbench couvre `moe_gemm_q` sur le conteneur ; η lien MoE calculé ; 2.11/2.12 tranchés |
 | **W24 — QSA et clôture doc** | `qsa_score` à M=512 (3.8), doc des 5 ops QSA (3.9), `docs/OPS.md` + `libr3d/README.md` (1.5/5.7/8.6), `RAPPORT` (5.6), handover final (8.7) | 83,4 ms à M=512 (2 % du pic) | `qsa_score` ≥ 20 % du pic ou cause écrite ; doc publiée ; décision d'ajout du RAPPORT prise |
-| **W25 — MTP Flash-Next (R25, ADR-7)** | rows device `mtp_enter` et `logit_rerank` dans `libr3d` (contrats de `libr4d`), tests device ; puis `num-speculative-tokens > 0` et couverture MTP 48 de kbench | plugin `qwen4exp_fp8` déclare les trois ops MTP à `NS > 0` ; libr3d n'a aucune des deux rows ; 78 cas kbench « Not covered » dont le MTP 48 | MTP servi ; kbench MTP 48 couvert (0 « Not covered » MTP) ; gain de décodage mesuré ; 27B inchangé (`NS=0`) |
+| **W25 — MTP Flash-Next (R25, ADR-7)** — **fait** | rows `mtp_enter_e4m3`, `logit_rerank_iqr`/`_i8`, tests device ; corrige `gemm_nt_q_w2a8_m16` (en-tête joint lu sur l'hôte, chunk de K à M=1) ; `NS=3` servi | plugin `qwen4exp_fp8` déclare les ops MTP à `NS > 0` ; libr3d n'avait aucune des rows ; tables MTP 48 non posées par kbench | décodage **4,51 → 8,21 tok/s (1,82×)**, texte identique, acceptation 40,3 % ; kbench 872/872 (FN) et 605/605 (27B) ; **reste** les tables MTP 48 de kbench (R23) |
 | **W26 — vision servie (R26, ADR-7)** — **fait** | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3 / ffmpeg 8.0), corpus de 4 PNG sur l'hôte, tours image 512² et 1024² (`data:` URL), `capabilities.image=true` | tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16384 patches | 512² : 256 tokens image, TTFT 8,19 s ; 1024² : 1024 tokens, TTFT 28,73 s ; réponses correctes ; 856/856 kbench dans les deux modes, 480/480 cas vision |
 
 Hors v1 et non planifié : codebook `w4nl` dans `w4a8` seulement. Le MTP et la
@@ -160,13 +160,13 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   not serve » sur `w4nl`), donc le temps par row MoE et η lien par noyau ne
   sont pas mesurables sur cet artefact ; aligner les tags de format ou passer
   par une fixture `--record`.
-- **R25** — MTP Flash-Next **dans la cible** (ADR-7) : le plugin déclare
-  `mtp_enter`, `mtp_couple_propose` et `logit_rerank` à `NS > 0`, et `libr3d`
-  ne sert aucune des deux rows device (`mtp_enter`, `logit_rerank`) ; le run
-  reste donc replié sur `num-speculative-tokens: 0` tant que W25 n'est pas
-  livré. Les experts du MTP 48 (`w4nl` `u4`) sont déjà servis par
-  `moe_gemm_w4nl` ; restent les deux rows et la couverture kbench des cas MTP.
-  Le 27B n'est pas concerné (son drafter h128 exige un KV bf16).
+- **R25** — *résolu* (W25) : rows `mtp_enter_e4m3` et `logit_rerank_iqr`/`_i8`
+  en device, plus deux corrections de `gemm_nt_q_w2a8_m16` (en-tête du poids
+  joint lu sur l'hôte alors qu'il vit en VRAM ; MT dont le chunk ne divise pas
+  K à M=1/K=2560). Flash-Next sert à `NS=3` : **4,51 → 8,21 tok/s (1,82×)**,
+  texte identique, acceptation 40,3 % (66/61/37 % aux profondeurs 1–3).
+  kbench 872/872 (FN) et 605/605 (27B) dans les deux modes. Reste la
+  couverture des tables MTP 48 par kbench (R23). Le 27B reste à `NS=0`.
 - **R26** — *résolu* (W26) : build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3,
   ffmpeg 8.0), tour de 27 blocs (856,68 Mio) placée en VRAM, staging média de
   48,27 Mio pour 16 384 patches. `capabilities.image=true` ; image 512² servie

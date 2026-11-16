@@ -63,5 +63,9 @@ MTP 48 tables and `ngram_hint`.
   (libavformat 62.3), the tower (856.68 MiB) is in VRAM, `capabilities.image`
   is true, and 512²/1024² image turns are answered correctly. Video and audio
   are advertised by the processor but untested.
-- MTP: **open**. `mtp_enter` and `logit_rerank` still have no `libr3d` device
-  row; the run stays at `num-speculative-tokens: 0` until W25.
+- MTP: **delivered** (W25). `libr3d` serves `mtp_enter_e4m3` and
+  `logit_rerank_iqr`/`_i8`; two pre-existing `gemm_nt_q_w2a8_m16` faults were
+  fixed on the way (a joined weight's header was read from VRAM, and the MT
+  chunk did not divide K at M=1/K=2560). The service runs at
+  `num-speculative-tokens: 3` with 1.82× the decode throughput and identical
+  greedy text (40.3% acceptance); the MTP 48 table coverage remains with R23.

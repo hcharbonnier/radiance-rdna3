@@ -961,6 +961,57 @@ identique avant/après.
   de diagnostic (une ligne de log par image : taille après resize, patches,
   tokens ; un message de watchdog adapté aux passes média).
 
+## 2026-11-16 — W25 : MTP de Flash-Next servi (R25)
+
+**Rows.** `libr3d` sert deux nouvelles rows, sur les contrats de `libr4d` et
+`libref` :
+- `mtp_enter_e4m3` : norme groupée du flux large (`hc` sous-flux), norme de
+  l'embedding, deux produits E4M3 `[n,n]` (scale f32 par 128) et le mélange
+  `wadd` ; noyau un warp par canal, norme en LDS. Test device : 22 checks sur
+  3 cas, contre `libref`, M=1..32, hc=4, n=2560.
+- `logit_rerank_iqr` et `logit_rerank_i8` : rescore exact des `R=8`
+  candidats du draft head contre la tête `lm_head` du tronc ; IQR (u3/u4) et
+  i8 (`i8*bf16[1x128]`), `vocab_off` géré, `pairs` optionnel (monde > 1).
+  Test device : 36 checks sur 5 cas, M=1..8, N=248320, K=2560, dont la
+  forme réelle du conteneur. Selftest : **164 rows, 0 échec, 15 skips**.
+
+**Deux bugs préexistants de `gemm_nt_q_w2a8_m16`, révélés par le draft head.**
+1. **En-tête lu sur l'hôte** : le shim et le launcher appelaient
+   `rad_planes_header` sur le poids `b_scale`, qui vit en **VRAM** quand l'op
+   est sur la carte ; le CPU déréférençait donc un pointeur GPU → SIGSEGV au
+   premier pas de spéculation. Preuve : `rocgdb` sur le serveur NS=3,
+   `si_addr=0x7fe1c4347000`, `cmpl $0x534e4c50,(%rax)` (le magic
+   `rad.planes`) dans `r3d_rad_gemm_nt_q_w2a8+2114`. Correctif : les offsets
+   des plans (scale f16, zero u8) se déduisent de la règle de layout
+   (`header + 2 entries`, aligné 64), sans lire l'en-tête ; le hook de layout
+   impose désormais un zero `u8` (les deux bras le refusaient déjà).
+2. **Chunk de K contre M** : le MT était choisi par M seul ; à M=1,
+   `chunk = 2048`, et `K=2560` n'est pas un multiple → refus « shape ».
+   Correctif : plus petit MT ≥ M dont le chunk divise K (MT=4 pour
+   M=1, K=2560), le noyau stockant seulement `m < M`.
+
+**Validation.** `sched_test` et `engine_e2e_test` verts ; `iqr_device_test`,
+`logits_bf16`, `gather_rows_u8`, `vision_rows`, les deux tests MTP/rerank et
+`r3d_selftest` verts. kbench Flash-Next `--kernels libr3d:libref
+--max-cases 1` : **872/872** dans les deux modes (16 cas de plus qu'avant :
+les rows MTP sont servies et vérifiées), 0 divergence, pire rel_l2 1,206e-2 ;
+27B **605/605** dans les deux modes, pire rel_l2 3,619e-3. Les tables MTP 48
+(`moe_gemm_q`) restent « Not covered » : c'est la couverture de R23.
+
+**Service et gain.** Flash-Next avec `--num-speculative-tokens 3`, même
+prompt et greedy (`max_tokens 256`, 1 séquence, 8k, KV i8, host pool 43 000,
+build FFmpeg) :
+
+| | NS=0 | NS=3 |
+|---|---|---|
+| décodage | 4,508 tok/s (255 pas) | **8,213 tok/s** (115 pas) |
+| TTFT | 1,92 s | 2,03 s |
+| texte | 1322 car. | **identique** (1322 car.) |
+| acceptation | — | 40,3 % global (66,1 / 60,5 / 37,0 % aux profondeurs 1–3) |
+
+Soit **1,82×** le décodage à texte identique, sans changer le préfill. Le 27B
+reste à `NS=0` (son drafter h128 exige un KV bf16).
+
 
 
 

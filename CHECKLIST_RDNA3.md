@@ -43,10 +43,14 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [ ] **R23 tables MoE** — kbench ne pose pas les tables du conteneur (110 cas
       sautés) ; aligner les tags de format ou passer par une fixture
       `--record`, puis remplir le temps par row MoE et η lien par noyau.
-- [ ] **R25 MTP Flash-Next (ADR-7)** — écrire `mtp_enter` et `logit_rerank`
-      en device dans `libr3d` (mêmes contrats que `libr4d`), puis servir avec
-      `num-speculative-tokens > 0`, couvrir les cas MTP 48 de kbench et mesurer
-      le gain de décodage. Le 27B reste à 0 (drafter h128 en bf16).
+- [x] **R25 MTP Flash-Next (ADR-7)** — rows device `mtp_enter_e4m3`,
+      `logit_rerank_iqr` et `logit_rerank_i8` (contrats `libr4d`), tests
+      device (22 + 36 checks), selftest **164 rows**. Deux bugs préexistants
+      de `gemm_nt_q_w2a8_m16` corrigés (en-tête du poids joint lu sur l'hôte
+      alors qu'il vit en VRAM ; chunk de K incompatible à M=1/K=2560). Service
+      à `NS=3` : décodage **4,51 → 8,21 tok/s (1,82×)**, texte identique,
+      acceptation 40,3 % (66/61/37 % aux profondeurs 1–3). Les tables MTP 48
+      restent à couvrir par kbench via R23.
 - [ ] 2.11/2.12 — formes mixtes par couche et rows `mod4` (seulement si `tp=4`).
 
 **P2 — couverture, doc, clôture**
@@ -104,6 +108,11 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       62.3, ffmpeg 8.0), tour 856,68 Mio en VRAM, `capabilities.image=true`,
       tour image 512² et 1024² accepté et répondu ; 856/856 kbench dans les
       deux modes et 480/480 cas vision, 0 divergence
+- [x] W25 (R25) — MTP de Flash-Next : `mtp_enter_e4m3` et
+      `logit_rerank_iqr`/`_i8` en device, `gemm_nt_q_w2a8_m16` corrigé pour
+      un poids joint en VRAM et pour M=1/K=2560 ; **164 rows** au selftest,
+      **872/872** kbench Flash-Next et 605/605 27B dans les deux modes ;
+      NS=3 servi, **1,82×** le décodage à texte identique
 - [x] M3 (QSA) — équivalent au dense, 4 ops device vertes
 - [x] M4 — coûts HC/PLE/QSA documentés (MoE par row bloqué, cf. R23)
 - [x] M5 / M6 — Flash-Next texte 1/4/6 séquences, 8k et 16k, démo,
@@ -208,9 +217,10 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       43000`, KV i8, **`max_mixed_tok ≤ 2048`** (le plan `score` fait 512 MiB
       à 2048 lignes, 1 Gio à 4096 et le plugin refuse), `max-model-len: 8192`.
       Vérifiée en W19 (serveur démarré avec ces réglages) ; le tier KV hôte est
-      actif depuis R21, avec les deux groupes paginés de Flash-Next. Le
-      `num-speculative-tokens: 0` de l'ADR-6 n'est plus la configuration servie
-      dès que R25 est livré (ADR-7) ; il reste le repli entre-temps. Depuis
+      actif depuis R21, avec les deux groupes paginés de Flash-Next. Depuis
+      R25, la configuration servie est **`num-speculative-tokens: 3`** (MTP
+      actif, 1,82× le décodage) ; 0 reste le repli pour comparer ou si un
+      drafter n'est pas servi. Depuis
       R26, le build servi exige `-DRAD_WITH_FFMPEG=ON`, `--mm-max-patches`
       reste `auto` (16384 patches, 2048²) et la tour tient en VRAM
       (856,68 Mio) dans le budget `host-pool-mib: 43000` / marge 96 Mio.
@@ -321,9 +331,10 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       `capabilities.image=true`, tours image 512²/1024²/2048² acceptés et
       répondus, 18 cas de robustesse (multi-images, formats, erreurs 400),
       limite retirée de `TABLEAU_REEL_IDEAL_RDNA3.md` (W26).
-- [ ] 8.9 **MTP Flash-Next (ADR-7)** : `mtp_enter` et `logit_rerank` en device,
-      run avec `num-speculative-tokens > 0`, cas MTP 48 couverts par kbench
-      (0 « Not covered » sur le MTP), gain de décodage mesuré et consigné.
+- [~] 8.9 **MTP Flash-Next (ADR-7)** : `mtp_enter` et `logit_rerank` en device,
+      run à `NS=3` et gain mesuré (4,51 → 8,21 tok/s, 1,82×, texte identique,
+      40,3 % d'acceptation) ; **reste** la couverture des tables MTP 48 par
+      kbench (0 « Not covered » MTP), bloquée par R23.
 
 ## 9. Ordre de marche suggéré (parallélisable)
 

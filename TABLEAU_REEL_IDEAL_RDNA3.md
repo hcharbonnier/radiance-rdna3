@@ -401,6 +401,25 @@ Limites observées, à connaître pour l'exploitation :
   dimensionné pour un pass de 16 384 patches, chaque image étant préparée
   séparément.
 
+## MTP Flash-Next (W25, 2026-11-16)
+
+Rows `mtp_enter_e4m3` (norme groupée du flux large + deux produits E4M3) et
+`logit_rerank_iqr`/`_i8` (rescore exact des 8 candidats du draft head),
+plus deux corrections de `gemm_nt_q_w2a8_m16` (l'en-tête d'un poids joint en
+VRAM n'est plus lu sur l'hôte ; le MT est choisi pour que son chunk divise K,
+cas M=1/K=2560). Serveur Flash-Next, même prompt, greedy, `max_tokens 256`,
+1 séquence, 8k, KV i8, host pool 43 000, build FFmpeg :
+
+| | NS=0 | NS=3 |
+|---|---|---|
+| décodage | 4,508 tok/s (255 pas) | **8,213 tok/s** (115 pas) |
+| TTFT | 1,92 s | 2,03 s |
+| texte | 1 322 car. | **identique** (1 322 car.) |
+| acceptation | — | **40,3 %** (66,1 / 60,5 / 37,0 % aux profondeurs 1–3) |
+
+**1,82×** le décodage à texte identique, sans toucher au préfill. Les tables
+MTP 48 (`moe_gemm_q`) restent « Not covered » par kbench : c'est R23.
+
 ### Ce que M6 ne démontre pas
 
 - Le préfixe multi-tour **au-delà de 2 048 tokens** : le tier KV hôte est actif
@@ -408,8 +427,8 @@ Limites observées, à connaître pour l'exploitation :
   exercé une session de 200k ; il faudrait ~10 × plus de pool.
 - L'image/vision : **levé en W26** (voir § Vision) ; la vidéo et l'audio ne sont pas
   testés.
-- Le MTP de Flash-Next : `num-speculative-tokens: 0` et pas de row device pour
-  `mtp_enter`/`logit_rerank`. **Dans la cible depuis l'ADR-7** : lot W25.
+- Le MTP de Flash-Next : **levé en W25** (voir § MTP) ; seule la couverture
+  kbench des tables MTP 48 reste attachée à R23.
 
 ## Lecture
 

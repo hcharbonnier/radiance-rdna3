@@ -67,8 +67,9 @@ The table groups the rows by family; `r3d_rows.cpp` and `r3d.h` hold the full se
 | `moe` | `expert_scale_bf16` (the renormalised top-k weight times the expert's per-expert scale, in place), `moe_router_topk_bf16` (softmax top-k, renormalised if `norm`), `moe_router_topk_scatter` (the top-k and the counting sort as one op), `moe_router_sigmoid_topk` (the GLM-style router: sigmoid scores, selection on scores + bias, the kept weights scaled by `route_scale`), `moe_scatter_small` (the routed slots' stable counting sort: one workgroup up to 1024 slots, three passes over 256-slot tiles above), `moe_gather` (fold the expert outputs back to the token, with the optional shared arm), `moe_gemm_q_e4m3` (grouped E4M3 GEMM; the `impl` axis: 16x16 table decode, 16x16 ALU decode, 16x128 block with the F32 scales folded), `moe_gemm_bf16` (unquantised experts, wave matrix), `moe_gemm_mxfp4a8` (canonical MXFP4 experts), `moe_gemm_w4a8` (int8 activation, packed two's-complement int4 experts: the i32 wave matrix, an f32 a-scale and a bf16 w-scale per (row, 128 of K), token- and sorted-order `a`), `moe_gemm_w4a4` (int4 activation, packed two's-complement int4 experts: both widen to int8 on the i32 wave matrix, an f32 a-scale and a bf16 w-scale per (row, 128 of K), token- and sorted-order `a`), `row_topk_{bf16,f32}` (the reference files the op under `moe`, so the row does too) |
 | `gdn` | `gdn_kkt_solve_c64` (`A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1` per 64-chunk; libhalo's kernel), `gdn_chunk_scan_k128_v128_c64` (the chunked scan: WY recompute, state recurrence and output in one kernel; libhalo's), `gdn_gated_rmsnorm_h128`, `gdn_gated_norm_had_quant_i8` (the gated norm fused with the rotation and quantiser), `gdn_conv_prep_w4_h128` (causal conv, split, l2norm, gating and the per-chunk gate cumsum in one prefill kernel), `gdn_conv_update_w4_h128` (the same convolution at decode over a rolling conv-state buffer), `gdn_recurrent_update_k128_v128` (the decode-time recurrent state update, per_candidate or anchor; libhalo's), `gdn_conv_recurrent_update_k128_v128` (the convolution and the recurrent update as one decode kernel, q/k/v never materialised; libhalo's) |
 | `draft` | `dflash_select_bf16`: the drafter's accept step, a walk over the draft block's candidate lattice |
+| `mtp` | `mtp_enter_e4m3` (the MTP head's entry: grouped pre-fc norm of the wide stream, the embedding norm, two E4M3 fc matrices and the `wadd` gate), `logit_rerank_iqr` and `logit_rerank_i8` (exact rescoring of a draft round's `R` candidates against the trunk's lm_head, in the IQR and i8 forms) |
 
-The table holds 161 rows over 99 schemas; `r3d_selftest` checks every schema slot for slot against
+The table holds 164 rows over 101 schemas; `r3d_selftest` checks every schema slot for slot against
 the `libref.so` beside the plugin. Eighteen rows carry tune axes (see
 [Tunable params](#tunable-params)); the rest are single-implementation.
 
@@ -615,10 +616,14 @@ ABI's own answer.
   extent in the issued tensors (`o.rows` after the issue's narrowing). A kernel that read the
   ranged `M` as its loop bound would read and write past a shorter step; every row here takes its
   bounds from the operands, and `rad-kbench --band-capacity` exercises the contract.
-- **MTP 48 coverage is in progress (W25).** Flash-Next's layer 48 and `mtp.draft_head` are in the
-  v1 target (ADR-7), but this library declares neither `mtp_enter` nor `logit_rerank`, and the
-  kbench MTP 48 cases are not covered yet. Do not read the current `Not covered` list as an
-  exclusion, and do not document the draft path as served.
+- **MTP 48 table coverage is open (R23).** Flash-Next's MTP is served: this library declares
+  `mtp_enter` and `logit_rerank` (IQR and i8), and `NS=3` gives 1.82× the decode with identical
+  greedy text. What kbench still cannot pose is the container's MTP 48 **expert tables**
+  (`moe_gemm_q`), so their "Not covered" cases are a tooling gap, not a missing row.
+- **A joined weight may live in VRAM.** A row that reads a `rad.planes` header at issue must not
+  dereference it on the host (a W25 SIGSEGV in `gemm_nt_q_w2a8_m16`): derive the plane offsets
+  from the layout rule, or keep a host copy. The `w2a8` arm also picks an MT whose chunk divides
+  K (M=1/K=2560 uses MT=4).
 
 ## What is not here yet
 
