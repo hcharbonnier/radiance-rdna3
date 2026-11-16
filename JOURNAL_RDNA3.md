@@ -534,6 +534,40 @@ sur `rdna3-iqr`.
 block 4, `rope` h128 imrope, router fusionné, `gemm_nt` N=1, rows vision
 (`gemm_nt_bias`, `grid_embed`), et réconciliation MoE ; `moe_gemm_w4nl` suivra.
 
+## 2026-11-16 — W15 : rows Flash-Next
+
+Huit agents en worktrees, revus par leurs auteurs puis fusionnés sur
+`rdna3-iqr` (`2177619`). `moe_gemm_w4nl` reste en cours.
+
+- **`kSigned` 8** : `RAD_I8 → kSigned, B=8`, `X(kSigned,8,0,0,0,kBf16)` dans
+  `R3D_IQR_FORMS`, acceptation dans les trois familles denses, échelle bf16 par
+  128, codes i8 directs ; le treillis reste bit-identique. Débloque k/v/output,
+  `ssm_out`, partagés et PLE du tronc Flash-Next.
+- **`gdn_conv_recurrent_update_had`** : row device, conv + recurrent + decode i8
+  tourné, testée contre la paire non fusionnée sur quatre séquences, fenêtre
+  pleine et groupe 256 (46 checks).
+- **`kv_store` block 4** : i8, head_dim 256, n_head_kv 2, M=4096, pages
+  partielles, block 16 bit-identique (test device dédié).
+- **`rope` imrope h128** : sections 11/11/10, rotary 64, 2 097 152 valeurs
+  exactes à M=4096, h256/h72 inchangés.
+- **Router fusionné** : GEMM + top-k + tri en device, `protect`, égalités
+  déterministes, 38 checks.
+- **`gemm_nt` N=1** : row GEMV bf16 dédiée, sélection et refus testés.
+- **Vision** : `gemm_nt_bias` et `grid_embed` en device, 66 checks, 142 rows
+  vision toujours vertes.
+- **MoE** : `moe_iqr_test` réconcilié — le test demandait une classe impaire
+  plus étroite que la row refuse par contrat ; plans à classes égales, refus
+  épinglé. 10 formes, 0 écart (tolérance 2 ulp), `moe_iqr_device_test` 15/15.
+
+**Validation** : `iqr_device_test`, les quatre tests QSA, `moe_iqr_device_test`,
+`moe_iqr_test`, `kv_store_b4`, `rope` h128, router, `gemm_nt` N=1, vision et
+GDN had verts ; `r3d_selftest` **158 rows, 0 échec, 15 skips**.
+
+**Reste** : `moe_gemm_w4nl` (25 590 poids `down` + MTP 48), puis démarrage réel
+de Flash-Next avec `num-speculative-tokens: 0`, `max_mixed_tok ≤ 2048`,
+`expert_tiered`, et les mesures HC/PLE.
+
+
 
 
 

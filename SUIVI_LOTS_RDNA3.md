@@ -13,17 +13,17 @@
 | W2 — décodeur device | en cours | 1,5 sem | treillis + table/grille faits ; `kSigned`/`w4nl` en W15 |
 | W3 — GEMM M ≤ 16 | **terminé (2026-11-15)** | 1,5 sem | GEMV 86 % ; split-K `down` 76,6 % (1,55×) |
 | W4 — m64 et préfill | **terminé (résident) ; WMMA éteinte** | 2,5 sem | tuile résidente 15,5 TFLOP/s ; WMMA 25–32 % plus lente, à reprendre en W14 |
-| W5 — MoE IQR | **en cours** | 4 sem | row treillis + run map + référence hôte ; `moe_iqr_test` à réconcilier ; `w4nl`, formes mixtes, experts bf16 |
-| W6 — attention h256/GQA/KV i8 | **terminé (revu, 15/15 device)** | 3,5 sem | + kv_store i8 block 4, rope imrope h128 (W15) |
+| W5 — MoE IQR | **en cours** | 4 sem | treillis + run map + référence hôte verts (10 formes, 0 écart) ; **`w4nl` en cours**, puis formes mixtes et experts bf16 |
+| W6 — attention h256/GQA/KV i8 | **terminé (revu, 15/15 device)** | 3,5 sem | kv_store i8 block 4 et rope imrope h128 livrés en W15 |
 | W7 — QSA | **terminé (2026-11-16, 4 ops)** | 2,5 sem | tests libref verts ; perf à mesurer |
 | W8 — HC | **terminé (revu, device vert)** | 3,5 sem | 6 rows ; perf à mesurer |
 | W9 — PLE | **terminé (revu, device vert)** | 1,5 sem | 4 rows ; perf à mesurer |
-| W10 — vision | **terminé (revu, 142 rows vertes)** | 3 sem | `gemm_nt_bias`/`grid_embed` device en W15 |
+| W10 — vision | **terminé (revu, 142 rows vertes)** | 3 sem | `gemm_nt_bias`/`grid_embed` device livrés en W15 |
 | W11 — intégration | **terminé (2026-11-15)** | 1,5 sem | tête vocabulaire validée et servie par défaut |
 | W12 — optimisation | **terminé (2026-11-15)** | 3–4 sem | préfill 27B ×3,8 ; gated fusionné ; tête 16 bits ; h256/vision |
 | W13 — optimisation | **terminé (2026-11-15)** | 2 sem | split-K `down` 1,55× ; vision −49 % à M=512 ; tête un lancement ; h256 ; WMMA mesurée plus lente et éteinte |
 | W14 — audit et rows | **terminé sauf réconciliation MoE** | 1 sem | audit Flash-Next ; 4 ops QSA ; MoE treillis + référence ; formes denses table/grille ; **151 rows / 0 échec** |
-| W15 — rows Flash-Next | **en cours (8 agents)** | 2 sem | `kSigned` 8, `gdn_conv_recurrent_update_had`, `kv_store` b4, `rope` h128, router fusionné, `gemm_nt` N=1, rows vision, `moe_gemm_w4nl` |
+| W15 — rows Flash-Next | **terminé sauf `w4nl`** | 2 sem | `kSigned` 8, `gdn_conv_recurrent_update_had`, `kv_store` b4, `rope` h128, router fusionné, `gemm_nt` N=1, rows vision ; **158 rows / 0 échec / 15 skips** ; `moe_iqr_test` réconcilié |
 | M0 — Go/No-Go | **GO (2026-11-15)** | fin S3 | `MEMO_M0_RDNA3.md` |
 | M1 — dense IQR | **atteint et dépassé : 27B texte, décodage 28,4 tok/s (16 tok) / 21,2 (819), préfill 301 tok/s à 819** | fin S8 | W15 : WMMA, occupation gated, mesure M=16384 |
 
@@ -72,7 +72,6 @@
   lignes et 1 Gio à 4096 (le plugin refuse) ; garder `max_mixed_tok ≤ 2048` ou
   baisser `max-model-len`. La v1 fixe `num-speculative-tokens: 0` (MTP hors
   périmètre), `placement: expert_tiered`, `host-pool-mib: 43000`.
-- **R15** — `moe_iqr_test` (référence hôte) échoue encore sur la carte alors
-  que `moe_iqr_device_test` passe : le schéma/les parts/le run map diffèrent
-  entre les deux tests. Un agent d'intégration réconcilie ; ne pas conclure M2
-  avant son vert.
+- **R15** — *résolu* : `moe_iqr_test` demandait une classe impaire plus étroite
+  que la row refuse par contrat ; les plans carte sont passés à classes égales
+  et le refus est épinglé. 10 formes, 0 écart (tolérance 2 ulp).

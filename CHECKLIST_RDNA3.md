@@ -1,7 +1,7 @@
 # Checklist de clôture — RDNA3 / Qwen3.8 Flash-Next IQR-V4
 
-État au 2026-11-16, branche `rdna3-iqr`, pointe `fb07ba3` (W14 fusionné, `moe_iqr_test`
-en cours de réconciliation). Sert à suivre l'avancement ; cocher au fur et à
+État au 2026-11-16, branche `rdna3-iqr`, pointe `2177619` (W14 et W15 fusionnés,
+seul `moe_gemm_w4nl` reste en cours). Sert à suivre l'avancement ; cocher au fur et à
 mesure et dater la ligne. Le détail des décisions et mesures est dans
 `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md`, `SUIVI_LOTS_RDNA3.md`,
 `HANDOVER_RDNA3_PHASE6.md` et `FLASH_NEXT_AUDIT.md`.
@@ -21,8 +21,12 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 - [x] W12 / W13 — optimisations, **144 rows / 0 échec / 14 skips**, device 6/27
 - [x] W14 — audit Flash-Next (`FLASH_NEXT_AUDIT.md`), 4 ops QSA device (tests
       libref verts), row MoE IQR treillis, référence hôte MoE, formes denses
-      table/grille ; **151 rows / 0 échec / 14 skips** (hors `moe_iqr_test`,
-      en cours de réconciliation)
+      table/grille ; **151 rows / 0 échec / 14 skips**, puis `moe_iqr_test`
+      réconcilié (10 formes, 0 écart)
+- [x] W15 — `kSigned` 8, `gdn_conv_recurrent_update_had`, `kv_store` block 4,
+      `rope` imrope h128, router fusionné, `gemm_nt` N=1, `gemm_nt_bias`,
+      `grid_embed` ; **158 rows / 0 échec / 15 skips**, tous les tests device
+      W15 verts. Seul `moe_gemm_w4nl` reste (agent en cours).
 - [x] M1 — 27B texte : décodage 28,4 tok/s (16 tok), 21,2 (819), préfill 301
 - [x] M7 (dense) — tableau rempli pour les rows denses
 - [x] ADR-1 à ADR-6 — écrits dans `docs/adr/`
@@ -40,10 +44,10 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
       à couvrir avec leurs lots.
 - [ ] 1.5 Mettre à jour `docs/OPS.md`, `libr3d/README.md` et le tableau des
       tailles de plans pour les formes ajoutées.
-- [ ] 1.6 **`kSigned` 8** : `RAD_I8 → kSigned, B=8`, `X(kSigned,8,0,0,0,kBf16)`
+- [x] 1.6 **`kSigned` 8** : `RAD_I8 → kSigned, B=8`, `X(kSigned,8,0,0,0,kBf16)`
       dans `R3D_IQR_FORMS`, acceptation dans les trois familles, décodage i8
       direct, bandes mixtes `kSigned`+`kTrellisMad`. Agent W15 dédié.
-- [ ] 1.7 Vérifier l'agrégation par bande : une row qui accepte les deux formes
+- [~] 1.7 Vérifier l'agrégation par bande : une row qui accepte les deux formes
       couvre `N=512 K=2560` et `N=2560 K=6144` (MTP 48).
 
 ## 2. W5 — MoE IQR / jalon M2 (~4 semaines, chemin critique)
@@ -65,7 +69,7 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 - [ ] 2.8 Mesure M2 : décodage 1 et 4 séquences, préfill 2048/4096, **η lien
       ≥ 80 %**.
 - [ ] 2.9 Doc de la row MoE et des limites connues.
-- [ ] 2.10 **`moe_gemm_w4nl`** : forme `kW4NL` (table f32[16], E4M3/64 + f32,
+- [~] 2.10 **`moe_gemm_w4nl`** : forme `kW4NL` (table f32[16], E4M3/64 + f32,
       `group=64`), row device, `a_order` token/sorted, N=1280/2560,
       K=2560/640, MTP 48. **Requis pour Flash-Next** (25 590 poids `down`).
 - [ ] 2.11 MoE : formes mixtes dans une couche (treillis gate_up + w4nl down)
@@ -86,17 +90,17 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 
 ## 4. Rows et formes découvertes par l'audit (W15)
 
-- [ ] 4.1 `gdn_conv_recurrent_update_had` — bloque le déclaratif Flash-Next
+- [x] 4.1 `gdn_conv_recurrent_update_had` — bloque le déclaratif Flash-Next
       (`libr3d` seul) ; agent W15.
-- [ ] 4.2 `kv_store` i8 **block 4** (head_dim 256, n_head_kv 2, M=4096) ;
+- [x] 4.2 `kv_store` i8 **block 4** (head_dim 256, n_head_kv 2, M=4096) ;
       agent W15.
-- [ ] 4.3 `rope` **imrope h128** (sections 11/11/10, rotary 64) ; agent W15.
-- [ ] 4.4 `router_gemm_topk_scatter` device (M≤64, E=512, top_k=10, protect) ;
+- [x] 4.3 `rope` **imrope h128** (sections 11/11/10, rotary 64) ; agent W15.
+- [x] 4.4 `router_gemm_topk_scatter` device (M≤64, E=512, top_k=10, protect) ;
       agent W15 (fusion ou paire selon ce que le plugin demande).
-- [ ] 4.5 `gemm_nt` **N=1** device (shared gate, K=2560, M=2048) ; agent W15.
-- [ ] 4.6 `gemm_nt_bias` et `grid_embed` vision device ; agent W15.
-- [ ] 4.7 `kSigned` 8 (voir 1.6 et 1.7).
-- [ ] 4.8 `moe_gemm_w4nl` (voir 2.10).
+- [x] 4.5 `gemm_nt` **N=1** device (shared gate, K=2560, M=2048) ; agent W15.
+- [x] 4.6 `gemm_nt_bias` et `grid_embed` vision device ; agent W15.
+- [x] 4.7 `kSigned` 8 (voir 1.6 et 1.7).
+- [~] 4.8 `moe_gemm_w4nl` (voir 2.10).
 
 ## 4bis. M5/M6 — intégration Flash-Next (~1,5 semaine)
 
@@ -153,7 +157,7 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 
 ## 8. Critères de clôture du projet
 
-- [ ] 8.1 `r3d_selftest` **151/0/14** (144 + les 7 rows QSA/MoE), `iqr_device_test`,
+- [ ] 8.1 `r3d_selftest` **158/0/15** (144 + QSA/MoE + W15), `iqr_device_test`,
       `moe_iqr_test` et les quatre tests QSA verts sur la pointe.
 - [ ] 8.2 Flash-Next démarre et génère (texte, 1 et 4 séquences, préfills
       2048/4096) sans fallback ni avertissement nouveau.
@@ -167,12 +171,11 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 ## 9. Ordre de marche suggéré (parallélisable)
 
 1. **W14 (fait)** : audit, 4 ops QSA, MoE treillis + référence, formes denses
-   table/grille, 151 rows vertes hors `moe_iqr_test`.
-2. **W15 (en cours)** : `kSigned` 8, `gdn_conv_recurrent_update_had`,
+   table/grille ; **151 rows** puis **158 rows** après W15.
+2. **W15 (fait sauf w4nl)** : `kSigned` 8, `gdn_conv_recurrent_update_had`,
    `kv_store` b4, `rope` h128 imrope, router fusionné, `gemm_nt` N=1,
-   rows vision (`gemm_nt_bias`, `grid_embed`), réconciliation `moe_iqr_test`.
-3. **W15b** : `moe_gemm_w4nl` + formes mixtes/bf16 protégé (après la
-   réconciliation du schéma MoE).
+   rows vision (`gemm_nt_bias`, `grid_embed`), `moe_iqr_test` réconcilié.
+3. **W15b** : `moe_gemm_w4nl` + formes mixtes/bf16 protégé (en cours).
 4. **Intégration** : démarrage Flash-Next réel, config v1 (`num-spec 0`,
    `max_mixed_tok ≤ 2048`, `expert_tiered`), 1/4 séquences, préfills 2048/4096.
 5. **Mesures** : HC/PLE, MoE, QSA, R3, tableau + RAPPORT.
