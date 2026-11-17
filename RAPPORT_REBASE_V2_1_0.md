@@ -209,9 +209,9 @@ Arbre neuf `<work-root>/work/w29-rebase`, `rsync` sans `external/`,
 `external-docs/`, `.git` ni `build/` :
 
 ```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B build-clean -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DRAD_GPU_TARGETS=gfx1100 -DRAD_WITH_FFMPEG=ON
-cmake --build build -j 24
+cmake --build build-clean -j 24
 ```
 
 **EXIT=0.** `libr4d` et `libhalo` ne sont pas construits (cibles gfx12xx /
@@ -225,7 +225,7 @@ gfx1151), comme attendu. Aucun doublon de row ou de schéma après le rebase
 | `r3d_selftest` | **195 rows, 0 échec, 16 skips** | 190 rows, 0 échec, 16 skips |
 | `sched_test` | **548 952 checks, 212 cas, 0 échec** | 548 782 checks |
 | `engine_e2e_test` | **1 076 checks, 51 cas (3 skips), 0 échec** | 909 checks |
-| `fixture_test` | 92 385 checks, 59 cas (7 skips) | — |
+| `fixture_test` | 109 671 checks, 59 cas (7 skips) | — |
 | `build_test` | 969 checks, 65 cas | — |
 | `shipped_plugins_test` | 1 010 checks, 6 cas | — |
 | `abi_layout_test` | 16 checks, 4 cas | — |
@@ -467,9 +467,9 @@ git branch rdna3-iqr-pre-rebase 20c5947      # existante
 git -c rerere.enabled=true rebase main
 
 # Build neuf
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+cmake -S . -B build-clean -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DRAD_GPU_TARGETS=gfx1100 -DRAD_WITH_FFMPEG=ON
-cmake --build build -j 24
+cmake --build build-clean -j 24
 
 # Validation
 flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <tree> && \
