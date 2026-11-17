@@ -467,6 +467,85 @@ int form_supported(const Form& f) {
            f.bits >= 8 && f.bits <= 12;
 }
 
+/* ---- GS=1 path, restored from the W26 kernel: the W27 group loop costs 17% on the
+ * 27B (GS=1); GS=2 keeps the grouped kernels below. ---- */
+
+template <class F, int W>
+__global__ void __launch_bounds__(W * kIqrWave) R3D_WAVES(4)
+gemm_iqr_resident_gs1_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
+                         const uint8_t* __restrict__ b, const uint8_t* __restrict__ bs,
+                         uint16_t* __restrict__ y, int M, int N, int K, int a_ld, int y_ld,
+                         uint32_t run_tiles) {
+    const uint32_t lane = threadIdx.x & (kIqrWave - 1);
+    const uint32_t wave = threadIdx.x / kIqrWave;
+    const uint32_t nkb = (uint32_t)(K / 128);
+    const uint32_t nm = ((uint32_t)M + 16u * W - 1u) / (16u * W);
+    /* Consecutive blocks share a weight tile, so the L2 stream a group of blocks reads is one. */
+    const uint32_t rt = (uint32_t)blockIdx.x / nm;
+    const uint32_t m0 = ((uint32_t)blockIdx.x % nm) * (16u * W) + wave * 16u;
+    Ctx c;
+    c.W = b;
+    c.S = bs;
+    c.N = (uint32_t)N;
+    c.nkb = nkb;
+    c.run_tiles = run_tiles;
+    c.tab = nullptr;
+
+    /* The decoded 16x128 int8 tile, shared by the workgroup's W slices, and the form's table. */
+    __shared__ uint32_t sW[16 * kIqrSWPitch];
+    __shared__ __align__(16) int8_t sTab[Dec<F>::kTab];
+    if constexpr (Dec<F>::kTab > 4) {   /* a table form; the computed trellis reads none */
+        Dec<F>::stage(sTab, c, threadIdx.x, blockDim.x);
+        __syncthreads();
+        c.tab = sTab;
+    }
+    const int row0 = (int)rt * 16;
+
+    constexpr int NP = 8;   /* (token, row) pairs a lane: 16 tokens x 16 rows over one wave */
+    float acc[NP];
+#pragma unroll
+    for (int i = 0; i < NP; ++i) acc[i] = 0.0f;
+
+    for (uint32_t kb = 0; kb < nkb; ++kb) {
+        if (wave == 0) {
+            const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
+            uint32_t w[16];
+            Dec<F>::rows(r, c, 1.0f, w);
+            Dec<F>::unzero(c, rt, kb, w);
+#pragma unroll
+            for (int q = 0; q < 16; ++q) sW[q * kIqrSWPitch + lane] = w[q];
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int i = 0; i < NP; ++i) {
+            const int p = (int)lane + kIqrWave * i;
+            const uint32_t mu = m0 + (uint32_t)(p / 16);
+            if (mu >= (uint32_t)M) continue;
+            const int m = (int)mu, q = p % 16;
+            int sub = 0;
+            const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
+            const uint32_t* wp = sW + q * kIqrSWPitch;
+#pragma unroll
+            for (int c4 = 0; c4 < 32; ++c4)
+                sub = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub);
+            const float sa = as[m * nkb + kb];
+            const float sb = fold_f32<F>(c, row0 + q, kb);
+            acc[i] += (float)sub * sa * sb;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < NP; ++i) {
+        const int p = (int)lane + kIqrWave * i;
+        const uint32_t mu = m0 + (uint32_t)(p / 16);
+        if (mu >= (uint32_t)M) continue;
+        const int m = (int)mu, q = p % 16;
+        y[(long long)m * y_ld + row0 + q] = f32_to_bf16(acc[i] * row_scale<F>(c, row0 + q));
+    }
+}
+
 }  // namespace
 
 using namespace r3d_iqr;
@@ -531,12 +610,29 @@ static int launch_wmma(const uint8_t* b, const uint8_t* bs, long a, long as, lon
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+template <class F>
+static int launch_resident_gs1(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
+                               int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream) {
+    constexpr int W = kIqrResidentWaves;
+    const long long nt = N / 16;
+    const long long nm = ((long long)M + 16 * W - 1) / (16 * W);
+    const long long blocks = nt * nm;
+    if (blocks > 0x7FFFFFFFll) return -2;
+    const dim3 grid((unsigned)blocks), block(W * kIqrWave);
+    R3D_KLAUNCH(R3D_KNAME((gemm_iqr_resident_gs1_kernel<F, W>)), grid, block, (hipStream_t)stream,
+                (const int8_t*)a, (const float*)as, b, bs, (uint16_t*)y, M, N, K, a_ld, y_ld,
+                run_tiles);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 /* The tiled row's dispatch: the same residency and wave-matrix switch for every form. */
 template <uint32_t KIND, uint32_t B, uint32_t LV, uint32_t L, uint32_t LRB, uint32_t SC,
           uint32_t GS = 1>
 static int launch_tiled_form(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
                              int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream) {
     using F = FormT<KIND, B, LV, L, LRB, SC>;
+    if constexpr (GS == 1)
+        return launch_resident_gs1<F>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
     if (M >= kIqrWmmaMinM) return launch_wmma<F, GS>(b, bs, a, as, y, M, N, K, a_ld, y_ld,
                                                     run_tiles, stream);
     return launch_resident<F, GS>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
