@@ -1399,3 +1399,40 @@ peuvent retourner un argmax serré. C'est la même classe d'écart que le split 
 décodage, déjà documentée ; le shim ne connaît pas les longueurs par séquence,
 donc une politique indépendante du lot n'est pas disponible à cet endroit.
 
+**Profil servi (mesure, pas optimisation).** `profile-ops: true`,
+`RADIANCE_PROFILE_EVERY=1`, `build-opt`, une requête par cas, NS=0. Les temps
+sont gonflés par les barrières du mode ; les **parts** sont la lecture.
+
+| cas | TTFT | poste | part | détail |
+|---|---:|---|---:|---|
+| Flash-Next, image 1024² (1 045 tok) | 9,58 s | `gemm_nt_bias` | 36,7 % | 3,71 s, 111 appels, N=1152 K=1152 M=1045 : **11,8 ms/appel = 0,23 TFLOP/s** |
+| | | `hc_read` | 29,8 % | 3,01 s, 873 appels |
+| | | `moe_gemm_q` | 20,5 % | 2,07 s |
+| | | `attn_dense` | 4,4 % | 0,44 s |
+| Flash-Next, image 2048² (4 098 tok) | 39,2 s | `gemm_nt_bias` | 37,0 % | 14,7 s |
+| | | `hc_read` | 28,4 % | 11,3 s |
+| | | `attn_dense` | 16,8 % | 6,69 s, **251 ms/couche** à 4 096 tokens |
+| | | `moe_gemm_q` | 7,6 % | 3,04 s |
+| | | `attn_paged` | 4,7 % | 1,87 s |
+| Flash-Next, texte 972 tok | 4,78 s | `hc_read` | 53,4 % | 2,84 s |
+| | | `moe_gemm_q` | 32,1 % | 1,71 s |
+| 27B, texte 3 252 tok | 11,44 s | `gemm_nt_q` | 88,3 % | 10,22 s = **17,2 TFLOP/s** (roofline de son propre noyau, 16,8) |
+
+Lecture :
+
+- **La tour vision coûte 21,4 s des 39,2 s** d'une image 2048². `gemm_nt_bias`
+  est la row **bit-exacte** de la tour (tuile 16×32, opérandes f32 en LDS, un
+  mul + un add par pas de k) : 0,83–0,96 TFLOP/s à kbench sur toutes les formes,
+  et **libavx à 32 threads fait 2,8× mieux** que la carte sur la même forme. Ce
+  n'est pas un noyau lent par accident, c'est le contrat de la row.
+- **`attn_dense` hd72 s'effondre au-delà de la bande mesurée** : 215 GFLOP/s à
+  M=512 (350,7 µs) mais **19 GFLOP/s à 4 096** (251 ms/couche, 11× pire par
+  FLOP), non causal, `gqa=1`, `max_seqlen=16384` déclaré. Aucun changement de
+  contrat n'est nécessaire pour corriger ça (même ordre arithmétique).
+- **`hc_read` reste un poste de préfill** : 2,84 s par chunk de 972 tokens
+  (53 %), 11,3 s à 4 098 tokens, soit 28 µs par rangée et par site — ~4,6× le
+  plancher de ses 630 Mo de matrices relues.
+- **Le 27B n'a pas de marge de graphe** : 88 % de son préfill est `gemm_nt_q`
+  à 17,2 TFLOP/s, c'est-à-dire son noyau ; le gagner demande de gagner le
+  noyau IQR tiled (16,8 → 23,5 TFLOP/s pour notre propre tuile bf16).
+

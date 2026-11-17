@@ -693,6 +693,27 @@ même temps que q=1 ; en gqa12 il paie +23–31 % d'un pas, parce que la tuile d
 4 tokens passe de 25 % à 100 % de rangées réelles — c'est le travail, pas un
 défaut de parallélisme. Pas de chantier multi-rangées.
 
+## Profil servi 2026-11-18 — réel / idéal par poste
+
+`profile-ops`, `RADIANCE_PROFILE_EVERY=1`, `build-opt`, une requête par cas,
+NS=0. Les temps sont gonflés par les barrières du mode ; les parts sont la
+lecture, et les débits sont calculés sur les FLOPs utiles.
+
+| poste (cas) | réel | idéal (borne) | écart | cause | levier |
+|---|---:|---:|---:|---|---|
+| `gemm_nt_bias` (tour vision, 1024²) | **0,23 TFLOP/s** (11,8 ms/layer, N=K=1152, M=1045) | 20–23 TFLOP/s (notre tuile bf16) | **~90×** | row **bit-exacte** : tuile 16×32, f32 en LDS, un mul + un add par k ; `max(M=512) = 0,83–0,96 TFLOP/s` à kbench, et libavx 32 threads fait **2,8×** mieux que la carte | noyau rapide **avec changement de contrat** (1 bf16 ULP) ; lire libr4d d'abord |
+| `attn_dense` hd72 (tour vision, 2048²) | **19 GFLOP/s** (251 ms/couche à 4 096) | 215 GFLOP/s — la même row à M=512 (350,7 µs) | **11× par FLOP** | effondrement au-delà de la bande mesurée (M ≤ 512) ; `max_seqlen=16384`, non causal, `gqa=1` | même arithmétique, meilleure tuile/partition : aucun changement de contrat |
+| `hc_read` (préfill Flash-Next) | 2,84 s / 972 tok (53 %), 28 µs/rangée/site ; 11,3 s à 4 098 tok | 630 Mo de matrices à ~900 GB/s ⇒ **~0,7 s** par chunk | **~4×** | ordre des tuiles : les 873 appels relisent 2,9 Go (4,6× les matrices) | localité (un site, toutes ses tuiles) ou fusion dans les producteurs |
+| `moe_gemm_q` (préfill Flash-Next) | 1,71 s / 972 tok (32 %) ; 3,04 s à 4 098 | η 70 % de la row à M=32 (IQR) | 2–3× | dispersion des experts au préfill | ordonnancement par expert, pas un noyau |
+| `gemm_nt_q` IQR (27B, 3 252 tok) | **17,2 TFLOP/s** (88 % du préfill) | 23,5 (notre tuile bf16) / 81,9 (plafond f16 WMMA) | 1,4× / 4,8× | décodage 5–6 bits : le coût est le décodage, pas le produit | ordonnancement de la tuile `v_dot4` (double buffer, 8 fragments, épilogue) |
+| `attn_paged` (27B, 3 252 tok) | 0,91 s (7,9 %) | — | — | livré (split-KV) | rien |
+| décodage (Flash-Next, 27B) | 12,73 / 16,8 tok/s | ~14 / ~18 tok/s (poids à 900 GB/s) | ~10 % | flux de poids | octets lus (quantification, placement) ou acceptation MTP, pas un noyau |
+
+Ordre de valeur produit : `attn_dense` long (aucun contrat à changer),
+`gemm_nt_bias` (contrat à trancher), `hc_read` préfill (localité), puis le noyau
+IQR. Le décodage est au roofline de ses poids ; l'attention n'est plus un poste.
+
+
 
 
 
