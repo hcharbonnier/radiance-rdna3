@@ -268,4 +268,12 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   à 8K ; 3 915,0 vs 3 872,6 à 32K) ; gqa12 paie +23–31 % d'un pas (707,1 vs
   539,9 µs à 8K), soit le travail de 4× plus de rangées réelles dans la même
   tuile. Même conclusion que R33 : ne pas rouvrir sans profiler le graphe.
+- **Service 4 séquences (27B, W30)** : validé. Quatre requêtes distinctes
+  (~90 tokens, 64 générés) lancées ensemble, `max-num-seqs 4`, KV i8, NS=0 :
+  **49,4 / 49,2** tok/s agrégés sur `build-p0` (W29) contre **50,3 / 48,9** sur
+  `build-opt` (W30), ~16 tok/s par flux — aucune régression du split-KV du
+  préfill. **Réserve** : la reproductibilité du texte suppose une composition
+  de lot fixe ; le nombre de tranches dépend de `n_seq`, comme le split du
+  décodage. Ne pas promettre un texte bit-identique à travers deux
+  compositions de lot.
 

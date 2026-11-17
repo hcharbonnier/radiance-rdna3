@@ -1383,3 +1383,19 @@ prix du travail, pas un défaut de parallélisme. **Pas de chantier multi-rangé
 `v_dot4_i32_i8` après quantification de q, ou softmax en une passe (online) —
 ce qui déplace le contrat numérique et demande une mesure dédiée.
 
+**Service multi-séquence (27B).** `max-num-seqs 4`, KV i8, `NS=0`, quatre
+requêtes **distinctes** de 83–92 tokens, 64 tokens chacune, lancées ensemble,
+`build-p0` contre `build-opt`, deux runs par build : **49,4 / 49,2** (p0) et
+**50,3 / 48,9** (opt) tok/s agrégés, 256 tokens en 5,08–5,31 s, soit
+**~16 tok/s par flux**. Le split-KV du préfill ne dégrade donc pas le service
+multi-séquence ; la recette `max-num-seqs 4` reste valide.
+
+Réserve mesurée : le texte n'est reproductible qu'à **composition de lot
+fixe**. Un warm-up sur un prompt distinct rend chaque build déterministe d'un
+run à l'autre (une exception sur `build-opt`, où la composition a changé), mais
+le nombre de tranches de préfill dépend de `n_seq` (`per = ceil(rows/n_seq)`
+dans le shim) : deux compositions différentes déplacent des bits bas et
+peuvent retourner un argmax serré. C'est la même classe d'écart que le split du
+décodage, déjà documentée ; le shim ne connaît pas les longueurs par séquence,
+donc une politique indépendante du lot n'est pas disponible à cet endroit.
+
