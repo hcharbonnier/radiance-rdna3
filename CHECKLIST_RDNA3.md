@@ -25,8 +25,11 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       et 47 % du préfill. Action suivante : `--profile-ops true` sur Flash-Next
       (temps device par op) pour trancher lecture/décodage/latence, puis
       corriger. **Feu vert requis** : optimisation noyau en pause.
-- [ ] **W24a `qsa_score`** — 83,4 ms à M=512 (103 GFLOP/s, 2 % du pic), ~4 s par
-      préfill 2 048 (item 3.8).
+- [x] **W24a `qsa_score`** — mesuré à froid (79,0/82,7/83,3 ms à M=512,
+      103 GFLOP/s, 2 % du pic, aucun throttler) ; cause : warp = 32 pages
+      distinctes au même offset (16× d'amplification de secteur, borné par L2) ;
+      l'essai 4 blocs/thread perd 2× et est retiré. Reste une réécriture
+      coalescée/tuilée (W24, non bloquant).
 
 **P1 — cache multi-tour, périmètre servi, couverture MoE**
 - [x] **R22 snapshots multi-agents** — cause : sous `--prefix-resume exact`
@@ -63,22 +66,22 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [ ] 2.11/2.12 — formes mixtes par couche et rows `mod4` (seulement si `tp=4`).
 
 **P2 — couverture, doc, clôture**
-- [ ] 5.5 R9 — modèle non-IQR absent de l'hôte (dérogation écrite, à reprendre
-      si un conteneur 2B/4B arrive).
-- [ ] 5.6 — décider l'ajout de `RAPPORT_RDNA3.md` au dépôt (à jour, hors dépôt).
+- [x] 5.5 R9 — **résolu (W27)** : le 2B IQ8R charge et sert à `NS=0` (rows
+      groupe 256 des trois producteurs et du GEMM `i8a8h`).
+- [x] 5.6 — **décidé (2026-11-17)** : `RAPPORT_RDNA3.md` est ajouté au dépôt.
 - [x] 1.5 / 5.7 / 8.6 — `docs/OPS.md` (rows, dont les cinq ops QSA) et
-      `libr3d/README.md` (inventaire 164 rows / 101 schémas, limites connues) ;
+      `libr3d/README.md` (inventaire 169 rows / 101 schémas, limites connues) ;
       2.9 la row MoE est déjà documentée dans `docs/OPS.md` (§`moe_gemm_q`,
       w4nl) ; 3.9 les cinq ops QSA sont documentées (W24).
 - [ ] `qsa_tail_store` / `qsa_work` — refuser explicitement un index qui n'est
       pas i32 (le shim caste sans vérifier) et ajouter le test de refus ; écart
       relevé pendant W24, sans impact sur le moteur qui alloue i32.
-- [x] 8.7 — handover final de phase (`HANDOVER_RDNA3_PHASE7.md`, état `de81ffe`).
+- [x] 8.7 — handover final de phase (`HANDOVER_RDNA3_PHASE7.md`, état W27).
 - [ ] 6.1–6.6 — optimisations différées (non bloquantes).
-- [ ] **Écart RDNA4 → RDNA3** — **238 rows / 179 ops** absents de `libr3d`
-      (toutes architectures) ; la cible v1 n'en manque aucun sur ses chemins
-      exercés. Périmètre à décider, feuille de route **§D** et liste complète
-      `RAPPORT_RDNA3.md` §10.
+- [ ] **Écart RDNA4 → RDNA3** — **233 rows / 176 ops** absents de `libr3d`
+      (toutes architectures ; les cinq rows IQ8R du tronc sont livrées en W27) ;
+      la cible v1 n'en manque aucun sur ses chemins exercés. Périmètre à
+      décider, feuille de route **§D** et liste complète `RAPPORT_RDNA3.md` §10.
 - Hors v1 : codebook `w4nl` dans `w4a8` seulement (MTP et vision sont revenus
   dans la cible par l'ADR-7).
 
@@ -341,12 +344,13 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       borné par le décodage treillis, 10–12 %).
 - [x] 8.4 QSA identique à la référence et égal au dense sous le seuil (781/819
       checks, kbench 0 divergence).
-- [~] 8.5 Tableau réel/idéal complet, écarts expliqués, RAPPORT à jour :
-      Flash-Next, kbench, HC/PLE, QSA et MoE par row mesurés ; η lien calculé ;
-      reste la décision d'ajout du RAPPORT au dépôt (5.6).
+- [x] 8.5 Tableau réel/idéal complet, écarts expliqués, RAPPORT à jour :
+      Flash-Next, kbench, HC/PLE, QSA, MoE par row et MiniCPM5-2B mesurés ; η
+      lien calculé ; `qsa_score` à M=512 mesuré avec sa cause (W24) ;
+      `RAPPORT_RDNA3.md` est au dépôt (5.6).
 - [x] 8.6 Documentation des rows, architectures, limites et perf à jour
       (`docs/OPS.md` : cinq ops QSA, `gather_rows_u8` ; `libr3d/README.md` :
-      inventaire 164 rows / 101 schémas, familles, limites connues).
+      inventaire 169 rows / 101 schémas (W27), familles, limites connues).
 - [x] 8.7 Handover final écrit (`HANDOVER_RDNA3_PHASE7.md`) et journal tenu à
       la date de clôture ; §8 donne la reprise immédiate.
 - [x] 8.8 **Vision servie (ADR-7)** : build `RAD_WITH_FFMPEG=ON`,
@@ -377,15 +381,16 @@ le reste concerne Flash-Next.
 
 Mesure à l'état `de81ffe` : `libr4d/r4d_rows.cpp` (**457 rows, 274 ops**) contre
 `libr3d/r3d_rows.cpp` (**164 rows, 101 ops**), soit **238 rows / 179 ops** sans
-équivalent RDNA3. La liste complète (op par op, famille par famille) est dans
-`RAPPORT_RDNA3.md` §10 ; cette section est la feuille de route.
+équivalent RDNA3. Depuis W27 (IQ8R), `libr3d` en a **169** : l'écart courant est
+de **233 rows / 176 ops**. La liste complète (op par op, famille par famille) est
+dans `RAPPORT_RDNA3.md` §10 ; cette section est la feuille de route.
 
 - **La cible v1 actuelle n'a aucun op manquant** sur ses chemins exercés
-  (kbench 968/968, 683/683 ; selftest 164/0/15). Les lignes ci-dessous sont
+  (kbench 968/968, 683/683 ; selftest 169/0/15). Les lignes ci-dessous sont
   conditionnées par le périmètre multi-architectures.
-- [ ] **D0 — décider le périmètre** : toutes les architectures `arch/` (238
-      rows) ou seulement la cible v1 + l'artefact IQ8R ? Sans cette décision,
-      D5–D9 restent hors engagement.
+- [ ] **D0 — décider le périmètre** : toutes les architectures `arch/` (233
+      rows restants) ou seulement la cible v1 + l'artefact IQ8R ? Sans cette
+      décision, D5–D9 restent hors engagement.
 - [x] **D1 — IQ8R groupe 256 (MiniCPM5-2B, non-IQR)** — **livré pour le tronc
       à un rang (W27)** : producteurs `rmsnorm_had_quant_i8g`,
       `had_quant_act_i8g`, `gated_had_quant_i8g` en groupe 256 (rows

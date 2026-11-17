@@ -92,13 +92,12 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   M=32–512) ; `attn_paged` h256 reste mesuré de bout en bout seulement (préfill
   301, décodage 21,2 à 819). Les noyaux restent dans l'arbre, marqués à mesurer
   isolément et optimiser en W14.
-- **R9** — La vérification des formes E4M3/rotated sur un modèle non-IQR reste
-  impossible : aucun 2B/4B sur l'hôte, seulement le 27B et le Flash-Next.
-  **Dérogation documentée (2026-11-16)** : inventaire de l'hôte vérifié —
-  `qwen3.8-27b-iq4r-l-v4.rad` et `qwen3.8-next-flash-iqr-v4.rad`, tous deux IQR.
-  La couverture actuelle est celle des rows et des tests device sur ces deux
-  conteneurs ; la validation croisée non-IQR reste à faire dès qu'un conteneur
-  est disponible.
+- **R9 — résolu (W27)** : un conteneur non-IQR est sur l'hôte
+  (`minicpm5-2b-iq8r.rad`) ; il charge et sert à `NS=0`, et ses rows IQ8R
+  (producteurs et GEMM groupe 256) sont couvertes par `iqr_device_test` (cas
+  256 bit-exacts) et `act_i8g_group256_device_test`, plus kbench ciblé 110/110
+  sur le conteneur. Reste non couvert : le drafter DSpark (`NS > 0`) et les
+  variantes `ar_*` (tp > 1).
 - **R10** — `gemm_iqr_gated_i8a8h` fusionné n'utilise que 1,4 bloc par CU
   (136 groupes, 96 CU) ; son gain est réel (~1,5 % en décodage) mais son
   occupation est à revoir en W14 (deux groupes par bloc ou 256 threads).

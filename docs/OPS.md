@@ -48,7 +48,10 @@ here is such a choice.
     (`docs/MOE-W4.md`).
   - `i8a8` is an i8 weight with a bf16 scale per (row, 128 of K) against an int8 activation on
     the same grid; `i8a8h` is that weight rotated by a 128-wide Walsh–Hadamard along K, its scale
-    carrying the 1/128 (libquant's `transform=fwht128`), met by `had_quant_act_i8g`.
+    carrying the 1/128 (libquant's `transform=fwht128`), met by `had_quant_act_i8g`. The IQ8R
+    group (256 of K, libquant's rotated i8) keeps the same code grid: the two 128-wide halves are
+    rotated independently and share **one** bf16 scale per (row, 256), the product of a u8 level
+    per 256 and a bf16 level per row (W27).
   - `w4a8_asym` is the unsigned-nibble-minus-zero-point grid instead of the symmetric one.
   - `fp8a8` and `fp8a16` say whether a block-scaled E4M3 weight meets an fp8 or a bf16 activation.
   - `fp8a8f32` is `fp8a8` with f32 weight scales on the 128x128 block grid. The host libraries
@@ -674,8 +677,10 @@ not slow. `libref/ref_quant.cpp` is the definition.
   each code the value over it rounded to nearest even and clamped to ±127, row-major. They feed the
   int8 trunk GEMM (`gemm_nt_q` at `dtype=i8a8`), which folds a scale per K block. The `had_` form
   rotates first and, like the rotated E4M3 form, folds nothing: its consumer is a weight at
-  `dtype=i8a8h`, whose scale carries the whole 1/`group`. It is not interchangeable with the
-  per-row `had_*` int8 forms, which fold 1/sqrt(`group`) into the activation's scale. `dequant`
+  `dtype=i8a8h`, whose scale carries the whole 1/128. It is not interchangeable with the
+  per-row `had_*` int8 forms, which fold 1/sqrt(`group`) into the activation's scale. At
+  `group=256` (IQ8R) the rotation is still 128-wide on each half and the single per-256 scale
+  carries the same 1/128, so the GEMM folds one int32 sum per 256 (W27). `dequant`
   inverts `quant_act_i8g`: the scale stream's extent gives the group count and `group` each group's
   width.
 

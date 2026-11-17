@@ -12,8 +12,9 @@ d'optimisation s'en rapprocher.
 > `HANDOVER_RDNA3_PHASE7.md`). Lire les sections 1, 7.3 et 9 avec ce correctif :
 >
 > - Le conteneur **démarre et sert** (HTTP) sur la W7900 avec `libr3d` seul :
->   `r3d_selftest` **164/0/15**, kbench Flash-Next **968/968** et 27B **683/683**,
->   0 échec, 0 divergence. État de branche `rdna3-iqr`, code `de81ffe`.
+>   `r3d_selftest` **169/0/15** (164 avant W27), kbench Flash-Next **968/968** et
+>   27B **683/683**, 0 échec, 0 divergence ; MiniCPM5-2B IQ8R charge et sert à
+>   `NS=0` (§7.6). État de branche `rdna3-iqr`, code `f81f982`.
 > - **Décodage mesuré : 217–250 ms/pas** (4,0–4,6 tok/s à `NS=0`), et non
 >   30–45 ms/pas. Le poste dominant n'est ni le lien ni le MoE mais **`hc_read`** :
 >   1,77 ms par appel à M=1 pour 6,55 Mo de poids (η 0,6 % de la borne bande),
@@ -503,22 +504,22 @@ Total ≈ 17 500 lignes spécifiques, hors MTP et hors portions de `r4d_moe.hip`
 Mesure faite sur l'état `de81ffe` en comparant les tables de rows :
 `libr4d/r4d_rows.cpp` (**457 rows, 274 ops**) et `libr3d/r3d_rows.cpp`
 (**164 rows, 101 ops**). **238 rows / 179 ops** n'ont pas d'équivalent RDNA3.
-Ce chiffre est celui de la couverture *de toutes les architectures que `arch/`
-sait déclarer* ; il ne signifie pas que la cible v1 est incomplète.
+Depuis W27, `libr3d` en a **169** (les cinq rows IQ8R du tronc) : l'écart est
+de **233 rows / 176 ops**. Ce chiffre est celui de la couverture *de toutes les
+architectures que `arch/` sait déclarer* ; il ne signifie pas que la cible v1
+est incomplète.
 
 ### 10.1 Ce qui est réellement requis
 
-- **Cible v1 actuelle (Flash-Next, 27B)** : aucun op manquant sur les chemins
-  exercés — kbench **968/968** et **683/683**, selftest 164/0/15. Les seuls
-  écarts conditionnels sont ci-dessous.
+- **Cible v1 actuelle (Flash-Next, 27B, MiniCPM5-2B)** : aucun op manquant sur
+  les chemins exercés — kbench **968/968** et **683/683**, selftest 169/0/15.
+  Les seuls écarts conditionnels sont ci-dessous.
 - **IQ8R (MiniCPM5-2B, artefact non-IQR)** : le tronc rotated int8 à
-  **groupe 256** ne charge pas. Manquent les rows du producteur IQ8R
-  (`rmsnorm_had_quant_iq8r`, `ar_rmsnorm_had_quant_iq8r`,
-  `gate_had_quant_iq8r`), le producteur non groupé `rmsnorm_had_quant_i8`, et
-  les variantes **groupe 256** des GEMM `gemm_nt_q` / `gemm_nt_q_gated` en
-  `i8a8h` (les rows actuelles n'acceptent que 128). Le drafter **DSpark** du
-  même conteneur demanderait en plus les ops `dflash_*` (seulement si on sert
-  `NS > 0`).
+  **groupe 256** **charge et sert depuis W27** (producteurs groupe 256,
+  `gemm_nt_q` `i8a8h` groupe 256). Restent, sans besoin pour `NS=0` : les
+  variantes `ar_*`/non fusionnées (`tp > 1`), `gate_had_quant_i8g` et le fold
+  `gemm_nt_q_gated` 256. Le drafter **DSpark** du même conteneur demanderait en
+  plus les ops `dflash_*` (seulement si on sert `NS > 0`).
 - **tp > 1** : `all_reduce`, `all_gather` et les fusions `ar_*` (18 rows) sont
   absents ; sans eux, `tp=2/4` n'est pas servable. Sans objet sur une carte.
 - **Streaming KV** (`kv_store_streamed`, `kv_resolve`) : absent ; requis
