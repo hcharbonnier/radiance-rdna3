@@ -1307,3 +1307,71 @@ préservant l'ordre par rangée. kbench ne chronomètre toujours pas l'attention
 **Amont.** `down_w5_fp8` et `ngram_ids_i32` sont deux régressions de `main`
 2.1.0 (compilation et service RDNA3) ; correctifs locaux `5e98eb9` et
 `c11c451`, à proposer en amont.
+
+## 2026-11-18 — W30 : préfill `attn_paged` h256 i8 en split-KV
+
+**Constat.** Le préfill h256 i8 était le seul chemin encore à `splits=1` :
+un premier pas de 17 tokens fait deux tuiles de 16 (gqa 6) ou trois de 8
+(gqa 12), soit **8 à 12 workgroups** pour une carte de 96 CU, et chaque
+workgroup marche **tout le contexte** en série. La preuve est dans la mesure :
+à 8 192 de contexte, q=17 et q=128 coûtent le même temps (12,1 vs 12,5 ms)
+alors que q=128 fait **7,5× plus de travail** — le poste est borné par le
+parallélisme, pas par l'arithmétique. Baseline `build-p0`
+(`RAD_ATTN_BENCH=1`, carte froide, meilleur de 3 lots de 20) :
+
+| préfill | 2 048 | 8 192 | 32 768 |
+|---|---:|---:|---:|
+| gqa6 bs16 q=17 | 3 153,8 µs | 12 122,4 µs | 46 886,4 µs |
+| gqa12 bs4 q=17 | 3 539,4 µs | 13 634,6 µs | 52 937,9 µs |
+| gqa6 bs16 q=128 | 3 305,0 µs | 12 517,6 µs | — |
+| gqa12 bs4 q=128 | 3 625,6 µs | 14 379,7 µs | — |
+
+**Correctif** (`libr3d`, `r3d_attn_paged_h256.hip` + `r3d_rows.cpp`). L'entrée
+de préfill prend `splits` et le scratch, comme le décodage : l'échelle de
+splits cible **128 workgroups** (deux par CU), est plafonnée au nombre de blocs
+du cache (une tranche au-delà ne porte aucune clé) puis divisée par deux
+jusqu'à tenir dans l'aréna offerte, jusqu'à `splits=1` — le repli sans scratch
+reste donc le comportement d'avant. Les rows de préfill déclarent
+`attn_h256_scratch` (indice à 16 tranches, plafond 16 Mio), le décodeur est
+inchangé. Le noyau n'a pas bougé : c'est la même marche en deux passes, la même
+arithmétique par tranche, et les mêmes parenthèses documentées du split-KV.
+Test `attn_paged_device_test` étendu au mode temps : préfill q=17 à 32 768 et
+q=128 à 2 048/8 192 pour les deux géométries.
+
+**Mesures** (`build-opt`, même protocole ; carte 199 W, 2 315 MHz, aucun
+throttler — `THROTTLE_STATUS` vaut `THROTTLED` au repos sur cet hôte) :
+
+| préfill | 2 048 | 8 192 | 32 768 |
+|---|---:|---:|---:|
+| gqa6 bs16 q=17 | **558,0 µs (5,7×)** | **2 375,6 µs (5,1×)** | **8 507,7 µs (5,5×)** |
+| gqa12 bs4 q=17 | **394,7 µs (9,0×)** | **1 795,3 µs (7,6×)** | **6 364,3 µs (8,3×)** |
+| gqa6 bs16 q=128 | **2 379,6 µs (1,39×)** | **8 994,2 µs (1,39×)** | — |
+| gqa12 bs4 q=128 | **2 537,0 µs (1,43×)** | **9 637,5 µs (1,49×)** | — |
+
+Décodage inchangé (gqa6 q=1 : 56,4 / 243,4 / 956,1 / 3 859,4 µs à ctx
+512/2048/8192/32768 ; gqa12 : 38,3 / 544,1 / 2 321,8 µs). Dispersion entre deux
+runs du même binaire : ~5 % (q=17 à 8K : 2 253–2 376 µs) ; les chiffres retenus
+sont les plus prudents. Une cible à 256 workgroups (donc 32 tranches quand
+l'aréna le permet) ne change rien : à 128 workgroups le noyau sature — il est
+borné par l'instruction (une conversion int8 et une FMA par lane et par
+dimension), pas par le parallélisme. q=17 garde en plus 47 % de rangées de
+remplissage (17 tokens sur 32 emplacements) ; elles ne paient que la passe un.
+
+**Validation** (`build-opt`, build neuf) : `attn_paged_device_test`
+**8 checks/9 cas** (le cas préfill « split » exerce désormais une vraie coupe
+à ctx=32), selftest **195 rows, 0 échec, 16 skips**, `sched_test` 548 952,
+`engine_e2e_test` 1 076 (3 skips), `fixture_test` 109 671, tous les tests device
+verts (iqr, logits, gather_u8, vision, mtp, rerank, act_i8g 103, ple_hc 48,
+tp2 12). Texte servi **identique** : Flash-Next, prompt de 3 252 tokens
+(chemin QSA sparse) 32 tokens générés, même acceptation de drafts (19/39) ;
+Flash-Next et 27B à 372 tokens, texte identique aussi. Le prélude de
+3 252 tokens ne gagne rien (241,1 → 239,9 tok/s) : le découpage est en chunks de
+2 048 tokens, où `tuiles × têtes KV` dépasse déjà 128, donc `splits=1` ; le gain
+de la row porte sur les **chunks courts** (< 512 tokens, typiquement la queue
+d'un prompt), où le préfill est dominé par les GEMM et non par l'attention.
+
+**Reste.** Multi-rangées verify M=4 (ordre par rangée préservé) ; au-delà, il
+faut changer l'arithmétique — dot `v_dot4_i32_i8` après quantification de q, ou
+softmax en une passe (online), qui déplace le contrat numérique et demande une
+mesure dédiée.
+

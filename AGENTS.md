@@ -225,7 +225,10 @@ gqa6 bs16 et gqa12 bs4, court + split ; le 9e est le mode temps
 `RAD_ATTN_BENCH=1`) à **1 bf16 ULP** de libref — écart documenté (polynôme
 `exp` à 1 f32 ulp, parenthèses du split-KV) ; le mode temps, **scratch/split-KV
 alloué**, donne **4,06 ms** (gqa6) / **2,37 ms** (gqa12) à 32K q=1 (sans
-scratch, repli `splits=1` non servi : 29,1 / 33,3 ms) ; les multi-rangées
+scratch, repli `splits=1` non servi : 29,1 / 33,3 ms) ; le **préfill** est
+aussi en split-KV depuis W30 (cible 128 workgroups, repli `splits=1` sans
+aréna) : q=17 à 8K **2 376 µs** (gqa6) / **1 795** (gqa12) contre 12 122 /
+13 635, et 8 508 / 6 364 à 32K, décodage inchangé ; les multi-rangées
 doivent préserver l'ordre par rangée. `final-all` est
 l'arbre **W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ;
 détails dans `RAPPORT_REBASE_V2_1_0.md`.

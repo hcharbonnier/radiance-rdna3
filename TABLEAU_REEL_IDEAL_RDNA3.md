@@ -578,9 +578,11 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
 - **`attn_dense` hd72 à M=16384** : le gain est mesuré jusqu'à M=512 ; un cas
   device à 16384 existe (18 874 368 valeurs exactes) mais kbench n'en a pas de
   cas sur ce conteneur.
-- **`attn_paged` h256** : le cache de scores et le pitch 272 sont livrés ; le gain
-  isolé n'est pas mesuré et le split du préfill reste interdit par l'ordre exact
-  que les tests exigent.
+- **`attn_paged` h256** : le cache de scores et le pitch 272 sont livrés ; le
+  **split du préfill** est livré en W30 (5–9× sur q=17, 1,4–1,5× sur q=128). Le
+  noyau reste borné par l'instruction (conversion int8 + FMA par lane et par
+  dimension) : le gain suivant demande un autre produit (dot4 int8) ou une
+  softmax en une passe.
 - **`qsa_score`** — **livré (W28)** : réécriture coalescée/tuilée, M=512
   **2,23 ms** (36–37×), bit-identique. Le plan refuse toujours 2 048/4 096 lignes
   (512 Mio/1 Gio), d'où `max-num-batched-tokens: 2048`.
@@ -645,11 +647,42 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
   libref, écart documenté (polynôme `exp`, split-KV). `RAD_ATTN_BENCH=1`,
   **scratch/split-KV alloué** : **4,06 ms** (gqa6) / **2,37 ms** (gqa12) à
   32K q=1 (sans scratch, repli non servi : 29,1/33,3 ms) ; levier restant :
-  préfill q=17 (splits=1) + multi-rangées verify (M=4), en préservant l'ordre
-  par rangée. kbench ne la chronomètre pas.
+  préfill q=17 (splits=1) + multi-rangées verify (M=4) — le préfill est livré
+  en W30 ci-dessous, reste le verify M=4. kbench ne la chronomètre pas.
 - **Validation** : kbench 27B **3 181/3 181**, Flash-Next **4 786/4 786**,
   MiniCPM **1 802/1 802**, 0 échec ; détail dans
   `RAPPORT_REBASE_V2_1_0.md`.
+
+## État 2026-11-18 — W30 (préfill attention h256 i8 en split-KV)
+
+`RAD_ATTN_BENCH=1`, scratch alloué, meilleur de 3 lots de 20, carte 199 W /
+2 315 MHz (aucun throttler). Device µs :
+
+| op / géométrie | ctx | avant (W29) | après (W30) | gain |
+|---|---:|---:|---:|---:|
+| préfill h256 i8 gqa6 q=17 | 2 048 | 3 153,8 | **558,0** | 5,7× |
+| | 8 192 | 12 122,4 | **2 375,6** | 5,1× |
+| | 32 768 | 46 886,4 | **8 507,7** | 5,5× |
+| préfill h256 i8 gqa12 q=17 | 2 048 | 3 539,4 | **394,7** | 9,0× |
+| | 8 192 | 13 634,6 | **1 795,3** | 7,6× |
+| | 32 768 | 52 937,9 | **6 364,3** | 8,3× |
+| préfill h256 i8 gqa6 q=128 | 2 048 | 3 305,0 | **2 379,6** | 1,39× |
+| | 8 192 | 12 517,6 | **8 994,2** | 1,39× |
+| préfill h256 i8 gqa12 q=128 | 2 048 | 3 625,6 | **2 537,0** | 1,43× |
+| | 8 192 | 14 379,7 | **9 637,5** | 1,49× |
+| décodage q=1 gqa6 | 32 768 | 3 866,0 | 3 859,4 | — |
+| décodage q=1 gqa12 | 32 768 | 2 319,4 | 2 321,8 | — |
+
+Lecture : le préfill q=17 était limité par le **parallélisme** (8 workgroups,
+marche séquentielle sur tout le contexte) ; le split-KV à 128 workgroups le
+ramène à la même efficacité par unité de travail que q=128, qui ne gagne donc
+que le surcoût de ses 64 workgroups. Le plateau restant est
+**instruction-bound** (une conversion int8 et une FMA par lane et par
+dimension) : une cible à 256 workgroups ne change rien. q=17 paie 47 % de
+rangées de remplissage, qui ne coûtent que la passe un. Hôte : le prélude
+3 252 tokens est servi en chunks de 2 048 (donc `splits=1`) et ne bouge pas
+(241,1 → 239,9 tok/s) ; le gain porte sur les chunks < 512 tokens.
+
 
 
 

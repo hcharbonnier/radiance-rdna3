@@ -223,9 +223,9 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   de libref, **pas bit-exact** mais écart **documenté** (polynôme `exp` à
   1 f32 ulp, parenthèses du split-KV). `RAD_ATTN_BENCH=1`, **scratch/split-KV
   alloué**, donne **4,06 ms** (gqa6) / **2,37 ms** (gqa12) à 32K q=1 (sans
-  scratch, repli `splits=1` non servi : 29,1/33,3 ms) ; prochaine
-  optimisation : préfill q=17 (splits=1) et multi-rangées verify M=4, en
-  préservant l'ordre par rangée.
+  scratch, repli `splits=1` non servi : 29,1/33,3 ms). Le **préfill** est
+  passé au split-KV en W30 (voir ci-dessous) ; reste le multi-rangées verify
+  M=4, en préservant l'ordre par rangée.
 
 ## W29 — rebase `main` 2.1.0 + GS=1 (2026-11-17)
 
@@ -235,3 +235,32 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   4 786/4 786, MiniCPM 1 802/1 802 ; 27B 288 tok/s (GS=1), Flash-Next long
   contexte 3 252 tokens 234,8 tok/s.
 - Détail et suites : `RAPPORT_REBASE_V2_1_0.md`.
+
+## W30 — préfill attention h256 i8 en split-KV (2026-11-18)
+
+- **Cause mesurée** : q=17 coûtait le même temps que q=128 à 8K (12,1 vs
+  12,5 ms) pour 7,5× moins de travail — 8 workgroups, marche séquentielle sur
+  tout le contexte. Le préfill était le dernier chemin à `splits=1`.
+- **Livré** : l'entrée de préfill prend `splits`/scratch ; échelle ciblant
+  **128 workgroups**, plafonnée au nombre de blocs du cache, puis divisée
+  jusqu'à tenir dans l'aréna (repli `splits=1` inchangé, décodeur inchangé) ;
+  les rows de préfill déclarent `attn_h256_scratch`.
+- **Gain** (build-p0 → build-opt, `RAD_ATTN_BENCH=1`) : q=17 **5,1–9,0×**
+  (2 376 µs à 8K gqa6, 8 508 à 32K ; 1 795 / 6 364 gqa12) ; q=128 **1,39–1,49×** ;
+  décodage inchangé. Une cible à 256 workgroups ne donne rien : le noyau
+  sature, borné par l'instruction (conversion int8 + FMA par lane et par dim).
+- **Porte tenue** : `attn_paged_device_test` **8 checks/9 cas**, selftest
+  **195/0/16**, `sched_test` 548 952, `engine_e2e_test` 1 076 (3 skips),
+  `fixture_test` 109 671, tests device verts ; texte **identique** Flash-Next
+  3 252 tokens (32 tokens, drafts 19/39) et 27B/Flash-Next à 372 tokens.
+  Le prélude long ne bouge pas (chunks de 2 048 tokens → `splits=1`) : le gain
+  porte sur les chunks courts.
+- **Reste** : multi-rangées verify M=4 ; au-delà, changer l'arithmétique
+  (`v_dot4_i32_i8` après quantification de q, ou softmax en une passe) — nouveau
+  contrat numérique, à mesurer séparément.
+- **R35** — *décision (W30)* : le split du préfill est autorisé au même titre
+  que celui du décodage. Le test ne pinçait pas « préfill = une passe » : il
+  pinçait la tolérance **1 bf16 ULP**, et les tranches sont sommées en ordre
+  ascendant puis réduites, comme pour le décodage. Un test qui exigerait le
+  bit-exact sur un préfill multi-tranches serait faux.
+
