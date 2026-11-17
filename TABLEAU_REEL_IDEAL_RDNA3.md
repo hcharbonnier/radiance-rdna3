@@ -202,6 +202,16 @@ tuile de 128 lignes que la row décrit) ; l'engine ne fait que l'exécuter.
 loin du plancher de bande (10,5 µs) et de la référence libr4d. La correction
 est un travail de noyau (W21) et attend le feu vert.
 
+**W28 (livré).** Les deux noyaux stagent désormais leur tranche de poids en LDS
+avec les 256 threads (16 lignes × 256 colonnes en `down`, 64 lignes × 32 k en
+`up`), les lanes propriétaires gardant la somme f32 ascendante : à froid, trois
+passes alternées, 2 801 MHz, aucun throttler — **M=1 1 941 → 428 µs (4,5×)**
+avec inject, 1 774 → 351 µs sans (5,0×) ; M=8 6,2× ; M=128 7,9× ; **M=512
+114 → 12,4 ms (9,2×)**. `ple_hc_device_test` 48 checks verts, rel_l2 kbench
+inchangé. En service, décodage Flash-Next **4,48 → 12,73 tok/s (2,84×)**. Reste
+un écart ~40× au plancher de bande : prochaine étape, plusieurs lignes par
+tranche de poids.
+
 ### HC — `hc_enter`, `hc_write`
 
 | M | `hc_enter` | `hc_write` |
@@ -475,6 +485,7 @@ Premier conteneur non-IQR servi : 3,04 Gio, 42 couches, `n_embd` 2 048,
 | résolution IQ8R | `gemm_nt_q` groupe 256 → `gemm_iqr_nt_m16_w256` (M ≤ 16) / `gemm_iqr_tiled_w256` ; producteurs → `*_256_bf16` |
 | kbench ciblé (4 ops) | **110/110**, pire rel_l2 4,018e-05, GEMM bit-exact |
 | décodage | **40,2 tok/s** (60 tokens) ; 69,0 tok/s (16 tokens) |
+| décodage `NS=3` (DSpark, W28) | **32,20 vs 20,64 tok/s** (1,56×) sur 64 tokens, texte **identique au bit**, 33 drafts acceptés sur 210 (15,7 %) |
 | préfill | 184–367 tok/s (prompts de 5–10 tokens) |
 | texte | cohérent (capitales, listes) |
 
@@ -502,6 +513,13 @@ bloc), 2 octets utiles par secteur de 32 ; la row est bornée par L2. L'essai
 ILP (quatre chaînes f32 indépendantes par thread, arithmétique inchangée,
 exacte au test) double le nombre de pages par instruction et **perd 2×** : il
 est retiré. La suite est une réécriture coalescée/tuilée, pas un déroulage.
+
+**W28 (livré).** Un workgroup stage en LDS les pages de blocs et les lignes de
+`q` d'une tuile 32×64, chaque thread gardant ses chaînes f32 ascendantes :
+**M=512 82,27 → 2,23–2,30 ms** (**36–37×**), **bit-identique** à libref
+(rel_l2 0,00e+00), `qsa_score_device_test` 72 checks exacts ; `--bench` FN
+4 946/4 946 dans les deux modes. La row hôte AVX (9,0 ms) est désormais 4×
+plus lente que la carte.
 
 ## Lecture
 

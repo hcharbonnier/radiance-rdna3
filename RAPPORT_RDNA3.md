@@ -12,9 +12,9 @@ d'optimisation s'en rapprocher.
 > `HANDOVER_RDNA3_PHASE7.md`). Lire les sections 1, 7.3 et 9 avec ce correctif :
 >
 > - Le conteneur **démarre et sert** (HTTP) sur la W7900 avec `libr3d` seul :
->   `r3d_selftest` **169/0/15** (164 avant W27), kbench Flash-Next **968/968** et
->   27B **683/683**, 0 échec, 0 divergence ; MiniCPM5-2B IQ8R charge et sert à
->   `NS=0` (§7.6). État de branche `rdna3-iqr`, code `f81f982`.
+>   `r3d_selftest` **190/0/16** (169 avant W28), kbench Flash-Next **948/948**,
+>   2B **384/384** et 27B **653/653**, 0 échec, 0 divergence ; MiniCPM5-2B IQ8R
+>   sert à `NS=0` et `NS=3` (§7.6). État de branche `rdna3-iqr`, code `a8bc412`.
 > - **Décodage mesuré : 217–250 ms/pas** (4,0–4,6 tok/s à `NS=0`), et non
 >   30–45 ms/pas. Le poste dominant n'est ni le lien ni le MoE mais **`hc_read`** :
 >   1,77 ms par appel à M=1 pour 6,55 Mo de poids (η 0,6 % de la borne bande),
@@ -379,8 +379,8 @@ Ce que cela change par rapport aux prévisions :
    (W26) et le MTP (W25, `NS=3`, 4,51 → 8,21 tok/s, texte identique,
    acceptation 40,3 %) sont livrés ; les tables MTP 48 et le draft head sont
    couverts. Restent hors v1 : 10 cas `gemm_nt_q_gated` i8a8h sans référence
-   libref, 8 `ngram_hint` sans oracle, et `qsa_score` à M=512 (cause mesurée en
-   W24, réécriture coalescée/tuilée à faire).
+   libref, 8 `ngram_hint` sans oracle, et les 16 schemas sans oracle libre
+   (`selftest`), dont `gate_had_quant_i8g` (couvert par un test device).
 
 ### 7.6 W24–W27 : `qsa_score` et IQ8R (2026-11-17)
 
@@ -398,6 +398,40 @@ chaînes f32 indépendantes, arithmétique par (row, bloc) inchangée — a donn
 instruction) : il a été retiré. La suite utile est une réécriture **coalescée et
 tuilée** (pages de blocs et lignes de `q` en LDS, un thread par (row, bloc)
 conservé), avec ce protocole d'A/B.
+
+**W28 (2026-11-17).** La réécriture coalescée est livrée : un workgroup stage
+les pages de blocs et les lignes de `q` d'une tuile 32×64 en LDS, chaque thread
+gardant ses chaînes f32 ascendantes. **M=512 : 82,27 → 2,23–2,30 ms (36–37×)**,
+**bit-identique** à libref (rel_l2 0,00e+00), 72 checks exacts au test device,
+4 946/4 946 en `--bench` dans les deux modes.
+
+**`hc_read` (W28, R20).** Le profil engine (96 sites, 1,93 ms/appel, poids en
+VRAM) a montré que le coût était dans le noyau : une lane par ligne au même
+offset, 32× d'amplification de secteur en `down` (16 lanes actives sur 256) et
+8× en `up`. Les deux noyaux stagent maintenant leur tranche de poids en LDS
+(16 × 256 en `down`, 64 × 32 k en `up`), l'arithmétique restant identique.
+À froid : **M=1 1 941 → 428 µs (4,5×)**, M=512 **114 → 12,4 ms (9,2×)**,
+`ple_hc_device_test` 48 checks verts. En service, décodage Flash-Next
+**4,48 → 12,73 tok/s (2,84×)**, texte cohérent.
+
+**DSpark (W28, D2).** Le 2B à `NS=3` : **32,20 vs 20,64 tok/s (1,56×)**, texte
+identique au bit, 33/210 drafts acceptés (15,7 %). Le cas selftest `w2a8`
+déclarait son plan joint `U8` au lieu de `F16` et était toujours sauté ; un cas
+numérique au bande du drafter (M=7, plan en mémoire device) le couvre.
+
+**Collectifs tp>1 (W28, D3).** 18 rows `all_reduce`/`all_gather` portées de
+libhalo (2/3/4/8 rangs, wires exact/wht6/ti8, gathers), schémas libr4d,
+`device.p2p` requis ; test à deux rangs sur une carte (12 checks). Les jonctions
+`ar_*` fusionnées restent des stubs.
+
+**Trouvé à l'intégration.** Déclarer `gate_had_quant_i8g` fait prendre à
+Flash-Next la branche fusionnée, émise sur **toute la projection** : `q`/`x` en
+`[T, heads*head_dim]` alors que `n` nomme la largeur de tête, et la porte est une
+vue `[T, heads, head_dim]` de pas de tête 512. La row refusait la géométrie ; le
+pas de ligne et de tête est maintenant porté, un bloc de rotation reste dans une
+tête, et un cas device dédié la couvre (103 checks sur 6 cas). Le 27B replie 30
+cas `sigmoid`/`mul`/`quant_act_fp8` dans la même branche mais **répond au bit
+près** comme avant (29,63 vs 29,50 tok/s).
 
 **IQ8R groupe 256 (MiniCPM5-2B)** : le conteneur (3,04 Gio, 42 couches,
 `n_embd` 2 048, `n_ff` 6 144, 16/2 têtes) déclare **523 ops / 423 poids** et

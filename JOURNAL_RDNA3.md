@@ -1185,6 +1185,68 @@ relit la paire de matrices **par ligne** au lieu d'amortir par la tuile de
 libr4d 18,7 µs). La correction est un travail de noyau (W21) et attend le feu
 vert ; `hc_enter`, `hc_write` et le MoE ne sont pas en cause.
 
+## 2026-11-17 — W28 : hc_read, qsa_score, DSpark NS=3, folds IQ8R et collectifs tp>1
+
+Cinq lots menés en parallèle (worktrees Agent Manager), fusionnés dans `rdna3-iqr`,
+puis validés ensemble dans un build neuf (`w28-merge`).
+
+**W21 `hc_read` (`96617a4`).** Diagnostic (profil `--profile-ops`) : 96 sites à
+**1,93 ms/appel** en engine contre 1,77 ms en kbench au même géométrique, poids
+`hc_norm` en VRAM — le coût est dans le noyau. Les deux noyaux lisaient les
+matrices de mélange une ligne par lane au même offset (32× d'amplification de
+secteur en `down`, 8× en `up`, 30 blocs à M=1). Ils stagèrent maintenant une
+tranche en LDS avec les 256 threads (16 lignes × 256 colonnes en `down`, 64
+lignes × 32 k en `up`), les lanes propriétaires gardant la somme f32 ascendante
+de la référence. Cold card, 3 passes alternées, 2 801 MHz : M=1 **1 941 → 428 µs**
+avec inject (4,5×) et **1 774 → 351 µs** sans (5,0×) ; M=8 6,2× ; M=128 7,9× ;
+M=512 **114 → 12,4 ms** (9,2×). `ple_hc_device_test` 48 checks verts, rel_l2
+kbench inchangé. En service, décodage Flash-Next **4,48 → 12,73 tok/s**
+(**2,84×**, même prompt, 64 tokens).
+
+**W24 `qsa_score` (`bb08e16`).** Une warp lisait 32 pages de blocs distinctes au
+même offset (16× d'amplification). Réécriture : un workgroup stage en LDS les
+pages et les lignes de q d'une tuile 32×64, chaque thread garde des chaînes
+f32 ascendantes. M=512 **82,27 → 2,23–2,30 ms** (36–37×), **bit-identique** à
+libref ; `qsa_score_device_test` 72 checks exacts.
+
+**W25/D2 DSpark (`e7a5b26`).** `minicpm5-2b-iq8r.rad` à `NS=3` sur la build
+`w28` : les rows du drafter existaient ; le seul défaut était le cas selftest
+`w2a8` déclaré `U8` au lieu de `F16`, donc toujours sauté. Cas numérique ajouté
+au bande du drafter (**M=7**, plan joint en mémoire device, rel_l2 1,72e-03).
+Service : **32,20 tok/s contre 20,64** (1,56×), **texte identique au bit**,
+33 drafts acceptés sur 210 (15,7 %) ; kbench 2B 384/384, FN 968/968.
+
+**W28b folds IQ8R (`4cbcd73`).** `gate_had_quant_i8g` 128/256 (la porte dans son
+propre opérande, deux rotations 128 et un amax par 256) et le fold
+`gemm_nt_q_gated` `i8a8h` 256 (un `sub` i32 exact sur deux blocs, un fold).
+Tests device étendus (91 checks sur 5 cas).
+
+**W28c collectifs tp>1 (`038d78b`).** 18 rows `all_reduce`/`all_gather` portées
+de libhalo (`r3dh_ar_*`, renommage `halo_`→`r3dh_`), schemas et bandes de
+libr4d, `device.p2p` requis, paramètre rangé = plafond de bande ; les jonctions
+`ar_*` fusionnées restent des stubs (producteurs à signer). Test
+`tp2_collectives_device_test` : deux rangs sur une carte, deux streams, somme
+f32 exacte et gather étiqueté (12 checks, 2 cas). Selftest **190 rows**.
+
+**Trouvé à l'intégration (corrigé, `a8bc412`).** Déclarer une op change le
+**graphe** de l'arch : avec `gate_had_quant_i8g` déclarée, Flash-Next prend la
+branche fusionnée et l'émet sur **toute la projection** — `q`/`x` en
+`[T, heads*head_dim]` alors que le paramètre `n` nomme la largeur de tête, et la
+porte est une vue `[T, heads, head_dim]` de pas de tête 512 ([q|porte]
+entrelacé). La row refusait cette géométrie. Corrigé : pas de ligne et de tête
+portés, un bloc de rotation reste dans une tête, cas device dédié (103 checks
+sur 6 cas). Texte servi correct ; le 27B voit 30 cas `sigmoid`/`mul`/
+`quant_act_fp8` remplacés par la branche fusionnée (sans oracle libref) mais
+**répond au bit près** comme avant (29,63 vs 29,50 tok/s).
+
+**Validation combinée.** Selftest **190 rows, 0 échec, 16 skips** (les 16
+schemas sans oracle libref) ; `sched_test` 548 782, `engine_e2e_test` 909
+(3 skips), `fixture_test` 92 385 (7 skips), qsa 72, tp2 12, act_i8g 103,
+ple_hc 48, iqr, logits, gather_u8, vision, mtp, rerank verts ; kbench FN
+**948/948**, 2B **384/384**, 27B **653/653**, 0 échec, 0 divergence, pires
+rel_l2 inchangés (1,206e-02 / 1,810e-03 / 3,619e-03) — le nombre de cas suit
+l'énumération des rows résolues, pas la couverture.
+
 **Doc.** `RAPPORT_RDNA3.md` entre dans le dépôt (décision prise) et ses
 §7.6/§10.4–10.5 sont révisés ; `docs/OPS.md` et `libr3d/README.md` étaient déjà
 à jour.

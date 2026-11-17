@@ -180,16 +180,18 @@ flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
   ./build/tests/iqr_device_test && ./build/tests/logits_bf16_device_test && \
   ./build/tests/gather_rows_u8_device_test && ./build/tests/vision_rows_device_test && \
   ./build/tests/mtp_enter_e4m3_device_test && ./build/tests/logit_rerank_iqr_device_test && \
-  ./build/tests/act_i8g_group256_device_test && \
+  ./build/tests/act_i8g_group256_device_test && ./build/tests/ple_hc_device_test && \
+  ./build/tests/tp2_collectives_device_test && \
   ./build/bin/r3d_selftest ./build/radiance_home/kernels/libr3d.so'
 ```
 
-État de référence de la branche (R21 + R22 + R23 + R25 + R26 + W27) :
-**169 rows, 0 échec, 15 skips** ; `sched_test` **548 782 checks, 0 échec** et
+État de référence de la branche (R21 + R22 + R23 + R25 + R26 + W27 + W28) :
+**190 rows, 0 échec, 16 skips** ; `sched_test` **548 782 checks, 0 échec** et
 `engine_e2e_test` **909 checks, 0 échec** (3 skips) ; `kbench` Flash-Next
-**968/968** et 27B **683/683**, 0 échec,
-0 divergence, **dans les deux modes** (défaut et `--band-capacity`). Test de
-contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
+**948/948** (4 946/4 946 en `--bench` dans les deux modes, W24), MiniCPM5-2B
+**384/384** et 27B **653/653**, 0 échec, 0 divergence (pires rel_l2 1,206e-02,
+1,810e-03, 3,619e-03) ; le nombre de cas suit les rows résolues, pas la
+couverture. Test de contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
 `gather_rows_u8_device_test` couvre les rows u8 du tier KV (fragment 4 128 octets,
 octets opaques, pitches larges) ; `mtp_enter_e4m3_device_test` et
 `logit_rerank_iqr_device_test` couvrent le MTP (22 + 36 checks). MTP servi à
@@ -202,6 +204,12 @@ octets opaques, pitches larges) ; `mtp_enter_e4m3_device_test` et
 Recette 27B (dense, IQR) : `--kv-cache-dtype i8 --num-speculative-tokens 0`
 (le drafter h128 fenêtré réclame bf16), `--max-num-seqs 4` — le multi-séquence
 est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill ≈ 318 tok/s).
+
+Recette MiniCPM5-2B (IQ8R, groupe 256) : `--tp 1 --num-speculative-tokens 0`
+en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
+`head_dim=128`) ; 523 ops / 423 poids, décodage 40,2 tok/s à 60 tokens. À
+`--num-speculative-tokens 3` (drafter DSpark) : **32,2 tok/s contre 20,6**
+(1,56×), texte identique au bit, 33 drafts acceptés sur 210 (15,7 %).
 
 ## Pièges connus
 
@@ -229,6 +237,17 @@ est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill ≈ 318 tok/s
   (kbench les laisse « Not covered ») : leur correctness passe par
   `act_i8g_group256_device_test`. Le 2B se sert en **KV bf16** (l'arch refuse i8
   à `head_dim=128`).
+- **Déclarer une op change le graphe de l'arch.** Dès qu'une row existe,
+  `rad_op_declared` peut faire prendre la branche fusionnée ; la row doit servir
+  la géométrie réellement émise, souvent la ligne entière
+  (`[T, heads*head_dim]`) alors que le paramètre `n` nomme la largeur de tête,
+  avec une porte en vue `[T, heads, head_dim]` de pas propre (W28 :
+  `gate_had_quant_i8g` sur Flash-Next, sinon le moteur s'arrête à l'étape 0).
+  Un kbench vert ne prouve pas cela — il ne rend pas le graphe du modèle :
+  couvrir la vue par un cas device **et** servir le modèle après le merge.
+  Inversement, une op déclarée peut replier des cas élémentaires (27B :
+  30 cas `sigmoid`/`mul`/`quant_act_fp8`), d'où un compte kbench qui baisse
+  sans échec : comparer les textes servis, pas seulement les compteurs.
 - **MTP** : Flash-Next se sert à `NS=3` (1,82× le décodage, texte identique,
   acceptation ~40 %) ; le 27B reste à `NS=0` (drafter h128 bf16). Un poids
   joint `rad.planes` d'une row device peut vivre en VRAM : un shim ne doit pas

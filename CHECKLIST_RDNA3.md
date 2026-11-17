@@ -20,14 +20,13 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 (« Prochains lots »), les chiffres dans `TABLEAU_REEL_IDEAL_RDNA3.md`.
 
 **P0 — performance Flash-Next (M2 non tenu : η lien 1,7 % de 2 545 tok/s)**
-- [ ] **R20 `hc_read`** — 1,77 ms à M=1 pour 6,55 Mo de poids (η 0,6 % ; la row
-      documente 18,7 µs) et 0,23 ms par ligne au-delà de M=8 : ~40 % du décodage
-      et 47 % du préfill. **Profil engine fait (2026-11-17)** : 96 sites
-      `hc_read`, **1,93 ms/appel** en engine contre 1,77 ms en kbench au même
-      géométrique, poids **en VRAM** — le coût est dans le noyau (lecture par
-      ligne, ~3,7 GB/s pour un plancher de 10,5 µs), pas dans l'engine ni le
-      lien. Reste la correction
-      noyau. **Feu vert requis** : optimisation noyau en pause.
+- [x] **R20 `hc_read`** — **noyau corrigé (W28)** : staging LDS coalescé des
+      matrices de mélange, sommes f32 ascendantes inchangées ; **M=1 1 941 →
+      428 µs (4,5×)**, M=8 6,2×, M=128 7,9×, **M=512 114 → 12,4 ms (9,2×)** ;
+      décodage Flash-Next **4,48 → 12,73 tok/s (2,84×)**. Le profil (96 sites,
+      1,93 ms/appel, poids en VRAM) reste la trace du diagnostic. Reste un
+      écart ~40× au plancher de 10,5 µs (~15 GB/s effectifs) : second passage
+      « plusieurs lignes par tranche de poids », pas un bug de contrat.
 - [x] **W24a `qsa_score`** — mesuré à froid (79,0/82,7/83,3 ms à M=512,
       103 GFLOP/s, 2 % du pic, aucun throttler) ; cause : warp = 32 pages
       distinctes au même offset (16× d'amplification de secteur, borné par L2) ;
@@ -405,17 +404,22 @@ dans `RAPPORT_RDNA3.md` §10 ; cette section est la feuille de route.
       sert à `NS=0` ; kbench ciblé **110/110**, GEMM bit-exact, et le conteneur
       entier **384/384** (0 échec, 0 divergence, pire rel_l2 1,810e-03).
       Restent hors de ce lot, sans besoin pour ce chemin : les rows nommées
-      comme RDNA4 (`rmsnorm_had_quant_iq8r`, `*_iq8r`), les variantes non
-      fusionnées `rmsnorm_quant_i8g` / `ar_*` (tp > 1), `gate_had_quant_i8g`,
-      et le fold `gemm_nt_q_gated` groupe 256 (non déclaré pour un poids i8) ;
-      puis DSpark (D2) pour `NS > 0`.
-- [ ] **D2 — DSpark (MiniCPM5 à NS > 0)** : `dflash_conv`,
-      `dflash_markov_greedy`, `dflash_markov_greedy_f32`, `dflash_tree` ; plus
-      `row_topk_merge`, `sample_merge_topk`, `pair_argmax` si le sélecteur les
-      demande. Inutile pour R9 à `NS=0`.
-- [ ] **D3 — multi-carte (`tp>1`)** : `all_reduce`, `all_gather` et les fusions
-      `ar_*` (**18 rows**, 2 ops). Sans objet sur une carte, requis pour
-      `tp=2/4`.
+      comme RDNA4 (`rmsnorm_had_quant_iq8r`, `*_iq8r`), et les variantes
+      non fusionnées `rmsnorm_quant_i8g` / `ar_*` (tp > 1). **Complété en
+      W28** : `gate_had_quant_i8g` 128/256 (porte en vue 3D à pas de tête) et
+      le fold `gemm_nt_q_gated` `i8a8h` 256 ; DSpark livré (D2).
+- [x] **D2 — DSpark (MiniCPM5 à NS > 0)** — **livré (W28)** : le drafter
+      s'appuie sur les rows existantes ; le cas selftest `w2a8` (plan joint
+      déclaré F16 au lieu d'U8) était toujours sauté, corrigé avec un cas
+      numérique au bande du drafter (M=7). Service `NS=3` : **32,20 vs
+      20,64 tok/s** (1,56×), texte identique au bit, 33/210 drafts acceptés
+      (15,7 %). `dflash_*` supplémentaires non nécessaires pour ce conteneur.
+- [~] **D3 — multi-carte (`tp>1`)** — **rows livrées (W28)** : les 18
+      `all_reduce`/`all_gather` (2/3/4/8 rangs, wires exact/wht6/ti8, gathers)
+      sont portées de libhalo avec les schémas libr4d, `device.p2p` requis,
+      `tp2_collectives_device_test` à 2 rangs sur une carte (12 checks). Restent
+      les **jonctions `ar_*` fusionnées** (stubs : producteurs aux signatures
+      différentes) pour qu'un modèle `tp>1` se serve.
 - [ ] **D4 — streaming KV** : `kv_store_streamed` (fp8/i8/bf16) et
       `kv_resolve_i32` ; le tier hôte actuel n'en a pas besoin.
 - [ ] **D5 — attention/KV des autres architectures (30 ops, 58 rows)** :
