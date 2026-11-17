@@ -8,7 +8,7 @@
  * ============================================================ the schema table
  *
  * The first plugin in hierarchy order to declare an op fixes its schema, and a plugin whose schema
- * disagrees is refused at load (rad_abi.h, spec Â§2.3): arguments are positional, so two schemas
+ * disagrees is refused at load (rad_abi.h, spec §2.3): arguments are positional, so two schemas
  * would give one call two meanings. libref declares the vocabulary (`docs/OPS.md`), so every schema
  * below is libref's: the same keys, types, requiredness, operand roles and optionality, in the same
  * order. The prose describes this library's rows; the loader compares only the positional slots.
@@ -18,7 +18,7 @@
  *
  * ============================================================ the constraint table
  *
- * A constraint is a necessary condition on the geometry (spec Â§2.1). An operand's dtype is a
+ * A constraint is a necessary condition on the geometry (spec §2.1). An operand's dtype is a
  * property of the call, and the shim checks it on the tensor. Constraints state what the kernel
  * cannot do (the divisibility its lane map assumes, the band its grid is sized for, the scheme its
  * decoders implement) and what the selector needs to choose between rows. A constraint the kernel
@@ -42,6 +42,7 @@
  */
 
 #include "r3d_plugin.h"
+#include "r3dh_args.h"
 #include "rad_abi_layout.h"
 
 #ifndef R3D_BUILD_TARGET
@@ -79,6 +80,9 @@
 #define C_GE(k, v)  { (k), RAD_C_GE,  (long long)(v), nullptr }
 #define C_DIV(k, v) { (k), RAD_C_DIV, (long long)(v), nullptr }
 #define C_IN(k, s)  { (k), RAD_C_IN,  0, (s) }
+/* The engine sets RAD_FACT_P2P to 1 when every rank can reach every peer's VRAM. A collective
+ * that moves its payload through the peer's IPC slot cannot serve the host-mailbox fallback. */
+#define C_P2P       C_EQ(RAD_FACT_P2P, 1)
 
 /* A row with one implementation and nothing to measure. */
 #define NOTUNE nullptr, 0, nullptr
@@ -907,6 +911,33 @@ static const RadOperandSpec oArGatherHcWrite[] = {
     { "inj", RAD_OPD_IN, 0 },       { "h", RAD_OPD_INOUT, 0 }
 };
 
+/* --- the tensor-parallel collectives (schema is libr4d's, slot for slot) --- */
+static const RadParamSpec pAllReduce[] = {
+    { "world_size", RAD_P_INT, RAD_REQUIRED },
+    /* The message in elements. A band resolves at its upper bound, so every bound the rows below
+     * state is a multiple of the largest DIV they use (128), or the band would have no row. */
+    { "numel",      RAD_P_INT, RAD_REQUIRED },
+    { "dtype",      RAD_P_STR, RAD_REQUIRED },
+    { "exact",      RAD_P_INT, RAD_REQUIRED },
+    { "min_bytes",  RAD_P_INT, RAD_OPTIONAL },
+    { "hops",       RAD_P_INT, RAD_OPTIONAL },
+    { "overlap",    RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oAllReduce[] = {
+    { "x", RAD_OPD_INOUT, 0 },
+    { "y", RAD_OPD_OUT,   1 },
+};
+static const RadParamSpec pAllGather[] = {
+    { "world_size", RAD_P_INT, RAD_REQUIRED },
+    { "numel",      RAD_P_INT, RAD_REQUIRED },
+    { "dtype",      RAD_P_STR, RAD_REQUIRED },
+    { "row",        RAD_P_INT, RAD_OPTIONAL },
+};
+static const RadOperandSpec oAllGather[] = {
+    { "x", RAD_OPD_IN,  0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+
 static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd) * mult. `wadd` is GemmaRMSNorm's `1 +`, "
@@ -1320,6 +1351,15 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("ar_gather_hc_write", pArGatherHcWrite, oArGatherHcWrite,
            "moe_gather, then ar_hc_write: the routed experts' rows summed back to token order "
            "(with the shared arm folded) ARE the message, and the gated write follows."),
+    SCHEMA("all_reduce", pAllReduce, oAllReduce,
+           "Sum over the tensor-parallel group. `exact` separates the exact sum from the quantised "
+           "wire and a caller that does not declare it gets no kernel. At 4 and 8 ranks the exact "
+           "sum is one-shot up to 524288 elements (at 8 ranks 8192) and two-shot above, chosen by "
+           "the message's band; `hops` is accepted and no row here reads it."),
+    SCHEMA("all_gather", pAllGather, oAllGather,
+           "y is [world_size * numel] with rank r's contribution at offset r * numel. The bytes "
+           "are moved and never summed: the vocab-parallel sampler's payload is (u32 token id, "
+           "f32 logit) pairs and an id lane read as f32 is a denormal."),
 };
 
 extern "C" int rad_kernel_schema_count(void) {
@@ -1332,7 +1372,7 @@ extern "C" const RadOpSchema* rad_kernel_schema_at(int i) {
 
 /* ================================================================== tuning
  *
- * The axes a kernel is instantiated along, measured per card by `rad-tune` (spec Â§15). Without a
+ * The axes a kernel is instantiated along, measured per card by `rad-tune` (spec §15). Without a
  * matrix instruction to size a tile against, the rows have few axes: how the work is split across
  * the card and how the weight stream is read.
  */
@@ -1541,6 +1581,69 @@ static long long tune_i(const RadArgs* a, const RadTunable* t, int n, const char
     return 0;
 }
 #define TUNE(a, tab, key) ((int)tune_i((a), (tab), NELEM(tab), (key)))
+
+/* ------------------------------------------------------------------------------ collectives
+ *
+ * The all-reduce family's launch geometry. The defaults are libhalo's measured points and change
+ * no result: nthreads 1024, drain 3 (s_wait_storecnt, which fine-grained uncached scratch needs),
+ * acq 0, pub 1, and nblocks 0 for the size rule (r3dh_ar_entry.hip clamps it). `ts_min` is the
+ * element count from which the four-rank exact one-shot hands its message to the exact two-shot on
+ * the same instance; it is declared by every all-reduce table so one tune pin is legal for every
+ * row the op resolves to. `overlap` 1 rows take the narrow launch (tArLane), which leaves the CUs
+ * to the compute beside them. */
+static const int64_t kArNblocks[]    = { 0, 2, 4, 8, 16, 24 };
+static const int64_t kArNthreads[]   = { 256, 512, 1024 };
+static const int64_t kArDrain[]      = { 1, 3 };
+static const int64_t kArAcq[]        = { 0, 1 };
+static const int64_t kArTsMin[]      = { 0, 16384, 32768, 65536, 131072, 262144 };
+static const int64_t kArQ84Tail[]    = { 1, 0 };
+static const int64_t kArNblocksLane4[] = { 0, 4, 8, 16, 24 };
+static const RadTunable tAr[] = {
+    { "nblocks",  kArNblocks,  NELEM(kArNblocks),  0, "blocks in the grid; 0 scales with the message and clamps" },
+    { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block" },
+    { "drain",    kArDrain,    NELEM(kArDrain),     3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
+    { "acq",      kArAcq,      NELEM(kArAcq),       0, "acquire fence after the flag read" },
+    { "ts_min",   kArTsMin,    NELEM(kArTsMin), 32768, "elements from which the four-rank one-shot takes the exact two-shot; 0 = never" },
+};
+static const RadTunable tArQ84[] = {
+    { "nblocks",  kArNblocks,  NELEM(kArNblocks),  0, "blocks in the grid; 0 is one a row, clamped" },
+    { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "unused: the norm's width sets the block for bit-exactness" },
+    { "drain",    kArDrain,    NELEM(kArDrain),     3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
+    { "acq",      kArAcq,      NELEM(kArAcq),       0, "acquire fence after the flag read" },
+    { "tail",     kArQ84Tail,  NELEM(kArQ84Tail),   1, "from 5 to 32 rows, the standalone two-shot with the junction as its tail; 0 = the one-shot" },
+};
+static const RadTunable tArTs4Lane[] = {
+    { "nblocks",  kArNblocksLane4, NELEM(kArNblocksLane4), 4, "blocks in the grid; 0 scales with the message and clamps" },
+    { "nthreads", kArNthreads, NELEM(kArNthreads), 1024, "threads per block" },
+    { "drain",    kArDrain,    NELEM(kArDrain),     3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
+    { "acq",      kArAcq,      NELEM(kArAcq),       0, "acquire fence after the flag read" },
+    { "ts_min",   kArTsMin,    NELEM(kArTsMin), 32768, "unused here (tAr says why it is declared)" },
+};
+static const RadTunable tArLane[] = {
+    { "nblocks",  kArNblocks,  NELEM(kArNblocks),  8, "blocks in the grid; 0 scales with the message and clamps" },
+    { "nthreads", kArNthreads, NELEM(kArNthreads), 256, "threads per block" },
+    { "drain",    kArDrain,    NELEM(kArDrain),     3, "store-drain wait before the flag: 3 = s_wait_storecnt, 1 = vmcnt" },
+    { "acq",      kArAcq,      NELEM(kArAcq),       0, "acquire fence after the flag read" },
+    { "ts_min",   kArTsMin,    NELEM(kArTsMin), 32768, "unused here (tAr says why it is declared)" },
+};
+
+extern "C" void r3dh_cfg_ar(const RadArgs* a, HaloArCfg* out) {
+    out->nblocks  = TUNE(a, tAr, "nblocks");
+    out->nthreads = TUNE(a, tAr, "nthreads");
+    out->drain    = TUNE(a, tAr, "drain");
+    out->acq      = TUNE(a, tAr, "acq");
+    out->pub      = 1;
+    /* Operand 0 is the message on every collective that reads this. */
+    if (a && a->t && a->n_t > 0 && rad_tensor_numel(&a->t[0]) >= 131072 &&
+        rad_args_geti_or(a, "world_size", a->world_size) == 4)
+        out->drain = 1;
+}
+extern "C" int r3dh_cfg_ar_tail(const RadArgs* a) {
+    return TUNE(a, tArQ84, "tail");
+}
+extern "C" long r3dh_cfg_ar_ts_min(const RadArgs* a) {
+    return (long)tune_i(a, tAr, NELEM(tAr), "ts_min");
+}
 
 extern "C" void r3d_cfg_gemm(const RadArgs* a, R3dGemmCfg* out) {
     out->wv = TUNE(a, tGemmM16, "wv");
@@ -2096,6 +2199,86 @@ static const RadConstraint cArGatherHc[] = { C_IN("dtype", "bf16"), C_GE("M", 1)
                                              C_EQ("world_size", 1), C_GE("hc", 2), C_LE("hc", 8),
                                              C_DIV("n", 8), C_GE("top_k", 1),
                                              C_LE("top_k", 64) };
+
+/* The tp collectives' message bands, the widths libr4d states: at 4 and 8 ranks the exact sum is
+ * one-shot up to these element counts and two-shot above, so the two-shot band starts one past the
+ * bound (a multiple of every DIV below) and the message size, not the caller, picks the form. */
+enum {
+    R3D_AR_WIDE_ONESHOT_MAX_ELEMS = 524288,
+    R3D_AR_8RANK_ONESHOT_MAX_ELEMS = 8192,
+    /* The two-shot's upper bound: the kernel's word offsets are int32 at fp32. */
+    R3D_AR_TWOSHOT_WIDE_MAX_ELEMS = 268435456
+};
+static const RadConstraint cArExact[] = {
+    C_EQ("world_size", 2), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"), C_P2P,
+};
+static const RadConstraint cArGather2[] = {
+    C_EQ("world_size", 2), C_IN("dtype", "bf16 fp16 f16 fp32 f32"), C_P2P,
+};
+static const RadConstraint cArGather3[] = {
+    C_EQ("world_size", 3), C_IN("dtype", "bf16 fp16 f16 fp32 f32"), C_P2P,
+};
+static const RadConstraint cArGather4[] = {
+    C_EQ("world_size", 4), C_IN("dtype", "bf16 fp16 f16 fp32 f32"), C_P2P,
+};
+static const RadConstraint cArGather8[] = {
+    C_EQ("world_size", 8), C_IN("dtype", "bf16 fp16 f16 fp32 f32"), C_P2P,
+};
+static const RadConstraint cArExact3[] = {
+    C_EQ("world_size", 3), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"), C_P2P,
+};
+static const RadConstraint cArExact4[] = {
+    C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"), C_P2P,
+};
+static const RadConstraint cArExact8[] = {
+    C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"), C_P2P,
+};
+/* No DIV at three ranks: the two-shot shards unevenly in whole words. */
+static const RadConstraint cArTsExact3[] = {
+    C_EQ("world_size", 3), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_GE("numel", R3D_AR_WIDE_ONESHOT_MAX_ELEMS + 1),
+    C_LE("numel", R3D_AR_TWOSHOT_WIDE_MAX_ELEMS), C_P2P,
+};
+static const RadConstraint cArTsExact4[] = {
+    C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_DIV("numel", 64), C_GE("numel", R3D_AR_WIDE_ONESHOT_MAX_ELEMS + 1),
+    C_LE("numel", R3D_AR_TWOSHOT_WIDE_MAX_ELEMS), C_P2P,
+};
+static const RadConstraint cArTsExact4Lane[] = {
+    C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_DIV("numel", 64), C_GE("numel", R3D_AR_WIDE_ONESHOT_MAX_ELEMS + 1),
+    C_LE("numel", R3D_AR_TWOSHOT_WIDE_MAX_ELEMS), C_EQ("overlap", 1), C_P2P,
+};
+static const RadConstraint cArTsExact8[] = {
+    C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_DIV("numel", 64), C_GE("numel", R3D_AR_8RANK_ONESHOT_MAX_ELEMS + 1),
+    C_LE("numel", R3D_AR_TWOSHOT_WIDE_MAX_ELEMS), C_P2P,
+};
+static const RadConstraint cArWht6[] = {
+    C_EQ("world_size", 2), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 64),
+    C_P2P,
+};
+static const RadConstraint cArExactLane[] = {
+    C_EQ("world_size", 2), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_EQ("overlap", 1), C_P2P,
+};
+static const RadConstraint cArWht6Lane[] = {
+    C_EQ("world_size", 2), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 64),
+    C_EQ("overlap", 1), C_P2P,
+};
+/* DIV 32, not 96: the three-rank split is uneven in whole 32-element groups. */
+static const RadConstraint cArTi8Ts3[] = {
+    C_EQ("world_size", 3), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 32),
+    C_P2P,
+};
+static const RadConstraint cArTi8Ts4[] = {
+    C_EQ("world_size", 4), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 128),
+    C_P2P,
+};
+static const RadConstraint cArTi8Ts4Lane[] = {
+    C_EQ("world_size", 4), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 128),
+    C_EQ("overlap", 1), C_P2P,
+};
 
 /* ================================================================== the rows
  *
@@ -4009,7 +4192,7 @@ static const RadKernelInfo kKernels[] = {
   "the same 128x128 tile as the fp8a8 arm, with the codes unpacked on the way into LDS -- 8 codes "
   "from a 4-byte load at U2, 16 from a 16-byte load at U4 -- and the epilogue folding "
   "(code - zero) * scale per staged element, so the dot runs over values and no a_sum term is "
-  "reduced: the zero comes off term by term, which is why Î£ a(q-z) needs no Î£ a here while the m16 "
+  "reduced: the zero comes off term by term, which is why Σ a(q-z) needs no Σ a here while the m16 "
   "row needs it to lift the integer bias off its f16-as-int dot. The row's scale and zero are one "
   "per ROW on a {1, group} plane, so the staging reads 128 scalars a chunk where the fp8a8 arm reads "
   "one, at the row the grid puts it; issued one chunk ahead of the fold that consumes them, because "
@@ -4337,6 +4520,184 @@ static const RadKernelInfo kKernels[] = {
   ROW(cArGatherHc), NOTUNE,
   nullptr, nullptr, r3d_rad_ar_gather_hc_write, nullptr, nullptr, nullptr, nullptr },
 
+/* --------------------------------------------------------------- tp: the collectives
+ *
+ * The engine's tp>1 path: the ports of libhalo's all-reduce and all-gather (r3dh_ar_*, the
+ * halo_ -> r3dh_ rename). They move the payload through the peer's IPC scratch and the start-up
+ * exchange buffers, so a row needs `device.p2p` 1. At four and eight ranks the exact sum is
+ * one-shot up to its bound and two-shot above; the message's band picks the form, as in libr4d.
+ */
+{ "ar_twoshot_3rank_exact", "all_reduce", "ar",
+  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch",
+  "exactly 3 ranks, all peer-accessible; messages from "
+  "524289 elements; shards as even as the word count allows",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_TWOSHOT,
+  ROW(cArTsExact3), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_twoshot_3rank_exact, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_twoshot_4rank_exact", "all_reduce", "ar",
+  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch",
+  "exactly 4 ranks, all peer-accessible; messages from "
+  "524289 elements, sharding evenly",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_TWOSHOT,
+  ROW(cArTsExact4), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_twoshot_4rank_exact, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_twoshot_4rank_exact_lane", "all_reduce", "ar",
+  "all-reduce (sum) with a narrow launch beside compute",
+  "exactly 4 ranks, peer-accessible, overlap 1; messages from "
+  "524289 elements, sharding evenly",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, same bytes as the wide row",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_TWOSHOT + 1,
+  ROW(cArTsExact4Lane), ROW(tArTs4Lane), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_twoshot_4rank_exact, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_twoshot_8rank_exact", "all_reduce", "ar",
+  "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch",
+  "exactly 8 ranks, all peer-accessible; messages from "
+  "8193 elements, sharding evenly",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_TWOSHOT,
+  ROW(cArTsExact8), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_twoshot_8rank_exact, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_oneshot_2rank_exact", "all_reduce", "ar",
+  "all-reduce (sum), one-shot push over P2P IPC scratch",
+  "exactly 2 ranks, peer-accessible; scratch sized by the full message; cudagraph-safe",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate, bit-identical across ranks",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT,
+  ROW(cArExact), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_oneshot_2rank_exact, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_oneshot_2rank_wht6", "all_reduce", "ar",
+  "all-reduce (sum) with a Walsh-Hadamard-rotated 6-bit wire payload -- lossy",
+  "exactly 2 ranks, peer-accessible; groups of 64 elements",
+  "bf16 / fp16 payload, 6 bits + bf16 scale per group on the wire, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT,
+  ROW(cArWht6), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_oneshot_2rank_wht6, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_oneshot_2rank_exact_lane", "all_reduce", "ar",
+  "all-reduce (sum), one-shot push with a narrow launch beside compute",
+  "exactly 2 ranks, peer-accessible, overlap 1; scratch sized by the full message",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate, same bytes as the wide row",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT + 1,
+  ROW(cArExactLane), ROW(tArLane), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_oneshot_2rank_exact, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_oneshot_2rank_wht6_lane", "all_reduce", "ar",
+  "all-reduce (sum) on the rotated 6-bit wire -- lossy; narrow launch beside compute",
+  "exactly 2 ranks, peer-accessible, overlap 1; groups of 64 elements",
+  "bf16 / fp16 payload, 6 bits + bf16 scale per group on the wire, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT + 1,
+  ROW(cArWht6Lane), ROW(tArLane), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_oneshot_2rank_wht6, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_oneshot_3rank_exact", "all_reduce", "ar",
+  "all-reduce (sum), one-shot push over P2P IPC scratch",
+  "exactly 3 ranks, peer-accessible; above "
+  "524288 elements ar_twoshot_3rank_exact outranks it",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT,
+  ROW(cArExact3), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_oneshot_3rank_exact, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_oneshot_4rank_exact", "all_reduce", "ar",
+  "all-reduce (sum), one-shot push over P2P IPC scratch",
+  "exactly 4 ranks, peer-accessible, at most "
+  "524288 elements",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT,
+  ROW(cArExact4), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_oneshot_4rank_exact, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_oneshot_8rank_exact", "all_reduce", "ar",
+  "all-reduce (sum), one-shot push over P2P IPC scratch",
+  "exactly 8 ranks, peer-accessible, at most "
+  "8192 elements",
+  "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT,
+  ROW(cArExact8), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_oneshot_8rank_exact, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_twoshot_3rank_ti8", "all_reduce", "ar",
+  "all-reduce (sum) on the tiered-int8 wire -- lossy",
+  "exactly 3 ranks, peer-accessible; whole 32-element groups, split over the shards as evenly as "
+  "they divide",
+  "bf16 / fp16 payload, int8 + fp16 scale + u32 record per group on the wire, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT,
+  ROW(cArTi8Ts3), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_twoshot_3rank_ti8, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_twoshot_4rank_ti8", "all_reduce", "ar",
+  "all-reduce (sum) on the tiered-int8 wire -- lossy",
+  "exactly 4 ranks, peer-accessible; numel a multiple of 128",
+  "bf16 / fp16 payload, int8 + fp16 scale + u32 record per group on the wire, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT,
+  ROW(cArTi8Ts4), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_twoshot_4rank_ti8, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_twoshot_4rank_ti8_lane", "all_reduce", "ar",
+  "all-reduce (sum) on the tiered-int8 wire -- lossy; narrow launch beside compute",
+  "exactly 4 ranks, peer-accessible, overlap 1; numel a multiple of 128",
+  "bf16 / fp16 payload, int8 + fp16 scale + u32 record per group on the wire, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT + 1,
+  ROW(cArTi8Ts4Lane), ROW(tArTs4Lane), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_twoshot_4rank_ti8, nullptr, nullptr, nullptr,
+  r3d_shape_all_reduce },
+
+{ "ar_gather_2rank", "all_gather", "ar",
+  "all-gather, one-shot push over P2P IPC scratch",
+  "exactly 2 ranks, peer-accessible; y is [2 * numel] with rank r's input at r * numel",
+  "any payload: the bytes are moved, never summed, so (u32 id, f32 logit) pairs survive intact",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT,
+  ROW(cArGather2), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_gather_2rank, nullptr, nullptr, nullptr,
+  r3d_shape_all_gather },
+
+{ "ar_gather_3rank", "all_gather", "ar",
+  "all-gather, one-shot push over P2P IPC scratch",
+  "exactly 3 ranks, peer-accessible; y is [3 * numel] with rank r's input at r * numel, or "
+  "row-interleaved [rows][3][row] when `row` is given",
+  "any payload: the bytes are moved, never summed, so (u32 id, f32 logit) pairs survive intact",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT,
+  ROW(cArGather3), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_gather_3rank, nullptr, nullptr, nullptr,
+  r3d_shape_all_gather },
+
+{ "ar_gather_4rank", "all_gather", "ar",
+  "all-gather, one-shot push over P2P IPC scratch",
+  "exactly 4 ranks, peer-accessible; y is [4 * numel] with rank r's input at r * numel",
+  "any payload: the bytes are moved, never summed, so (u32 id, f32 logit) pairs survive intact",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT,
+  ROW(cArGather4), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_gather_4rank, nullptr, nullptr, nullptr,
+  r3d_shape_all_gather },
+
+{ "ar_gather_8rank", "all_gather", "ar",
+  "all-gather, one-shot push over P2P IPC scratch",
+  "exactly 8 ranks, peer-accessible; y is [8 * numel] with rank r's input at r * numel",
+  "any payload: the bytes are moved, never summed, so (u32 id, f32 logit) pairs survive intact",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_AR_ONESHOT,
+  ROW(cArGather8), ROW(tAr), nullptr,
+  r3dh_rad_ar_init, r3dh_rad_ar_fini, r3dh_rad_ar_gather_8rank, nullptr, nullptr, nullptr,
+  r3d_shape_all_gather },
+
 
 /* ------------------------------------------------------------------ r3d_attn_paged_h256.hip
  *
@@ -4516,15 +4877,16 @@ static const RadKernelInfo kKernels[] = {
 /* ================================================================== the exports
  *
  * The two exports every plugin needs, the four that make a kernel library, and
- * `rad_kernel_concurrent`.
+ * `rad_kernel_concurrent` and `rad_kernel_collective`.
  *
  * No `rad_kernel_chain`: chaining replaces the queue's ordering between two dependent launches with
  * a spin in the kernel, and no row here has a chained form, so every answer would be 0. Omitting the
  * symbol means the same (ABI, `rad_kernel_chain`: "without the symbol, or with 0, the engine never
  * asks").
  *
- * No `rad_kernel_collective`: these rows run on single-GPU cards, and an all-reduce over the PCIe x1
- * slot most of them sit in is slower than going through the host.
+ * `rad_kernel_collective`: the all-reduce and all-gather rows exchange through IPC scratch and peer
+ * flags, so the engine must order them against the graph and hold the link for them. They are
+ * threads of one process in the selftest, but a serving engine runs one rank a card.
  */
 extern "C" int rad_kernel_count(void) {
     return (int)(sizeof(kKernels) / sizeof(kKernels[0]));
@@ -4548,7 +4910,19 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
 extern "C" int rad_kernel_concurrent(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;
+    /* The collectives keep per-block handshake and parity state in the instance, outside every
+     * operand, so two launches must not overlap. */
+    if (k->family && !std::strcmp(k->family, "ar")) return 0;
     return k->scratch == nullptr;
+}
+
+/* Collective rows: every launch exchanges with a peer rank through the instance's IPC scratch and
+ * flags. Answer 1: the engine orders them and releases the link after the launch (no row here
+ * returns RAD_LINK_ENDED early; that form needs the launch to hold the gate itself). */
+extern "C" int rad_kernel_collective(int i) {
+    const RadKernelInfo* k = rad_kernel_at(i);
+    if (!k || !k->op) return 0;
+    return !std::strcmp(k->op, "all_reduce") || !std::strcmp(k->op, "all_gather");
 }
 
 static const RadPluginInfo kInfo = {

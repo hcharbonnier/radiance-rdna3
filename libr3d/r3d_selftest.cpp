@@ -205,6 +205,9 @@ static void check_table() {
                 const RadConstraint& x = k->constraints[c];
                 const RadParamSpec* p = find_param(s, x.key);
                 if (!p) {
+                    /* `device.*` keys are facts the engine sets (rad_types.h), not parameters:
+                     * they are outside the schema and the selector reads them separately. */
+                    if (x.key && !std::strncmp(x.key, "device.", 7)) continue;
                     fail("row '%s' constrains '%s', not a parameter of '%s'", k->name,
                          x.key ? x.key : "(null)", k->op);
                     continue;
@@ -2453,6 +2456,12 @@ static int run_row(int i) {
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) {
         skip("no device visible");
+        return 0;
+    }
+    /* A collective's launch needs the peer group and the exchange buffers init() built from two
+     * or more ranks. The generic row run has neither: the tp2 device test builds them directly. */
+    if (!std::strcmp(k->op, "all_reduce") || !std::strcmp(k->op, "all_gather")) {
+        skip("a collective needs a peer group; tp2_collectives_device_test covers it");
         return 0;
     }
     const int hand = k->opd_shape ? 0

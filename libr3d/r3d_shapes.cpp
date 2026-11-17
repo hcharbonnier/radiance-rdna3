@@ -1152,6 +1152,27 @@ int r3d_shape_sample_topk(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     R3D_PICK(list);
 }
 
+/* The tensor-parallel collectives. `numel` is the largest message the instance carries: init
+ * sizes the peer scratch from it and the launch reads the real count off the tensor. The all-
+ * reduce's optional `y` is described so a caller that passes one is checked against the same
+ * extent; absent means in place. A gather's output is world_size times this rank's contribution,
+ * at the same total extent whether it is flat or row-interleaved. */
+int r3d_shape_all_reduce(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t numel = gi(p, n_p, "numel", 0);
+    const uint32_t D = act_dt(p, n_p);
+    if (numel <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = { opd(D, numel), opd(D, numel) };
+    R3D_PICK(list);
+}
+int r3d_shape_all_gather(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t numel = gi(p, n_p, "numel", 0);
+    const int64_t world = gi(p, n_p, "world_size", 0);
+    const uint32_t D = act_dt(p, n_p);
+    if (numel <= 0 || world <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = { opd(D, numel), opd(D, world * numel) };
+    R3D_PICK(list);
+}
+
 /* The four narrowing stages (top-p, min-p, typical, XTC), in place over the candidate set. The set
  * is drawn, not sorted: the ABI has no descending fill domain, and top-p is a prefix rule in
  * candidate order, which applies to any order. */

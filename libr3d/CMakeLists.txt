@@ -164,6 +164,19 @@ set(R3D_UNITS
   "r3dh_gdn_kkt_solve|"
   "r3dh_gdn_chunk_scan|"
   "r3dh_gdn_recurrent_update|"
+  # The tensor-parallel collectives: libhalo's all-reduce / all-gather kernels (r3dh_*, the
+  # halo_ -> r3dh_ rename), the entry that owns their host rendezvous and exchange buffers, and the
+  # fused junction. Compiled for the whole family; a card needs the engine's tp>1 path to use them.
+  "r3dh_ar_entry|"
+  "r3dh_ar_gather_2rank|"
+  "r3dh_ar_gather_Nrank|"
+  "r3dh_ar_oneshot_2rank_exact|"
+  "r3dh_ar_oneshot_2rank_wht6|"
+  "r3dh_ar_oneshot_Nrank_exact|"
+  "r3dh_ar_twoshot_Nrank_exact|"
+  "r3dh_ar_twoshot_Nrank_ti8|"
+  "r3dh_ar_ln_had_quant_i8|"
+  "r3dh_ar_stubs|"
   "r3d_gdn_gated_rmsnorm_h128|"
   "r3d_gdn_gated_norm_had_quant_i8|"
   "r3d_gdn_conv_w4_h128|"

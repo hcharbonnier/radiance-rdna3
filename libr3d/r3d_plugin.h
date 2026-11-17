@@ -56,7 +56,12 @@ enum {
     /* `rope` has an unconstrained row for neox/gptj/imrope, so a mode-specific row must outrank it
      * to be selected; the unconstrained row then refuses the mode at launch. The axial row is the
      * vision tower's two-component rotary. */
-    R3D_PRIO_ROPE_AXIAL = 80
+    R3D_PRIO_ROPE_AXIAL = 80,
+
+    /* The collectives: at the widths that have both forms the two-shot outranks the one-shot,
+     * since its band starts where the one-shot's send cost stops paying (libr4d's order). */
+    R3D_PRIO_AR_TWOSHOT = 70,
+    R3D_PRIO_AR_ONESHOT = 60
 };
 
 /* ================================================================== the dtype codes a C
@@ -536,6 +541,26 @@ int r3d_rad_hc_project     (const RadArgs* a, RadStream s);
 int64_t r3d_rad_hc_read_scratch(const RadArgs* a);
 int r3d_rad_ar_hc_write        (const RadArgs* a, RadStream s);
 int r3d_rad_ar_gather_hc_write (const RadArgs* a, RadStream s);
+/* --- the tensor-parallel collectives (r3dh_ar_entry.hip, the libhalo port) --- */
+int r3dh_rad_ar_init      (const RadParam* p, int n_p, int rank, int world, void** out);
+int r3dh_rad_ar_host_init (const RadParam* p, int n_p, int rank, int world, void** out);
+void r3dh_rad_ar_fini     (void* instance);
+int r3dh_rad_ar_oneshot_2rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_oneshot_2rank_wht6 (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_twoshot_3rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_oneshot_3rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_oneshot_8rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_twoshot_3rank_ti8  (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_twoshot_4rank_ti8  (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_gather_2rank       (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_gather_3rank       (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_gather_4rank       (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_gather_8rank       (const RadArgs* a, RadStream s);
+int r3d_shape_all_reduce (const RadParam*, int, int, RadOpdDesc*);
+int r3d_shape_all_gather (const RadParam*, int, int, RadOpdDesc*);
 /* The joined E4M3 mixing weight: codes and a f32 scale per group in the row's tail. */
 int r3d_rad_layout_hc_mix     (const RadParam*, int, int, const RadEncoding*, const int*,
                                const RadTensor*, int, RadLayout*);
