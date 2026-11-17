@@ -408,8 +408,10 @@ couverts par `act_i8g_group256_device_test` (67 checks sur 4 cas). Service en
 **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch n'acceptent pas i8 à
 `head_dim=128`) : réponses cohérentes, **40,2 tok/s** sur 60 tokens générés
 (69,0 tok/s sur 16), préfill 184–367 tok/s sur ces prompts courts. Le conteneur
-2B **n'a pas été rejoué en entier** : les autres ops ne sont pas modifiées, et
-leur non-régression est établie sur Flash-Next et le 27B.
+2B **rejoué en entier** (`--kernels libr3d:libref --max-cases 1`) donne
+**384/384**, 0 échec, 0 divergence, pire rel_l2 **1,810e-03** (30 rows device
+exercées) : `attn_paged` gqa=8, `rope` neox h128, `kv_store`, `embed_lookup`,
+la tête à 130 560 tokens et les sampleurs inclus.
 
 ## 8. Étape d'optimisation (après validation)
 

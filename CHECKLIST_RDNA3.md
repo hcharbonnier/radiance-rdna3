@@ -399,7 +399,8 @@ dans `RAPPORT_RDNA3.md` §10 ; cette section est la feuille de route.
       `gemm_iqr_nt_m16_w256` et `gemm_iqr_tiled_w256` : encodage IQ8R au
       layout, échelle bf16 = produit u8×bf16 par (row,256), un seul `sub` i32
       sur deux blocs 128, split-K refusé). Le 2B charge (523 ops, 423 poids) et
-      sert à `NS=0` ; kbench ciblé **110/110**, GEMM bit-exact.
+      sert à `NS=0` ; kbench ciblé **110/110**, GEMM bit-exact, et le conteneur
+      entier **384/384** (0 échec, 0 divergence, pire rel_l2 1,810e-03).
       Restent hors de ce lot, sans besoin pour ce chemin : les rows nommées
       comme RDNA4 (`rmsnorm_had_quant_iq8r`, `*_iq8r`), les variantes non
       fusionnées `rmsnorm_quant_i8g` / `ar_*` (tp > 1), `gate_had_quant_i8g`,

@@ -1123,7 +1123,11 @@ résolvent sur les nouvelles rows (`gemm_iqr_nt_m16_w256` à M ≤ 16, tiled
 au-delà ; `had_quant_act_i8g` a aussi un repli AVX, les deux producteurs
 fusionnés restent device). kbench ciblé **110/110**, pire rel_l2 **4,018e-05**,
 GEMM **bit-exact**. Les deux producteurs fusionnés affichent « Not covered »
-(pas d'oracle libref) et sont couverts par le test device.
+(pas d'oracle libref) et sont couverts par le test device. Le conteneur 2B
+**rejoué en entier** (`--kernels libr3d:libref --max-cases 1`, 18,5 s) donne
+**384/384**, 0 échec, 0 divergence, pire rel_l2 **1,810e-03**, 30 rows device
+exercées — `attn_paged` gqa=8, `rope` neox h128, `kv_store`, `embed_lookup`, la
+tête à 130 560 tokens et les sampleurs sont donc couverts sur ce conteneur.
 
 **Service.** `radiance --tp 1 --max-model-len 4096 --max-num-seqs 1
 --num-speculative-tokens 0 --kv-cache-dtype bf16` : `/health` 200, complétion
