@@ -187,6 +187,21 @@ préfill de 2 048 tokens** (47 % des 48,6 s mesurés, plafond 89 tok/s). C'est l
 de Flash-Next, devant le tiering des experts ; l'écart à la borne de la row (~18,7 µs) est
 d'un facteur ~95 et demande un profil engine pour être clos (kbench seul ne le tranche pas).
 
+**Profil engine (2026-11-17, préparation W21).** Un serveur Flash-Next
+(`--profile-ops`, `NS=0`, `MLP=8192`, `SEQS=1`, `expert_tiered`, pool hôte 43 000,
+KV i8) sur une requête greedy de 4 tokens donne : **96 sites `hc_read`
+(attn + ffn par couche), 1,93 ms/appel**, `wait` 3–8 µs ; le reste du pas est
+dominé par `embed_lookup` (9,5 ms/appel, depuis le pool hôte) et les GEMM
+`gdn`/`ssm` (2–5 ms). Le même (op, kernel, géométrie) mesure **1,77 ms** dans
+kbench (`M=1`, `n=2560 hc=4 lowrank=320 mix=e4m3`). Le plan de placement donne
+les poids `hc_norm` **en VRAM** (`blk.*.{attn,ffn}_hc_norm.weight`, 1,88 Mio × 48
+chacun), donc ni le lien ni le tiering ne sont en cause. Conclusion : le coût
+est **dans le noyau RDNA3** (relecture par ligne au lieu de l'amortissement par
+tuile de 128 lignes que la row décrit) ; l'engine ne fait que l'exécuter.
+À 6,55 Mo par appel (chiffre W18) en 1,77 ms, le débit est ~3,7 GB/s, très
+loin du plancher de bande (10,5 µs) et de la référence libr4d. La correction
+est un travail de noyau (W21) et attend le feu vert.
+
 ### HC — `hc_enter`, `hc_write`
 
 | M | `hc_enter` | `hc_write` |

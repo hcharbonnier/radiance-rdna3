@@ -22,9 +22,12 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 **P0 — performance Flash-Next (M2 non tenu : η lien 1,7 % de 2 545 tok/s)**
 - [ ] **R20 `hc_read`** — 1,77 ms à M=1 pour 6,55 Mo de poids (η 0,6 % ; la row
       documente 18,7 µs) et 0,23 ms par ligne au-delà de M=8 : ~40 % du décodage
-      et 47 % du préfill. Action suivante : `--profile-ops true` sur Flash-Next
-      (temps device par op) pour trancher lecture/décodage/latence, puis
-      corriger. **Feu vert requis** : optimisation noyau en pause.
+      et 47 % du préfill. **Profil engine fait (2026-11-17)** : 96 sites
+      `hc_read`, **1,93 ms/appel** en engine contre 1,77 ms en kbench au même
+      géométrique, poids **en VRAM** — le coût est dans le noyau (lecture par
+      ligne, ~3,7 GB/s pour un plancher de 10,5 µs), pas dans l'engine ni le
+      lien. Reste la correction
+      noyau. **Feu vert requis** : optimisation noyau en pause.
 - [x] **W24a `qsa_score`** — mesuré à froid (79,0/82,7/83,3 ms à M=512,
       103 GFLOP/s, 2 % du pic, aucun throttler) ; cause : warp = 32 pages
       distinctes au même offset (16× d'amplification de secteur, borné par L2) ;

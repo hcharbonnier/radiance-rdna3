@@ -321,8 +321,13 @@ feu vert ; W21 reprend la première place dès que le feu vert est donné.
 
 1. **W21 `hc_read` (R20)** — le plus gros levier de performance : 1,77 ms à
    M=1 (η 0,6 %) et 0,23 ms/ligne, ~40 % du décodage et 47 % du préfill.
-   Commencer par `--profile-ops true` (temps device par op) sur Flash-Next ; la
-   forme deux-grilles et la température sont déjà écartées.
+   **Profil engine fait (2026-11-17)** : `--profile-ops` sur Flash-Next
+   (`NS=0`) montre **96 sites `hc_read`, 1,93 ms/appel** (le kbench mesure
+   1,77 ms au même géométrique) ; les poids `hc_norm` sont **en VRAM**
+   (1,88 Mio × 96), donc ni le lien ni le tiering ne sont en cause — le coût
+   est dans le **noyau** (relecture par ligne au lieu de l'amortissement par
+   tuile de 128 lignes). La forme deux-grilles et la température sont déjà
+   écartées. **Feu vert requis** pour la correction noyau.
 2. **W24 — fait** : `qsa_score` à M=512 mesuré (79,0/82,7/83,3 ms), cause
    écrite (warp = 32 pages à offset constant, 16× d'amplification de secteur ;
    la row hôte AVX fait 9,0 ms), essai ILP 4 blocs retiré (2× plus lent).

@@ -1156,6 +1156,35 @@ instruction. Retiré de l'arbre. La suite est une réécriture coalescée/tuilé
 (pages et lignes de `q` en LDS, un thread par (row, bloc) conservé), à mesurer
 sur ce même protocole.
 
+## 2026-11-17 — W21 préparation : `hc_read` attribué au noyau (profil engine)
+
+Serveur Flash-Next `--profile-ops`, `NS=0`, `MLP=8192`, `SEQS=1`,
+`expert_tiered`, pool hôte 43 000, KV i8, une complétion greedy de 4 tokens
+(arbre `w27-merge`). Le tableau final (cumulatif sur 4 pas, non comparable à un
+run non profilé) donne :
+
+- **96 sites `hc_read`** (attn + ffn par couche, 4 appels chacun) à
+  **1,93 ms/appel**, `wait` 2,8–7,9 µs ; total 7,72–7,84 ms par site.
+- Les autres postes : `embed_lookup` **9,50 ms/appel** (pool hôte, 38 ms au
+  total), `gemm_nt_q` `ssm_inz` 5,27 ms/appel, `gdn_conv_recurrent_update_had`
+  3,11 ms/appel.
+- Décodage profilé : 161,9 ms/token (les synchronisations du profil changent le
+  débit ; à ne pas comparer à 4,0–4,6 tok/s non profilé).
+
+Comparaisons et placement :
+- kbench, **même (op, kernel, géométrie)** (`M=1 n=2560 hc=4 lowrank=320
+  mix=e4m3`) : **1,77 ms** → l'engine n'ajoute pas de coût propre.
+- `--debug-placement` : `blk.*.attn_hc_norm.weight` et `blk.*.ffn_hc_norm.weight`
+  sont **en VRAM** (48 × 1,88 Mio chacun, plus `output_hc_norm.weight` 40 Kio) ;
+  poids par rang : 42,55 GiB VRAM, 20,02 GiB pool hôte, 0 sur disque.
+
+Conclusion : ni le lien ni le tiering n'expliquent les 1,93 ms ; la row RDNA3
+relit la paire de matrices **par ligne** au lieu d'amortir par la tuile de
+128 lignes que son contrat décrit. À 6,55 Mo par appel (chiffre W18) en
+1,77 ms, le débit est **~3,7 GB/s** (plancher 10,5 µs à 622 GB/s, référence
+libr4d 18,7 µs). La correction est un travail de noyau (W21) et attend le feu
+vert ; `hc_enter`, `hc_write` et le MoE ne sont pas en cause.
+
 **Doc.** `RAPPORT_RDNA3.md` entre dans le dépôt (décision prise) et ses
 §7.6/§10.4–10.5 sont révisés ; `docs/OPS.md` et `libr3d/README.md` étaient déjà
 à jour.
