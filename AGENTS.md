@@ -229,7 +229,8 @@ scratch, repli `splits=1` non servi : 29,1 / 33,3 ms) ; le **préfill** est
 aussi en split-KV depuis W30 (cible 128 workgroups, repli `splits=1` sans
 aréna) : q=17 à 8K **2 376 µs** (gqa6) / **1 795** (gqa12) contre 12 122 /
 13 635, et 8 508 / 6 364 à 32K, décodage inchangé ; les multi-rangées
-doivent préserver l'ordre par rangée. `final-all` est
+doivent préserver l'ordre par rangée, mais le **verify M=4** n'est pas un
+levier (W30 : q=4 ≈ q=1 en gqa6, +23–31 % en gqa12, R36). `final-all` est
 l'arbre **W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ;
 détails dans `RAPPORT_REBASE_V2_1_0.md`.
 

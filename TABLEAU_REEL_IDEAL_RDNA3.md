@@ -648,7 +648,8 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
   **scratch/split-KV alloué** : **4,06 ms** (gqa6) / **2,37 ms** (gqa12) à
   32K q=1 (sans scratch, repli non servi : 29,1/33,3 ms) ; levier restant :
   préfill q=17 (splits=1) + multi-rangées verify (M=4) — le préfill est livré
-  en W30 ci-dessous, reste le verify M=4. kbench ne la chronomètre pas.
+  en W30 ci-dessous, et le verify M=4 y est mesuré et clos (R36). kbench ne la
+  chronomètre pas.
 - **Validation** : kbench 27B **3 181/3 181**, Flash-Next **4 786/4 786**,
   MiniCPM **1 802/1 802**, 0 échec ; détail dans
   `RAPPORT_REBASE_V2_1_0.md`.
@@ -672,6 +673,10 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
 | | 8 192 | 14 379,7 | **9 637,5** | 1,49× |
 | décodage q=1 gqa6 | 32 768 | 3 866,0 | 3 859,4 | — |
 | décodage q=1 gqa12 | 32 768 | 2 319,4 | 2 321,8 | — |
+| décodage q=4 (verify NS=3) gqa6 | 8 192 | — | 969,8 | q=1 : 921,3 |
+| décodage q=4 (verify NS=3) gqa6 | 32 768 | — | 3 915,0 | q=1 : 3 872,6 |
+| décodage q=4 (verify NS=3) gqa12 | 8 192 | — | 707,1 | q=1 : 539,9 |
+| décodage q=4 (verify NS=3) gqa12 | 32 768 | — | 2 885,0 | q=1 : 2 343,3 |
 
 Lecture : le préfill q=17 était limité par le **parallélisme** (8 workgroups,
 marche séquentielle sur tout le contexte) ; le split-KV à 128 workgroups le
@@ -682,6 +687,11 @@ dimension) : une cible à 256 workgroups ne change rien. q=17 paie 47 % de
 rangées de remplissage, qui ne coûtent que la passe un. Hôte : le prélude
 3 252 tokens est servi en chunks de 2 048 (donc `splits=1`) et ne bouge pas
 (241,1 → 239,9 tok/s) ; le gain porte sur les chunks < 512 tokens.
+
+Le **verify M=4** (NS=3) est mesuré et **clos** (R36) : en gqa6 il coûte le
+même temps que q=1 ; en gqa12 il paie +23–31 % d'un pas, parce que la tuile de
+4 tokens passe de 25 % à 100 % de rangées réelles — c'est le travail, pas un
+défaut de parallélisme. Pas de chantier multi-rangées.
 
 
 

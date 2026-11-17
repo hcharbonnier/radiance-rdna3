@@ -255,12 +255,17 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   3 252 tokens (32 tokens, drafts 19/39) et 27B/Flash-Next à 372 tokens.
   Le prélude long ne bouge pas (chunks de 2 048 tokens → `splits=1`) : le gain
   porte sur les chunks courts.
-- **Reste** : multi-rangées verify M=4 ; au-delà, changer l'arithmétique
-  (`v_dot4_i32_i8` après quantification de q, ou softmax en une passe) — nouveau
-  contrat numérique, à mesurer séparément.
+- **Reste** : au-delà, changer l'arithmétique (`v_dot4_i32_i8` après
+  quantification de q, ou softmax en une passe) — nouveau contrat numérique, à
+  mesurer séparément.
 - **R35** — *décision (W30)* : le split du préfill est autorisé au même titre
   que celui du décodage. Le test ne pinçait pas « préfill = une passe » : il
   pinçait la tolérance **1 bf16 ULP**, et les tranches sont sommées en ordre
   ascendant puis réduites, comme pour le décodage. Un test qui exigerait le
   bit-exact sur un préfill multi-tranches serait faux.
+- **R36** — *clos par la mesure (W30)* : le **multi-rangées verify M=4** n'est
+  pas un levier. gqa6 (27B) q=4 coûte le même temps que q=1 (969,8 vs 921,3 µs
+  à 8K ; 3 915,0 vs 3 872,6 à 32K) ; gqa12 paie +23–31 % d'un pas (707,1 vs
+  539,9 µs à 8K), soit le travail de 4× plus de rangées réelles dans la même
+  tuile. Même conclusion que R33 : ne pas rouvrir sans profiler le graphe.
 

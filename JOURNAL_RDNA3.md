@@ -1370,8 +1370,16 @@ Flash-Next et 27B à 372 tokens, texte identique aussi. Le prélude de
 de la row porte sur les **chunks courts** (< 512 tokens, typiquement la queue
 d'un prompt), où le préfill est dominé par les GEMM et non par l'attention.
 
-**Reste.** Multi-rangées verify M=4 (ordre par rangée préservé) ; au-delà, il
-faut changer l'arithmétique — dot `v_dot4_i32_i8` après quantification de q, ou
-softmax en une passe (online), qui déplace le contrat numérique et demande une
-mesure dédiée.
+**Verify M=4, mesuré et clos.** Le mode temps couvre désormais q=4 (NS=3) dans
+la bande décodage : gqa6 q=4 coûte le **même temps** que q=1 (969,8 vs 921,3 µs
+à 8K ; 3 915,0 vs 3 872,6 à 32K ; 235,9 vs 269,0 à 2K), donc la vérification
+des 4 rangées est absorbée par la marche KV et le lancement. gqa12 paie
++23–31 % d'un pas (707,1 vs 539,9 µs à 8K ; 2 885,0 vs 2 343,3 à 32K) parce que
+ses tuiles de 4 tokens passent de 25 % à 100 % de rangées réelles ; c'est le
+prix du travail, pas un défaut de parallélisme. **Pas de chantier multi-rangées**
+(comme R33 pour `mtp_enter`).
+
+**Reste.** Au-delà du split, il faut changer l'arithmétique — dot
+`v_dot4_i32_i8` après quantification de q, ou softmax en une passe (online) —
+ce qui déplace le contrat numérique et demande une mesure dédiée.
 
