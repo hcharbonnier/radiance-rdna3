@@ -40,11 +40,18 @@ ROCm/HIP 7.16.26385, build neuf `<work-root>/work/w29-rebase`
   `main`). Le graphe Flash-Next déclare `ngram_ids` en device à M=2048 ; sans
   row, le moteur s'arrête sur « no kernel resolved ». La row a été restaurée
   (`c11c451`), et Flash-Next sert de nouveau.
-- Validation : build **EXIT=0**, **195 rows, 0 échec, 16 skips**, `sched_test`
-  **548 952 checks**, `engine_e2e_test` **1 076 checks** (3 skips), kbench
-  **27B 3 181/3 181**, **Flash-Next 4 776/4 776**, **MiniCPM 1 802/1 802**,
-  0 échec, 0 divergence. Les deux modèles servent (27B : 192,5 tok/s préfill,
-  28,9 tok/s décodage ; Flash-Next : 22,5 tok/s décodage avec MTP à NS=3).
+- Validation **correction** : build **EXIT=0**, **195 rows, 0 échec, 16
+  skips**, `sched_test` **548 952 checks**, `engine_e2e_test` **1 076 checks**
+  (3 skips), kbench **27B 3 181/3 181**, **Flash-Next 4 776/4 776**, **MiniCPM
+  1 802/1 802**, 0 échec, 0 divergence. Les deux modèles servent (27B :
+  192,5 tok/s préfill, 28,9 tok/s décodage ; Flash-Next : 22,5 tok/s décodage
+  avec MTP à NS=3 ; 3 252 tokens de contexte sparse QSA à 234,8 tok/s).
+- **Performance : régression mesurée après rebase.** Le préfill 27B passe de
+  **285,7/284,0 à 248,9/248,5 tok/s (−12,5 %)** et `gemm_iqr_tiled` de
+  **3 836/3 856 à 4 491/4 503 µs (−17 %)** ; le GEMV est inchangé. Le noyau, le
+  layout, l'alignement, le flush HDP et l'horloge sont éliminés (§5.5) ; la
+  cause est dans le core/runtime partagé et reste à isoler (P0). Le rebase est
+  donc **vert en correction, pas en performance**.
 - **Rien n'a été poussé.**
 
 ---
@@ -265,8 +272,11 @@ attribuée (nouvelles rows `main` ou graphe QSA) si l'on veut la ramener.
 
 Flash-Next : 9 drafts, 5 acceptés (55,6 %) sur cette requête courte. Le prompt
 de 58 tokens est **sous la borne QSA de 2 051 tokens** : le chemin dense
-`by_table` de `main` est donc exercé (et fonctionne), mais le chemin sparse
-au-delà de la borne n'est pas testé ici.
+`by_table` de `main` est donc exercé. Le chemin sparse a été testé ensuite avec
+un prompt de **3 252 tokens** : préfill **234,8 tok/s** (13,85 s, TTFT 13,85 s),
+4 tokens générés, et la sélection de noyaux journalise bien
+`qsa_block_key`, `qsa_score`, `qsa_select`, `qsa_tail_store` et `qsa_work` en
+libr3d comme en avx. Aucun échec, aucune divergence signalée.
 
 Flash-Next exige une configuration explicite sur cette carte :
 
@@ -283,6 +293,57 @@ max-model-len: 8192
 Sans `host-pool-mib`, 20,81 GiB d'experts ne tiennent pas et le démarrage
 s'arrête sur « out of memory » ; c'est un réglage de placement, pas un défaut
 du rebase.
+
+### 5.5 Performance après rebase : régression de préfill (à traiter)
+
+La correction est verte, mais **le rebase n'est pas neutre en performance**.
+Deux A/B indépendants, sur carte froide, avec les mêmes modèles et le même
+protocole :
+
+| Mesure | Avant rebase (`final-all`) | Après rebase (`w29`) | Écart |
+|---|---:|---:|---:|
+| 27B, prompt 532 tok, préfill (2 runs) | **285,7 / 284,0 tok/s** | **248,9 / 248,5 tok/s** | **−12,5 %** |
+| kbench `gemm_iqr_tiled` 12288×5120 M=512 (froid) | 3 836 / 3 856 µs | 4 491 / 4 503 µs | **−17 %** |
+| kbench idem, chaud (`--bench-flush 0`) | 3 783 / 3 806 µs | 4 486 / 4 491 µs | −18 % |
+| kbench N=1024 K=5120 M=512 | 339 / 342 µs | 404–407 µs | −19 % |
+| kbench `gemm_iqr_nt_m64` 34816×5120 M=1 | 177,1 µs | 176,0 µs | inchangé |
+
+Le décodage GEMV est intact ; **seul le préfill IQR (`gemm_iqr_tiled`) est
+touché**, et l'écart est uniforme sur N (donc proportionnel au noyau, pas un
+coût fixe de lancement).
+
+Ce qui a été éliminé par la mesure :
+
+- **le noyau et son ordonnancement** : `r3d_gemm_iqr_m16.hip`,
+  `r3d_iqr_layout.cpp`, `r3d_iqr.h` et `r3d_iqr_dec.h` sont **identiques**
+  entre les deux arbres (`git diff pre..HEAD` vide sur ces fichiers) ; les
+  commandes de compilation sont identiques (`-O3`, `-ffp-contract=off`,
+  `-mllvm=-amdgpu-enable-vopd=false`, même `cuid`) ;
+- **le format et le layout du poids** : le hook de layout rend le même mot de
+  forme (`f=6/4/0/16/0/3/10/0`), les mêmes codes `12288×5120` de pas 5120, les
+  mêmes octets (31 457 792), et le pointeur B est aligné à 256 octets dans les
+  deux arbres ;
+- **le flush HDP de l'AQL** : `RAD_NO_HDP=1` ne change rien (249,9 vs 249,1
+  tok/s) ; le revert complet de `8f2e511` ne change rien non plus (248,9 /
+  248,3 tok/s) ;
+- **l'horloge** : l'échantillonnage pendant le kbench donne une moyenne
+  **plus haute** après rebase (2 194 MHz vs 1 797 MHz) et le kbench reporte
+  2 488 MHz vs 2 426 MHz. La carte n'est donc pas plus lente.
+
+Conclusion provisoire : la régression est dans le **chemin partagé
+core/runtime** (allocation/placement ou codegen/liaison), pas dans le noyau
+IQR. Les candidats restants sont les changements 2.1.0 de `core/vram`,
+`core/place`, `core/sched` et la **page backing** des buffers (le code de
+`rad_dev_alloc` documente lui-même un préfill 10–21 % plus lent depuis un pool
+de pages 4 KiB sous IOMMU), ainsi qu'une éventuelle différence d'ISA du noyau
+liée à l'ordre de liaison. Prochaine étape : bisect des commits 2.1.0 avec un
+build neuf à chaque pas, en priorisant ces fichiers, et comparaison de l'ISA
+du noyau `gemm_iqr_tiled`.
+
+**Conséquence** : les chiffres de `RAPPORT_COMPARAISON_PERF_RDNA3.md` restent
+la référence **avant rebase** ; les mesures post-rebase du §5.5 ne doivent pas
+être utilisées pour conclure un A/B de noyau tant que la régression n'est pas
+isolée. Le rebase est validé en **correction**, pas en **performance**.
 
 ---
 
@@ -348,18 +409,30 @@ La branche reste volontairement très au-dessus de `main` : **142 fichiers,
 
 ## 8. Suites recommandées
 
-1. Servir Flash-Next avec un prompt **> 2 051 tokens** et comparer le texte au
-   run d'avant rebase ; couvrir le chemin sparse QSA et `qsa_select`.
-2. Re-mesurer les noyaux du rapport de comparaison sur l'arbre rebasé : le
-   graphe QSA, l'ABI 40 et les correctifs AQL changent les coûts par token.
-   Les chiffres de `RAPPORT_COMPARAISON_PERF_RDNA3.md` restent datés du
-   pré-rebase.
-3. Proposer en amont les deux correctifs (`down_w5_fp8`, `ngram_ids_i32`) avec
+1. **Fait** : Flash-Next servi à 3 252 tokens (> 2 051) ; préfill 234,8 tok/s,
+   TTFT 13,85 s, rows QSA sparse (`qsa_block_key`, `qsa_score`, `qsa_select`,
+   `qsa_tail_store`, `qsa_work`) sélectionnées en libr3d et en avx. Rester à
+   faire : comparer le texte au run d'avant rebase sur le même prompt.
+2. **Fait, avec réserve** : les noyaux ont été re-mesurés (§5.5). Le GEMV est
+   inchangé, mais le préfill IQR perd 12,5 % et `gemm_iqr_tiled` 17–19 %.
+   Les chiffres post-rebase ne doivent pas servir à un A/B de noyau tant que
+   la régression n'est pas isolée.
+3. **P0 — isoler la régression de préfill** : bisect des commits 2.1.0 avec un
+   build neuf à chaque pas, en priorisant `core/vram`, `core/place`,
+   `core/sched`, la page backing de `rad_dev_alloc` (le code cite 10–21 % sous
+   IOMMU avec des pages 4 KiB) et l'ISA du noyau `gemm_iqr_tiled`. Le noyau
+   source, le layout, l'alignement, le flush HDP et l'horloge sont déjà
+   éliminés (§5.5).
+4. Proposer en amont les deux correctifs (`down_w5_fp8`, `ngram_ids_i32`) avec
    leurs tests.
-4. Rejouer `rad-tune` sur les modèles servis : les nouvelles rows bf16 de
-   `main` (et les anciennes) n'ont toujours pas de cache de tune dans
-   `build/radiance_home` ; le constat V3 du rapport de comparaison tient.
-5. Si `main` corrige `down_w5_fp8` ou `ngram_ids` différemment, prendre sa
+5. **Fait pour le 27B** : `rad-tune` rejoué sur le build propre
+   (`build-clean`) confirme les chiffres pré-rebase — `gemm_nt_bf16_tiled`
+   N=256 K=5120 M=1792 : `impl=0` 789,0 µs contre `impl=3` **199,5 µs**
+   (3,95×, rel 4,9e-06) ; `gemm_nt_bf16_m16` : 21,58 µs contre **15,27 µs**
+   (1,41×). Le cache reste absent du home servi (`build-clean/radiance_home`),
+   donc le constat V3 du rapport de comparaison tient toujours : à livrer. Le
+   tune Flash-Next n'a pas été rejoué.
+6. Si `main` corrige `down_w5_fp8` ou `ngram_ids` différemment, prendre sa
    version au prochain rebase (les commits `5e98eb9` et `c11c451` sont
    identifiables et peuvent être abandonnés).
 
@@ -397,3 +470,5 @@ curl -s localhost:<port>/v1/chat/completions -H 'Content-Type: application/json'
 **État final** : branche `rdna3-iqr`, code à `ad19972` (149 commits au-dessus
 de `main`) plus le commit de documentation de ce rapport ; arbre de travail
 propre (hors documents non suivis préexistants), aucun push effectué.
+**Correction validée ; performance en régression** (préfill 27B −12,5 %,
+`gemm_iqr_tiled` −17 %), à isoler avant toute optimisation (P0, §8).
