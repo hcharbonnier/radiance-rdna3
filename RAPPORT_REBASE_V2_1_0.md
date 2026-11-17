@@ -53,7 +53,9 @@ ROCm/HIP 7.16.26385, build neuf `<work-root>/work/w29-rebase`
   (**285,7/284,0 tok/s**, **3 836/3 856 µs**) est une **dette de W27** : la
   généralisation `GS=1/2` du noyau IQR pour IQ8R coûte 17 % au 27B (GS=1). Le
   GEMV est inchangé. Le noyau, le layout, l'alignement, le flush HDP et
-  l'horloge ont été éliminés (§5.5). P0 : spécialiser `GS == 1`.
+  l'horloge ont été éliminés (§5.5). **P0 fait** (`faa89fd`) : la
+  spécialisation `GS=1` restaure **3 839 µs** et **288/287 tok/s** (16,8
+  TFLOP/s), texte 27B identique, IQ8R inchangé.
 - **Rien n'a été poussé.**
 
 ---
@@ -329,15 +331,26 @@ C'est donc une **dette de performance de W27**, pas une régression du rebase :
 - les chiffres de `RAPPORT_COMPARAISON_PERF_RDNA3.md` (17 TFLOP/s) décrivent
   **W26**, pas la branche actuelle.
 
-**P0 recommandé (feu vert optimisation à demander)** : spécialiser `GS == 1`
-(`if constexpr`) pour retrouver la boucle d'origine, et garder la boucle
-groupée pour `GS == 2`. Le template porte déjà `GS`, donc la spécialisation est
-naturelle. Cible : retour à **3 836 µs / 285 tok/s** sur le 27B, sans toucher
-aux bits ni à l'IQ8R. Porte : kbench `gemm_iqr_tiled` (3,84 ms), préfill 27B
-(285 tok/s), texte 27B identique, MiniCPM 2B toujours à 40,2 tok/s.
+**P0 fait (commit `faa89fd`)** : le noyau resident `GS=1` a été restauré depuis
+la version W26 (`gemm_iqr_resident_gs1_kernel`), et `launch_tiled_form` y
+dispatche pour `GS == 1` ; la boucle groupée reste pour `GS == 2` (IQ8R).
+Résultats mesurés sur le build propre :
 
-Le rebase est donc validé en **correction et en performance** ; la seule action
-de performance ouverte est la spécialisation GS=1 de W27.
+| Mesure | W27 avant | **GS=1 restauré** | W26 (`final-all`) |
+|---|---:|---:|---:|
+| kbench `gemm_iqr_tiled` 12288×5120 M=512 | 4 486 / 4 517 µs | **3 839 µs** | 3 836 / 3 856 µs |
+| 27B préfill 532 tok | 251,5 / 250,5 tok/s | **288,4 / 287,3 tok/s** | 285,7 / 284,0 tok/s |
+| TFLOP/s (12288×5120 M=512) | 14,3 | **16,8** | 16,8 |
+
+Correction validée : `iqr_device_test`, `iqr_parity_test` et
+`shipped_plugins_test` passent ; kbench **27B 3 181/3 181**, **Flash-Next
+4 786/4 786**, **MiniCPM 1 802/1 802**, 0 échec, pires rel_l2 3,619e-03 /
+1,520e-02 / 3,485e-03 ; le texte 27B (prompt « sky is blue », 32 tokens,
+température 0) est **identique** entre l'arbre W27 sans GS=1 et l'arbre
+patché (`choices` égales). L'IQ8R (groupe 256) garde le chemin `GS=2`, inchangé.
+
+Le rebase est donc validé en **correction et en performance**, et la dette de
+préfill W27 est soldée.
 
 ---
 
@@ -409,13 +422,15 @@ La branche reste volontairement très au-dessus de `main` : **142 fichiers,
    faire : comparer le texte au run d'avant rebase sur le même prompt.
 2. **Fait** : les noyaux ont été re-mesurés (§5.5). Le GEMV est inchangé ; le
    rebuild **pre-rebase (W27)** donne 249 tok/s et 4,49 ms, identique au
-   post-rebase. L'écart avec `final-all` (285 tok/s, 3,84 ms) est la dette W27,
-   pas le rebase.
-3. **P0 — spécialiser `GS == 1` dans le noyau IQR** (W27) : retrouver la boucle
-   d'origine pour le groupe 128 tout en gardant la boucle groupée pour IQ8R
-   (groupe 256). Cible 3,84 ms / 285 tok/s sur le 27B, IQ8R inchangé. Le bisect
-   des commits 2.1.0 n'est plus nécessaire : le rebuild pre-rebase prouve que
-   le rebase est neutre.
+   post-rebase. L'écart avec `final-all` (285 tok/s, 3,84 ms) était la dette
+   W27, pas le rebase ; le patch GS=1 restaure 3 839 µs et 288 tok/s. Reste à
+   re-mesurer bf16/vision, MoE, `hc_read`, `mtp_enter`, QSA et l'attention sur
+   le build patché.
+3. **Fait (`faa89fd`)** : spécialisation `GS == 1` (noyau resident restauré de
+   W26, `GS=2` conservé pour IQ8R). kbench **27B 3 181/3 181**, **Flash-Next
+   4 786/4 786**, **MiniCPM 1 802/1 802**, 0 échec ; texte 27B identique ;
+   `iqr_device_test`, `iqr_parity_test`, `shipped_plugins_test` verts. Cible
+   3,84 ms / 285 tok/s atteinte (3 839 µs / 288 tok/s).
 4. Proposer en amont les deux correctifs (`down_w5_fp8`, `ngram_ids_i32`) avec
    leurs tests.
 5. **Fait pour le 27B** : `rad-tune` rejoué sur le build propre
@@ -428,6 +443,11 @@ La branche reste volontairement très au-dessus de `main` : **142 fichiers,
 6. Si `main` corrige `down_w5_fp8` ou `ngram_ids` différemment, prendre sa
    version au prochain rebase (les commits `5e98eb9` et `c11c451` sont
    identifiables et peuvent être abandonnés).
+7. **Après GS=1** : re-mesurer bf16/vision, MoE, `hc_read`, `mtp_enter`, QSA et
+   l'attention sur `build-clean` patché ; rejouer `rad-tune` sur Flash-Next ;
+   mettre à jour `AGENTS.md`, `TABLEAU_REEL_IDEAL_RDNA3.md`,
+   `JOURNAL_RDNA3.md` et `SUIVI_LOTS_RDNA3.md` (195 rows, `main` 2.1.0,
+   GS=1, état W29).
 
 ---
 
@@ -463,6 +483,6 @@ curl -s localhost:<port>/v1/chat/completions -H 'Content-Type: application/json'
 **État final** : branche `rdna3-iqr`, code à `ad19972` (149 commits au-dessus
 de `main`) plus le commit de documentation de ce rapport ; arbre de travail
 propre (hors documents non suivis préexistants), aucun push effectué.
-**Correction et performance du rebase validées** ; l'écart avec l'ancien
-`final-all` est une dette de W27 (`GS=1/2` du noyau IQR), à corriger par une
-spécialisation `GS == 1` (P0, §8).
+**Correction et performance du rebase validées** ; la dette de W27
+(`GS=1/2` du noyau IQR) est soldée par la spécialisation `GS == 1`
+(`faa89fd`) : 3 839 µs, 288 tok/s, texte identique, IQ8R inchangé.
