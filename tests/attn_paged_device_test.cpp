@@ -14,6 +14,7 @@
 #include <dlfcn.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -124,16 +125,31 @@ std::vector<uint16_t> rand_bf16(size_t n, unsigned seed) {
     return v;
 }
 
-int run(const RadKernelInfo* k, std::vector<RadTensor>& t, std::vector<RadParam>& p) {
+int run(const RadKernelInfo* k, std::vector<RadTensor>& t, std::vector<RadParam>& p,
+        void* scratch = nullptr, int64_t scratch_bytes = 0) {
     RadArgs a;
     std::memset(&a, 0, sizeof a);
     a.t = t.data();
     a.n_t = (int)t.size();
     a.p = p.data();
     a.n_p = (int)p.size();
+    a.scratch = scratch;
+    a.scratch_bytes = scratch_bytes;
     const int rc = k->launch(&a, (RadStream)0);
     hipDeviceSynchronize();
     return rc;
+}
+
+int64_t scratch_need(const RadKernelInfo* k, std::vector<RadTensor>& t,
+                     std::vector<RadParam>& p) {
+    if (!k->scratch) return 0;
+    RadArgs a;
+    std::memset(&a, 0, sizeof a);
+    a.t = t.data();
+    a.n_t = (int)t.size();
+    a.p = p.data();
+    a.n_p = (int)p.size();
+    return k->scratch(&a);
 }
 
 bool same_bf16(const std::vector<uint16_t>& a, const std::vector<uint16_t>& b, const char* what) {
@@ -209,6 +225,7 @@ bool case_ok(const char* name, int n_head, int gqa, int hd, int block_size, int 
         pf("scale", 1.0 / std::sqrt((double)hd)), pi("max_ctx", seq_len),
         pi("n_head", n_head), pi("max_seqs", 1), pi("prefill_fp8", 0)
     };
+    Dev dscratch;
     for (int which = 0; which < 2; ++which) {
         Dev& out = which ? dout1 : dout0;
         std::vector<RadTensor> t = {
@@ -221,7 +238,9 @@ bool case_ok(const char* name, int n_head, int gqa, int hd, int block_size, int 
             ten(q_len > 1 ? dcu.p : nullptr, RAD_I32, { q_len > 1 ? 2 : 0 }),
             ten(out.p, RAD_BF16, { q_len, n_head, hd })
         };
-        const int rc = run(which ? kr : kd, t, p);
+        if (!which) dscratch.alloc((size_t)std::max<int64_t>(0, scratch_need(kd, t, p)));
+        const int rc = run(which ? kr : kd, t, p, which ? nullptr : dscratch.p,
+                           which ? 0 : (int64_t)dscratch.bytes);
         if (rc != 0) {
             std::fprintf(stderr, "%s: %s rc=%d\n", name, which ? "ref" : "device", rc);
             return false;
@@ -290,6 +309,9 @@ bool bench_case(const char* name, int n_head, int gqa, int hd, int block_size, i
     a.n_t = (int)t.size();
     a.p = p.data();
     a.n_p = (int)p.size();
+    Dev dscratch((size_t)std::max<int64_t>(0, kd->scratch ? kd->scratch(&a) : 0));
+    a.scratch = dscratch.p;
+    a.scratch_bytes = (int64_t)dscratch.bytes;
 
     for (int i = 0; i < 5; ++i) kd->launch(&a, (RadStream)0);
     hipDeviceSynchronize();
@@ -315,11 +337,13 @@ bool bench_case(const char* name, int n_head, int gqa, int hd, int block_size, i
 
 }  // namespace
 
-/* Observed on gfx1100: every case agrees with ref_attn_paged within one bf16
- * ULP, but not bit-for-bit, even in the one-page (no split) short cases. The
- * gap is systematic (the softmax/reduction rounding), so the test asserts the
- * bf16 tolerance and the 1-ULP divergence is recorded in the report; the row's
- * bit-exact claim needs a contract decision before a multi-row rewrite. */
+/* The short cases (one page, splits=1) agree with ref_attn_paged within one
+ * bf16 ULP but not bit-for-bit; the gap is the documented exp polynomial
+ * (within 1 f32 ulp) and the reduction rounding. The long cases allocate the
+ * row's scratch and exercise split-KV, whose parentheses are the documented
+ * last-ulp departure; they are held to the same bf16 tolerance. A multi-row
+ * rewrite must preserve the per-row order. The bench mode allocates the
+ * scratch too, so its timings are the served split-KV path. */
 
 TEST(attn_paged_h256_gqa6_block16_decode_short_matches_libref_within_bf16) {
     if (!ready()) return;
