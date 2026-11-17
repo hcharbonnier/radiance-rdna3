@@ -75,6 +75,10 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       relevé pendant W24, sans impact sur le moteur qui alloue i32.
 - [x] 8.7 — handover final de phase (`HANDOVER_RDNA3_PHASE7.md`, état `de81ffe`).
 - [ ] 6.1–6.6 — optimisations différées (non bloquantes).
+- [ ] **Écart RDNA4 → RDNA3** — **238 rows / 179 ops** absents de `libr3d`
+      (toutes architectures) ; la cible v1 n'en manque aucun sur ses chemins
+      exercés. Périmètre à décider, feuille de route **§D** et liste complète
+      `RAPPORT_RDNA3.md` §10.
 - Hors v1 : codebook `w4nl` dans `w4a8` seulement (MTP et vision sont revenus
   dans la cible par l'ADR-7).
 
@@ -383,10 +387,14 @@ Mesure à l'état `de81ffe` : `libr4d/r4d_rows.cpp` (**457 rows, 274 ops**) cont
       rows) ou seulement la cible v1 + l'artefact IQ8R ? Sans cette décision,
       D5–D9 restent hors engagement.
 - [ ] **D1 — IQ8R groupe 256 (MiniCPM5-2B, non-IQR)** : `rmsnorm_had_quant_iq8r`,
-      `ar_rmsnorm_had_quant_iq8r`, `gate_had_quant_iq8r`, le producteur non
-      groupé `rmsnorm_had_quant_i8`, `rmsnorm_quant_i8g`, et les variantes
-      **groupe 256** de `gemm_nt_q`/`gemm_nt_q_gated` en `i8a8h` (les rows
-      actuelles n'acceptent que 128). Test : le 2B charge et sert à `NS=0`.
+      `ar_rmsnorm_had_quant_iq8r`, `gate_had_quant_iq8r`, `had_quant_act_iq8r`,
+      `gated_had_quant_iq8r`, le producteur non groupé `rmsnorm_had_quant_i8`,
+      `rmsnorm_quant_i8g`, et les variantes **groupe 256** de
+      `gemm_nt_q`/`gemm_nt_q_gated` en `i8a8h` (`gemm_iq8r_nt_m16`,
+      `gemm_iq8r_tiled` ; les rows actuelles n'acceptent que 128). Test : le
+      2B charge et sert à `NS=0`. Le `rad_arch_declare` échoue aujourd'hui sur
+      `nq_h.declare` (groupe 256 contre 128) — cause exacte dans
+      `RAPPORT_RDNA3.md` §10.5.
 - [ ] **D2 — DSpark (MiniCPM5 à NS > 0)** : `dflash_conv`,
       `dflash_markov_greedy`, `dflash_markov_greedy_f32`, `dflash_tree` ; plus
       `row_topk_merge`, `sample_merge_topk`, `pair_argmax` si le sélecteur les
