@@ -354,9 +354,10 @@ Autres noyaux mesurés sur le build patché : IQR tiled Flash-Next
 W26 ; MoE **231,2 µs** (M=1) / **4 009 µs** (M=512) ; bf16 défaut inchangé
 (776,8 / 788,4 µs) ; **`hc_read` 355,1 µs / 12 323,5 µs** grâce à W21
 (5–9× mieux que W26) ; `mtp_enter` **186,2 µs / 59 385 µs** (linéaire,
-inchangé) ; `logit_rerank` 32,9 µs. La géométrie `qsa_score` des fixtures a
-changé (n=128, heads=4, blocks=65 536, seqs=8 : 85,3 / 400,0 µs) et n'est pas
-comparable aux chiffres W26.
+inchangé ; le noyau parallélise déjà les rangées, la linéarité est le travail
+d'un GEMV par rangée — pas de chantier 2–4×) ; `logit_rerank` 32,9 µs. La
+géométrie `qsa_score` des fixtures a changé (n=128, heads=4, blocks=65 536,
+seqs=8 : 85,3 / 400,0 µs) et n'est pas comparable aux chiffres W26.
 
 Le rebase est donc validé en **correction et en performance**, et la dette de
 préfill W27 est soldée.
@@ -443,12 +444,16 @@ La branche reste volontairement très au-dessus de `main` : **142 fichiers,
    3,84 ms / 285 tok/s atteinte (3 839 µs / 288 tok/s).
 4. Proposer en amont les deux correctifs (`down_w5_fp8`, `ngram_ids_i32`) avec
    leurs tests.
-5. **Fait (27B et Flash-Next)** : `rad-tune` rejoué sur `build-clean` —
+5. **Fait et livré (27B + Flash-Next)** : `rad-tune` rejoué sur `build-clean` —
    27B `gemm_nt_bf16_tiled` N=256 K=5120 M=1792 : `impl=0` 789,0 µs contre
    `impl=3` **199,5 µs** (3,95×, rel 4,9e-06) ; `m16` 21,58 contre **15,27 µs**
    (1,41×). Flash-Next : `impl=3` **65,2 / 67,2 / 71,2 µs** sur N=96/512/640
-   K=2560 M=512, `m16` 13,08 / 13,63 / 14,10 µs. Le cache reste absent du home
-   servi (`build-clean/radiance_home`), donc V3 tient : à livrer.
+   K=2560 M=512, `m16` 13,08 / 13,63 / 14,10 µs. Les deux caches ont été
+   fusionnés dans `build-clean/radiance_home/tune/gfx1100-x2-AMD_Radeon_Pro_W7900.tune`
+   (39 lignes) ; kbench avec ce home passe les rows bf16 tiled à **impl=3** :
+   N=96 K=5120 M=512 **132,3 µs** contre 776,8 µs en `impl=0` (**5,9×**).
+   Le cache est un artefact machine, non versionné : à livrer avec le
+   déploiement (ou rejouer `rad-tune` sur les deux modèles dans le même home).
 6. Si `main` corrige `down_w5_fp8` ou `ngram_ids` différemment, prendre sa
    version au prochain rebase (les commits `5e98eb9` et `c11c451` sont
    identifiables et peuvent être abandonnés).

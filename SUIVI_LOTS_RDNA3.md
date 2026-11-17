@@ -204,9 +204,10 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
 - **R30** — *résolu (W29)* : la généralisation `GS=1/2` du noyau IQR (W27,
   IQ8R) coûtait **17 %** au préfill 27B ; la spécialisation `GS=1`
   (`faa89fd`, noyau resident W26) redonne 3 839 µs / 288 tok/s, IQ8R inchangé.
-- **R31** — *ouvert* : aucun cache `rad/tune/` n'est livré dans
-  `radiance_home` ; le défaut bf16 `impl=0` reste servi alors que `impl=3`
-  donne 3,95× (27B) et 5–9× (Flash-Next). À livrer avec chaque modèle.
+- **R31** — *résolu pour `build-clean`* : les caches 27B + Flash-Next sont
+  fusionnés dans `build-clean/radiance_home/tune` ; le kbench y sert `impl=3`
+  (132,3 µs contre 776,8 en `impl=0`, **5,9×**). Artefact machine non
+  versionné : à livrer avec chaque déploiement (ou rejouer `rad-tune`).
 - **R32** — *amont* : `down_w5_fp8` non déclaré dans
   `arch/common/rad_block_moe_fp8.h` (casse `flint`/`bailing_hybrid`) et
   retrait de `ngram_ids_i32` cassant RDNA3 ; correctifs locaux `5e98eb9` et

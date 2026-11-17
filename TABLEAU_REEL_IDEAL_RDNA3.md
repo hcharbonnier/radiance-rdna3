@@ -634,8 +634,9 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
 - **HC/MTP** : `hc_read` **355,1 µs / 12 323,5 µs** (W21, 5–9× mieux que W26 :
   1 772,7 / 113 746) ; `mtp_enter` 186,2 µs / 59 385 µs (linéaire, inchangé).
 - **bf16** : défaut `impl=0` 776,8 µs (N=96 K=5120 M=512) contre `impl=3`
-  **65–199 µs** selon la forme (3,95× sur N=256 M=1792) ; 27B et Flash-Next
-  `rad-tune` rejoués. Le cache de tune reste absent du home servi.
+  **132,3 µs** avec le cache livré (**5,9×**) ; 65–199 µs selon la forme
+  (3,95× sur N=256 M=1792). Caches 27B + Flash-Next fusionnés dans
+  `build-clean/radiance_home/tune` (artefact machine, non versionné).
 - **Validation** : kbench 27B **3 181/3 181**, Flash-Next **4 786/4 786**,
   MiniCPM **1 802/1 802**, 0 échec ; détail dans
   `RAPPORT_REBASE_V2_1_0.md`.

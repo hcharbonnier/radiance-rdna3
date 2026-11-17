@@ -217,9 +217,10 @@ octets opaques, pitches larges) ; `mtp_enter_e4m3_device_test` et
 **1 076** (3 skips) ; kbench **27B 3 181/3 181**, **Flash-Next 4 786/4 786**,
 MiniCPM **1 802/1 802**, 0 échec (pires rel_l2 3,619e-03 / 1,520e-02 /
 3,485e-03) ; préfill 27B **288 tok/s** (spécialisation `GS=1`, `faa89fd`),
-Flash-Next long contexte 3 252 tokens **234,8 tok/s**. `final-all` est l'arbre
-**W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ; détails dans
-`RAPPORT_REBASE_V2_1_0.md`.
+Flash-Next long contexte 3 252 tokens **234,8 tok/s** ; cache de tune livré
+dans `build-clean/radiance_home/tune` (bf16 `impl=3`, **5,9×** sur les rows
+tiled). `final-all` est l'arbre **W26** (ne pas l'utiliser comme baseline de
+perf sans rebuild) ; détails dans `RAPPORT_REBASE_V2_1_0.md`.
 
 Recette 27B (dense, IQR) : `--kv-cache-dtype i8 --num-speculative-tokens 0`
 (le drafter h128 fenêtré réclame bf16), `--max-num-seqs 4` — le multi-séquence
