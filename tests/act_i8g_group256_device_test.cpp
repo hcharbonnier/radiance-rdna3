@@ -438,9 +438,89 @@ void run_gate(int M, int n, long long gpitch, long long xpitch, int group, bool 
     }
 }
 
-void run_rms(int M, int n, int group, bool with_res, bool gain_f32, float wadd, uint32_t seed,
-             bool with_ob = true) {
+/* The form the engine issues: the op runs on the whole projection ([T, heads*head_dim]) while the
+ * `n` parameter names the head width, and the gate is a [T, heads, head_dim] column view of each
+ * head's block (a [q|gate] projection leaves it a slice). head_dim tiles 128, so a group never
+ * crosses a head. The flat cases above never exercise the per-head pitch. */
+void ref_gate_heads(const std::vector<uint16_t>& gate, const std::vector<uint16_t>& x, int T,
+                    int heads, int hd, long long gate_ld, long long head_pitch, int group,
+                    std::vector<uint16_t>* y, std::vector<int8_t>& q, std::vector<float>& s) {
+    const int n = heads * hd;
+    q.assign((size_t)T * n, 0);
+    s.assign((size_t)T * (n / group), 0.0f);
+    if (y) y->assign((size_t)T * n, 0);
+    for (int r = 0; r < T; ++r) {
+        for (int gi = 0; gi < n / group; ++gi) {
+            float buf[256];
+            const int c0 = gi * group;
+            const size_t xb = (size_t)r * n + (size_t)c0;
+            const size_t gb =
+                (size_t)r * gate_ld + (size_t)(c0 / hd) * head_pitch + (size_t)(c0 % hd);
+            for (int i = 0; i < group; ++i) {
+                const float xg = bf2f(gate[gb + (size_t)i]);
+                const float sg = 1.0f / (1.0f + (float)std::exp((double)-xg));
+                const uint16_t hb = rad_f32_to_bf16(sg * bf2f(x[xb + (size_t)i]));
+                if (y) (*y)[(size_t)r * n + (size_t)c0 + (size_t)i] = hb;
+                buf[i] = bf2f(hb);
+            }
+            for (int b = 0; b < group; b += 128) fwht(buf + b, 128);
+            s[(size_t)r * (n / group) + (size_t)gi] =
+                quant_group(buf, group, &q[(size_t)r * n + (size_t)c0]);
+        }
+    }
+}
+
+void run_gate_heads(int T, int heads, int hd, int group, uint32_t seed) {
     g_seed = seed;
+    const int n = heads * hd;
+    const long long head_pitch = 2 * hd;   /* a [q|gate] block per head */
+    const long long gate_ld = (long long)heads * head_pitch;
+    std::vector<uint16_t> hg((size_t)T * gate_ld, 0), hx((size_t)T * n, 0);
+    for (int r = 0; r < T; ++r)
+        for (int h = 0; h < heads; ++h)
+            for (int i = 0; i < 2 * hd; ++i)   /* both halves filled: a wrong pitch reads the other */
+                hg[(size_t)r * gate_ld + (size_t)h * head_pitch + (size_t)i] = bfv(1.5f * rnd());
+    for (int r = 0; r < T; ++r)
+        for (int i = 0; i < n; ++i) hx[(size_t)r * n + (size_t)i] = bfv(1.5f * rnd());
+
+    std::vector<int8_t> hq((size_t)T * n, 0x55);
+    std::vector<float> hs((size_t)T * (n / group), -1.0f);
+    std::vector<uint16_t> hy((size_t)T * n, 0);
+    std::vector<int8_t> rq;
+    std::vector<float> rs;
+    std::vector<uint16_t> ry;
+    ref_gate_heads(hg, hx, T, heads, hd, gate_ld, head_pitch, group, &ry, rq, rs);
+
+    Dev dg(hg.size() * 2), dx(hx.size() * 2), dq(hq.size()), ds(hs.size() * 4), dy(hy.size() * 2);
+    up(dg, hg.data(), dg.bytes);
+    up(dx, hx.data(), dx.bytes);
+    up(dq, hq.data(), dq.bytes);
+    up(ds, hs.data(), ds.bytes);
+
+    RadTensor g3 = ten(dg.p, RAD_BF16, { T, heads, hd });
+    g3.stride[0] = gate_ld;
+    g3.stride[1] = head_pitch;
+    g3.stride[2] = 1;
+    std::vector<RadTensor> t = { g3, ten(dx.p, RAD_BF16, { T, n }),
+                                 ten(dq.p, RAD_I8, { T, n }),
+                                 ten(ds.p, RAD_F32, { T, n / group }),
+                                 ten(dy.p, RAD_BF16, { T, n }) };
+    std::vector<RadParam> p = { pi("M", T), pi("n", hd), pi("group", group), ps("dtype", "bf16"),
+                                ps("act", "sigmoid") };
+    const int rc = run(g_lib.gate, t, p);
+    CHECK_EQ(rc, RAD_OK);
+    if (rc != RAD_OK) return;
+
+    down(dq, hq.data(), dq.bytes);
+    down(ds, hs.data(), hs.size() * 4);
+    down(dy, hy.data(), dy.bytes);
+    CHECK(same_bytes(hq.data(), rq.data(), hq.size(), "gate_had_quant_i8g head-view codes"));
+    CHECK(same_bytes(hs.data(), rs.data(), hs.size() * 4, "gate_had_quant_i8g head-view scales"));
+    CHECK(same_bytes(hy.data(), ry.data(), hy.size() * 2, "gate_had_quant_i8g head-view out_bf16"));
+}
+
+void run_rms(int M, int n, int group, bool with_res, bool gain_f32, float wadd, uint32_t seed,
+             bool with_ob = true) {    g_seed = seed;
     std::vector<uint16_t> hx((size_t)M * n), hres((size_t)M * n);
     std::vector<uint16_t> hwb((size_t)n);
     std::vector<float> hwf((size_t)n);
@@ -526,6 +606,13 @@ TEST(gate_had_quant_i8g_group_256) {
     run_gate(4, 512, 0, 0, 256, false, false, 0x5c5cu);   /* no out_bf16 */
     run_gate(2, 512, 2 * 512 + 64, 512 + 32, 256, true, true, 0x5d5du);   /* distinct pitches */
     run_gate(2, 512, 0, 0, 128, false, true, 0x5e5eu);    /* group 128 */
+}
+
+TEST(gate_had_quant_i8g_head_view) {
+    if (!ready()) return;
+    run_gate_heads(2, 2, 256, 256, 0x6a6au);   /* IQ8R group, one head a group */
+    run_gate_heads(3, 2, 256, 128, 0x6b6bu);   /* group 128, two groups a head */
+    run_gate_heads(1, 3, 256, 256, 0x6c6cu);   /* one token, several heads */
 }
 
 TEST(rmsnorm_had_quant_i8g_group_256) {

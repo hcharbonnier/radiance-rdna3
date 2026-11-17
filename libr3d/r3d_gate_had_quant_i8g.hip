@@ -19,6 +19,7 @@
 #include "r3d_fwht.h"
 #include "r3d_launch.h"
 #include <cmath>
+#include <cstdio>
 
 namespace {
 
@@ -38,21 +39,28 @@ __device__ __forceinline__ float wave_max_f(float v) {
 }
 
 /* SUB is the number of 128-wide rotation blocks one scale covers: 1 (group 128), or 2 for IQ8R's
- * 256-wide group, where each half is rotated on its own and the amax is taken over the pair. */
+ * 256-wide group, where each half is rotated on its own and the amax is taken over the pair.
+ *
+ * The op is issued on the whole projection row, not on one head: with a gated attention the
+ * operands are [M, heads*head_dim] while the `n` parameter names the head width, and the gate is a
+ * rank-3 view [M, heads, head_dim] whose head stride is wider than head_dim (a [q|gate] projection
+ * leaves it as a column slice of each head's block). Every rotation block lies inside one head
+ * because head_dim is a multiple of 128, so a block's gate base is head*gate_hs + in_head. */
 template <int MODE, int SUB>
 __global__ __launch_bounds__(kThreads) void gate_had_quant_i8g_kernel(
     const uint16_t* __restrict__ gate, const uint16_t* __restrict__ x, uint16_t* __restrict__ yo,
-    uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n, uint32_t gate_ld, uint32_t x_ld,
-    uint32_t y_ld) {
+    uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n, uint32_t q_ld, uint32_t gate_ld,
+    uint32_t gate_hs, uint32_t head_dim, uint32_t x_ld, uint32_t y_ld) {
     constexpr int HAD = 128, VPL = HAD / 32;
     static_assert(SUB == 1 || SUB == 2, "a 256 group is two 128-wide rotations");
     const uint32_t row = blockIdx.x, kg = blockIdx.y;
     const uint32_t nkb = n / (uint32_t)(SUB * HAD);
     const uint32_t lane = threadIdx.x & 31;
     const uint32_t c0 = kg * (uint32_t)(SUB * HAD);
-    const uint16_t* g = gate + (size_t)row * gate_ld + c0;
+    const uint32_t head = c0 / head_dim;
+    const uint16_t* g = gate + (size_t)row * gate_ld + (size_t)head * gate_hs + (c0 - head * head_dim);
     const uint16_t* xr = x + (size_t)row * x_ld + c0;
-    uint8_t* qr = q + (size_t)row * n + c0;
+    uint8_t* qr = q + (size_t)row * q_ld + c0;
     uint16_t* yop = yo ? yo + (size_t)row * y_ld + c0 : nullptr;
 
     const int base = lane * VPL;
@@ -93,7 +101,7 @@ extern "C" {
 
 int r3d_rad_gate_had_quant_i8g(const RadArgs* a, RadStream s)
 {
-    if (!a || a->n_t < 4) return R3D_NO(RAD_E_INVAL);
+    if (!a || a->n_t < 4) { std::fprintf(stderr, "gate_had: n_t %d\n", a ? (int)a->n_t : -1); return R3D_NO(RAD_E_INVAL); }
     /* The schema's order: gate, x, q, scale, out_bf16. */
     const RadTensor* gate = r3d_opt(a, 0), *x = r3d_opt(a, 1), *q = r3d_opt(a, 2),
                     *sc = r3d_opt(a, 3), *y = r3d_opt(a, 4);
@@ -102,6 +110,8 @@ int r3d_rad_gate_had_quant_i8g(const RadArgs* a, RadStream s)
         sc->dtype != RAD_F32)
         return R3D_NO(RAD_E_DTYPE);
 
+    /* The row is issued on the whole projection: q and x are [M, n] with `n` the full width, while
+     * the `n` parameter names the head width (heads * head_dim = n). */
     long long M = 0, n = 0;
     if (r3d_rows_of(q, &M, &n) != 0) return R3D_NO(RAD_E_INVAL);
     if (n <= 0 || n % 128) return R3D_NO(RAD_E_SHAPE);
@@ -111,13 +121,32 @@ int r3d_rad_gate_had_quant_i8g(const RadArgs* a, RadStream s)
     if (r3d_numel(gate) < M * n || r3d_numel(x) < M * n) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(sc) < M * (n / grp)) return R3D_NO(RAD_E_SHAPE);
     if (!r3d_contig(q)) return R3D_NO(RAD_E_STRIDE);
-    uint32_t gate_ld = (uint32_t)(gate->rank >= 2 ? gate->shape[1] : gate->stride[0]);
-    uint32_t x_ld = (uint32_t)(x->rank >= 2 ? x->shape[1] : x->stride[0]);
-    if (gate_ld < (uint32_t)n || x_ld < (uint32_t)n) return R3D_NO(RAD_E_SHAPE);
+
+    /* The gate is [M, n] contiguous, or [M, heads, head_dim] with its own head and row pitches: a
+     * [q|gate] projection leaves it a column slice of each head's block. head_dim tiles 128, so a
+     * rotation block never crosses a head. */
+    uint32_t head_dim, gate_hs;
+    if (gate->rank >= 3) {
+        if (gate->rank > 3 || gate->shape[2] <= 0 || gate->shape[2] % 128 ||
+            gate->stride[2] != 1 || gate->stride[1] < gate->shape[2] ||
+            gate->shape[1] * gate->shape[2] != n)
+            return R3D_NO(RAD_E_SHAPE);
+        head_dim = (uint32_t)gate->shape[2];
+        gate_hs = (uint32_t)gate->stride[1];
+    } else {
+        if (gate->rank != 2 || gate->stride[1] != 1) return R3D_NO(RAD_E_STRIDE);
+        head_dim = (uint32_t)n;
+        gate_hs = (uint32_t)n;
+    }
+    if (grp > head_dim) return R3D_NO(RAD_E_SHAPE);
+    if (x->rank < 2 || x->stride[1] != 1 || x->stride[0] < n) return R3D_NO(RAD_E_STRIDE);
+    const uint32_t gate_ld = (uint32_t)gate->stride[0], x_ld = (uint32_t)x->stride[0];
+    const uint32_t q_ld = (uint32_t)q->stride[0];
     uint32_t y_ld = (uint32_t)n;
     if (y) {
-        if (y->dtype != RAD_BF16 || r3d_numel(y) < M * n) return R3D_NO(RAD_E_SHAPE);
-        if (y->rank >= 2 && y->shape[1] > n) y_ld = (uint32_t)y->shape[1];
+        if (y->dtype != RAD_BF16 || r3d_numel(y) < M * n || y->rank < 2 || y->stride[1] != 1)
+            return R3D_NO(RAD_E_SHAPE);
+        y_ld = (uint32_t)y->stride[0];
     }
 
     const char* act = r3d_gets(a, "act");
@@ -127,7 +156,6 @@ int r3d_rad_gate_had_quant_i8g(const RadArgs* a, RadStream s)
     /* A lane stores four codes as one dword. */
     if (((uintptr_t)r3d_wp(q) & 3u) || ((uintptr_t)r3d_wp(sc) & 3u)) return R3D_NO(RAD_E_ALIGN);
 
-    const uint32_t gu_pitch = gate_ld, x_pitch = x_ld;
     dim3 grid((unsigned)M, (unsigned)(n / grp)), blk(kThreads);
     const int sub = grp == 256 ? 2 : 1;
     const uint16_t* gp = (const uint16_t*)r3d_p(gate);
@@ -138,17 +166,17 @@ int r3d_rad_gate_had_quant_i8g(const RadArgs* a, RadStream s)
     if (mode == 0) {
         if (sub == 2)
             R3D_KLAUNCH(R3D_KNAME(gate_had_quant_i8g_kernel<0, 2>), grid, blk, (hipStream_t)s,
-                        gp, xp, yp, qp, sp, (uint32_t)n, gu_pitch, x_pitch, y_ld);
+                        gp, xp, yp, qp, sp, (uint32_t)n, q_ld, gate_ld, gate_hs, head_dim, x_ld, y_ld);
         else
             R3D_KLAUNCH(R3D_KNAME(gate_had_quant_i8g_kernel<0, 1>), grid, blk, (hipStream_t)s,
-                        gp, xp, yp, qp, sp, (uint32_t)n, gu_pitch, x_pitch, y_ld);
+                        gp, xp, yp, qp, sp, (uint32_t)n, q_ld, gate_ld, gate_hs, head_dim, x_ld, y_ld);
     } else {
         if (sub == 2)
             R3D_KLAUNCH(R3D_KNAME(gate_had_quant_i8g_kernel<1, 2>), grid, blk, (hipStream_t)s,
-                        gp, xp, yp, qp, sp, (uint32_t)n, gu_pitch, x_pitch, y_ld);
+                        gp, xp, yp, qp, sp, (uint32_t)n, q_ld, gate_ld, gate_hs, head_dim, x_ld, y_ld);
         else
             R3D_KLAUNCH(R3D_KNAME(gate_had_quant_i8g_kernel<1, 1>), grid, blk, (hipStream_t)s,
-                        gp, xp, yp, qp, sp, (uint32_t)n, gu_pitch, x_pitch, y_ld);
+                        gp, xp, yp, qp, sp, (uint32_t)n, q_ld, gate_ld, gate_hs, head_dim, x_ld, y_ld);
     }
     return (int)hipGetLastError();
 }
