@@ -1252,3 +1252,42 @@ l'énumération des rows résolues, pas la couverture.
 **Doc.** `RAPPORT_RDNA3.md` entre dans le dépôt (décision prise) et ses
 §7.6/§10.4–10.5 sont révisés ; `docs/OPS.md` et `libr3d/README.md` étaient déjà
 à jour.
+
+## 2026-11-17 — rebase `main` 2.1.0 (W29) et retour du préfill IQR (GS=1)
+
+**Rebase.** `rdna3-iqr` rejouée sur `main` `3045979` (v2.1.0) : 144 commits
+rejoués, 4 conflits additifs (CMake + 3 blocs `r3d_rows.cpp`), `ple_conv`
+dédoublonné au profit du noyau entrant, `moe_gather` adopte la garde de
+capacité, `down_w5_fp8` restauré (défaut amont après `d1b5a45`), `ngram_ids_i32`
+restaurée (sa suppression cassait Flash-Next M=2048). Détail :
+`RAPPORT_REBASE_V2_1_0.md`.
+
+**Selftest.** **195 rows, 0 échec, 16 skips** ; `sched_test` 548 952,
+`engine_e2e_test` 1 076 (3 skips), `build_test` 969, `shipped_plugins_test`
+1 010, `arch_test` 183 527, `device_test` 61 808, tous les tests device RDNA3
+verts. kbench **27B 3 181/3 181**, **Flash-Next 4 786/4 786**, MiniCPM
+**1 802/1 802**, 0 échec, pires rel_l2 3,619e-03 / 1,520e-02 / 3,485e-03.
+
+**Écart de préfill, corrigé.** L'A/B `final-all` (W26) vs rebasé montrait
+285 → 249 tok/s ; un build neuf de la pré-rebase (W27) donne 250 tok/s, donc
+le rebase est neutre. La dette est la généralisation `GS=1/2` du noyau IQR
+pour IQ8R : `gemm_iqr_resident_kernel` groupé coûte 17 % sur le 27B. La
+spécialisation `GS=1` (`faa89fd`, noyau resident restauré de W26) redonne
+**3 839 µs** (16,8 TFLOP/s) et **288,4/287,3 tok/s** sur 532 tokens ; texte
+27B identique, IQ8R (`GS=2`) inchangé.
+
+**Autres postes (build patché).** Flash-Next IQR tiled 2 053,8 µs
+(12288×2560 M=512) / 2 675,9 µs (16384×2560) ; MoE 231,2 / 4 009 µs ;
+bf16 défaut 776,8 / 788,4 µs ; `hc_read` **355,1 / 12 323,5 µs** (W21, 5–9×
+mieux que W26) ; `mtp_enter` 186,2 / 59 385 µs (linéaire) ; `logit_rerank`
+32,9 µs. `rad-tune` 27B : bf16 tiled `impl=3` 199,5 µs contre 789,0
+(3,95×) ; Flash-Next tiled 65,2/67,2/71,2 µs (N=96/512/640 K=2560 M=512).
+
+**QSA long contexte.** Flash-Next à 3 252 tokens (> borne 2 051) : préfill
+**234,8 tok/s**, TTFT 13,85 s, rows `qsa_block_key`/`qsa_score`/`qsa_select`/
+`qsa_tail_store`/`qsa_work` sélectionnées en libr3d et avx. Le chemin dense
+`by_table` reste exercé à 58 tokens.
+
+**Amont.** `down_w5_fp8` et `ngram_ids_i32` sont deux régressions de `main`
+2.1.0 (compilation et service RDNA3) ; correctifs locaux `5e98eb9` et
+`c11c451`, à proposer en amont.

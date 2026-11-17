@@ -443,18 +443,17 @@ La branche reste volontairement très au-dessus de `main` : **142 fichiers,
    3,84 ms / 285 tok/s atteinte (3 839 µs / 288 tok/s).
 4. Proposer en amont les deux correctifs (`down_w5_fp8`, `ngram_ids_i32`) avec
    leurs tests.
-5. **Fait pour le 27B** : `rad-tune` rejoué sur le build propre
-   (`build-clean`) confirme les chiffres pré-rebase — `gemm_nt_bf16_tiled`
-   N=256 K=5120 M=1792 : `impl=0` 789,0 µs contre `impl=3` **199,5 µs**
-   (3,95×, rel 4,9e-06) ; `gemm_nt_bf16_m16` : 21,58 µs contre **15,27 µs**
-   (1,41×). Le cache reste absent du home servi (`build-clean/radiance_home`),
-   donc le constat V3 du rapport de comparaison tient toujours : à livrer. Le
-   tune Flash-Next n'a pas été rejoué.
+5. **Fait (27B et Flash-Next)** : `rad-tune` rejoué sur `build-clean` —
+   27B `gemm_nt_bf16_tiled` N=256 K=5120 M=1792 : `impl=0` 789,0 µs contre
+   `impl=3` **199,5 µs** (3,95×, rel 4,9e-06) ; `m16` 21,58 contre **15,27 µs**
+   (1,41×). Flash-Next : `impl=3` **65,2 / 67,2 / 71,2 µs** sur N=96/512/640
+   K=2560 M=512, `m16` 13,08 / 13,63 / 14,10 µs. Le cache reste absent du home
+   servi (`build-clean/radiance_home`), donc V3 tient : à livrer.
 6. Si `main` corrige `down_w5_fp8` ou `ngram_ids` différemment, prendre sa
    version au prochain rebase (les commits `5e98eb9` et `c11c451` sont
    identifiables et peuvent être abandonnés).
-7. **Après GS=1** : les noyaux sont re-mesurés (§5.5) ; reste à rejouer
-   `rad-tune` sur Flash-Next et à mettre à jour `AGENTS.md`,
+7. **Après GS=1** : les noyaux et les tunes 27B/Flash-Next sont re-mesurés
+   (§5.5) ; reste à mettre à jour `AGENTS.md`,
    `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md` et
    `SUIVI_LOTS_RDNA3.md` (195 rows, `main` 2.1.0, GS=1, état W29).
 

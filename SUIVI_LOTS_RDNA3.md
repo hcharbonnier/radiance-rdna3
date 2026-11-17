@@ -198,3 +198,25 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   testées à 2 rangs sur une carte (W28), mais les **jonctions `ar_*`
   fusionnées** restent des stubs (leurs producteurs ont des signatures
   différentes de libr3d) : un modèle `tp>1` n'est pas encore servable.
+- **R29** — *résolu (W29)* : `main` 2.1.0 retire `ngram_ids_i32` de libr3d ;
+  Flash-Next (M=2048 sur device) échoue alors au démarrage sur « no kernel
+  resolved ». Row restaurée (`c11c451`), service de nouveau correct.
+- **R30** — *résolu (W29)* : la généralisation `GS=1/2` du noyau IQR (W27,
+  IQ8R) coûtait **17 %** au préfill 27B ; la spécialisation `GS=1`
+  (`faa89fd`, noyau resident W26) redonne 3 839 µs / 288 tok/s, IQ8R inchangé.
+- **R31** — *ouvert* : aucun cache `rad/tune/` n'est livré dans
+  `radiance_home` ; le défaut bf16 `impl=0` reste servi alors que `impl=3`
+  donne 3,95× (27B) et 5–9× (Flash-Next). À livrer avec chaque modèle.
+- **R32** — *amont* : `down_w5_fp8` non déclaré dans
+  `arch/common/rad_block_moe_fp8.h` (casse `flint`/`bailing_hybrid`) et
+  retrait de `ngram_ids_i32` cassant RDNA3 ; correctifs locaux `5e98eb9` et
+  `c11c451`, à proposer en amont.
+
+## W29 — rebase `main` 2.1.0 + GS=1 (2026-11-17)
+
+- Rebase 144 commits, 4 conflits additifs, `ple_conv` dédoublonné au profit de
+  `main`, `moe_gather` corrigé (capacité), ABI 40, QSA `kQsaUnread`/`kQsaOnce`.
+- 195 rows, 0 échec, 16 skips ; kbench 27B 3 181/3 181, Flash-Next
+  4 786/4 786, MiniCPM 1 802/1 802 ; 27B 288 tok/s (GS=1), Flash-Next long
+  contexte 3 252 tokens 234,8 tok/s.
+- Détail et suites : `RAPPORT_REBASE_V2_1_0.md`.

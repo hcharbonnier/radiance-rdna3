@@ -619,4 +619,27 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
   **948/948**, 2B **384/384**, 27B **653/653**, 0 échec, 0 divergence ; 27B au
   texte identique (29,63 vs 29,50 tok/s).
 
+## État rebasé 2026-11-17 — W29 (`main` 2.1.0, GS=1)
+
+- **Branche** `rdna3-iqr` rebasée sur `main` `3045979` : **195 rows, 0 échec,
+  16 skips** ; `final-all` est l'arbre **W26** (à ne pas utiliser comme
+  baseline sans rebuild).
+- **Préfill IQR** : `gemm_iqr_tiled` 12288×5120 M=512 à **3 839 µs**
+  (**16,8 TFLOP/s**) ; 27B sur 532 tokens à **288,4/287,3 tok/s**. La
+  généralisation W27 `GS=1/2` coûtait 17 % (4 486 µs / 249 tok/s) ; la
+  spécialisation `GS=1` (`faa89fd`) restaure W26 (3 836–3 856 µs / 285 tok/s).
+- **Flash-Next** : IQR tiled 2 053,8 µs (12288×2560 M=512) / 2 675,9 µs
+  (16384×2560) ; MoE 231,2 µs (M=1) / 4 009 µs (M=512) ; long contexte
+  3 252 tokens **234,8 tok/s** (rows QSA sparse exercées).
+- **HC/MTP** : `hc_read` **355,1 µs / 12 323,5 µs** (W21, 5–9× mieux que W26 :
+  1 772,7 / 113 746) ; `mtp_enter` 186,2 µs / 59 385 µs (linéaire, inchangé).
+- **bf16** : défaut `impl=0` 776,8 µs (N=96 K=5120 M=512) contre `impl=3`
+  **65–199 µs** selon la forme (3,95× sur N=256 M=1792) ; 27B et Flash-Next
+  `rad-tune` rejoués. Le cache de tune reste absent du home servi.
+- **Validation** : kbench 27B **3 181/3 181**, Flash-Next **4 786/4 786**,
+  MiniCPM **1 802/1 802**, 0 échec ; détail dans
+  `RAPPORT_REBASE_V2_1_0.md`.
+
+
+
 
