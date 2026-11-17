@@ -376,14 +376,6 @@ int r3d_ple_gate(long k, long q, long v, long wk, long wq, long wc, long gv, lon
                  int n, int hc, int k_ld, int q_ld, int v_ld, int g_ld, int gn_ld, float eps,
                  float wadd, float geps, long stream);
 
-/* ================================================================== r3d_ple_conv_bf16.hip
- * The dilated depthwise convolution and its silu, then the residual add. `cs_slot`/`cs_ch`/
- * `cs_tok` are the state's strides, `state_len` its token-axis extent. */
-int r3d_ple_conv(long x, long w, long cs, long cu, long resid, long cidx, long hini, long nacc,
-                 long y, int n, int width, int dilation, int x_ld, int r_ld, int y_ld, int w_ld,
-                 long long cs_slot, long long cs_ch, long long cs_tok, long long state_len,
-                 int n_seq, int T, long stream);
-
 /* ================================================================== r3d_hc_bf16.hip
  * The wide residual stream's read, write, entry and control-vector projection. The read needs
  * `hc_read_scratch_bytes(M, lowrank, hc)` bytes (d and the stream scales). `mix_e4m3` selects the

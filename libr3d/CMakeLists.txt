@@ -238,7 +238,6 @@ set(R3D_UNITS
   "r3d_embed_lookup_q|"
   "r3d_ngram_hint|"
   "r3d_ple_gate_bf16|"
-  "r3d_ple_conv_bf16|"
   "r3d_hc_bf16|"
   "r3d_ar_hc_write|"
   # The MTP head's entry over the wide stream with E4M3 fc rows (libr4d's joined

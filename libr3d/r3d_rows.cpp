@@ -852,17 +852,6 @@ static const RadOperandSpec oPleGate[] = { { "k", RAD_OPD_IN, 0 },
                                            { "w_conv", RAD_OPD_WEIGHT, 0 },
                                            { "gv", RAD_OPD_OUT, 0 },
                                            { "gvn", RAD_OPD_OUT, 0 } };
-static const RadParamSpec pPleConv[] = { P_INT("M"), P_INT("n"), P_INT("width"),
-                                         P_INT("dilation"), P_STR("dtype") };
-static const RadOperandSpec oPleConv[] = { { "x", RAD_OPD_IN, 0 },
-                                           { "w", RAD_OPD_WEIGHT, 0 },
-                                           { "conv_state", RAD_OPD_INOUT, 0 },
-                                           { "cu", RAD_OPD_IN, 0 },
-                                           { "resid", RAD_OPD_IN, 1 },
-                                           { "cache_idx", RAD_OPD_IN, 1 },
-                                           { "has_init", RAD_OPD_IN, 1 },
-                                           { "num_accepted", RAD_OPD_IN, 1 },
-                                           { "y", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pHcRead[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("lowrank"),
                                         P_F64("eps"), P_STR("dtype"), P_F64O("wadd"),
                                         P_INTO("inject"), P_INTO("group"), P_INTO("rotate"),
@@ -1327,10 +1316,6 @@ static const RadOpSchema kSchemas[] = {
            "Per-Layer Embedding's gate: K and Q are grouped rmsnorms times their gains, "
            "s[c] = K[c].Q[c]/sqrt(n), the signed square root with `gate_eps`, then "
            "gv[c] = sigmoid(s[c]) * v and gvn = grouped_rmsnorm(gv) * w_conv."),
-    SCHEMA("ple_conv", pPleConv, oPleConv,
-           "A depthwise causal convolution whose taps are `dilation` apart, then silu and the "
-           "residual add: y[t] = resid[t] + silu(sum_j w[c][j] * x[t-(width-1-j)*dilation][c]). "
-           "History is (width-1)*dilation in `conv_state`, in the layout `num_accepted` selects."),
     /* --- W8: HyperConnections --- */
     SCHEMA("hc_read", pHcRead, oHcRead,
            "The read half of a gated residual: N = grouped_rmsnorm(h), g = sigmoid(mix_up @ "
@@ -2164,9 +2149,6 @@ static const RadConstraint cGemmQI8[]     = { C_IN("dtype", "i8a8"),
 /* --- Per-Layer Embedding and HyperConnections (Qwen4-Exp) --- */
 static const RadConstraint cPleGate[] = { C_IN("dtype", "bf16"), C_GE("n", 1),
                                           C_LE("n", 4096), C_GE("hc", 2), C_LE("hc", 8) };
-static const RadConstraint cPleConv[] = { C_IN("dtype", "bf16"), C_GE("n", 1),
-                                          C_GE("width", 1), C_LE("width", 5),
-                                          C_GE("dilation", 1), C_LE("dilation", 4) };
 static const RadConstraint cEmbedQ[] = { C_IN("dtype", "bf16"), C_GE("n_embd", 1) };
 static const RadConstraint cNgramHint[] = { C_GE("heads", 1), C_GE("ngram", 2), C_LE("ngram", 8),
                                             C_GE("hist", 0) };
@@ -4387,7 +4369,7 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r3d_shape_gemm_nt },
 
 /* ------------------------------------------------------------------ W9: r3d_embed_lookup_q.hip,
- * r3d_ngram_hint.hip, r3d_ple_gate_bf16.hip, r3d_ple_conv_bf16.hip
+ * r3d_ngram_hint.hip, r3d_ple_gate_bf16.hip (ple_conv is upstream's r3d_ple_conv.hip)
  *
  * Qwen4-Exp's Per-Layer Embedding. The table is the 320-million-row n-gram embedding, E4M3 with
  * one scale for the whole table (or a plain bf16 table read in place). The hint is a prefetch
@@ -4421,15 +4403,6 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cPleGate), NOTUNE,
   nullptr, nullptr, r3d_rad_ple_gate, nullptr, nullptr, nullptr, nullptr },
-
-{ "ple_conv_bf16", "ple_conv", "norm",
-  "the dilated depthwise causal convolution, its silu and the residual add; the state window is "
-  "written back in the same launch",
-  "bf16; width <= 5, dilation <= 4 so (width-1)*dilation <= 16, tokens walked 32 at a time",
-  "the taps summed in j order in f32, silu as x*sigmoid(x), one bf16 store",
-  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
-  ROW(cPleConv), NOTUNE,
-  nullptr, nullptr, r3d_rad_ple_conv, nullptr, nullptr, nullptr, nullptr },
 
 /* ------------------------------------------------------------------ W8: r3d_hc_bf16.hip
  *

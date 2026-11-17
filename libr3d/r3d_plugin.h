@@ -533,7 +533,6 @@ int r3d_shape_rmsnorm_had_quant_i8g(const RadParam*, int, int, RadOpdDesc*);
 int r3d_rad_embed_lookup_q (const RadArgs* a, RadStream s);
 int r3d_rad_ngram_hint     (const RadArgs* a, RadStream s);
 int r3d_rad_ple_gate       (const RadArgs* a, RadStream s);
-int r3d_rad_ple_conv       (const RadArgs* a, RadStream s);
 int r3d_rad_hc_enter       (const RadArgs* a, RadStream s);
 int r3d_rad_hc_read        (const RadArgs* a, RadStream s);
 int r3d_rad_hc_write       (const RadArgs* a, RadStream s);
