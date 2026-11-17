@@ -3538,18 +3538,18 @@ static const RadKernelInfo kKernels[] = {
    nullptr, nullptr, nullptr,
    nullptr, nullptr, nullptr },
 
-  { "ngram_ids_i32", "ngram_ids", "vocab",
-   "The hashed row ids of the Per-Layer Embedding: mixed(k) = XOR of t_s * mult[s], "
-   "ids[h] = mixed % vocab_sizes[h] + offsets[h]",
-   "One thread a token, looping its heads; n-gram shifts with EOS walk; 64-bit wrapping "
-   "multiply and floor-mod; ngram <= 8, heads divisible by (ngram-1)",
-   "i32 tok, i32 state, i32 cu, i64 mult, i64 vsz, i64 off, i32 ids; "
-   "optional i32 cidx, hini, nacc, ahead",
-   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
-   ROW(cNgramIds), NOTUNE,
-   nullptr, nullptr, r3d_rad_ngram_ids,
-   nullptr, nullptr, nullptr,
-   nullptr, nullptr, nullptr },
+{ "ngram_ids_i32", "ngram_ids", "vocab",
+  "The hashed row ids of the Per-Layer Embedding: mixed(k) = XOR of t_s * mult[s], "
+  "ids[h] = mixed % vocab_sizes[h] + offsets[h]",
+  "One thread a token, looping its heads; n-gram shifts with EOS walk; 64-bit wrapping "
+  "multiply and floor-mod; ngram <= 8, heads divisible by (ngram-1)",
+  "i32 tok, i32 state, i32 cu, i64 mult, i64 vsz, i64 off, i32 ids; "
+  "optional i32 cidx, hini, nacc, ahead",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cNgramIds), NOTUNE,
+  nullptr, nullptr, r3d_rad_ngram_ids,
+  nullptr, nullptr, nullptr,
+  nullptr, nullptr, nullptr },
 
   { "gemm_nt_q_bias_fp8a8_m16", "gemm_nt_q_bias", "gemm",
    "The narrow fp8 GEMM with a per-column bias epilogue: y = a @ b^T + bias",
