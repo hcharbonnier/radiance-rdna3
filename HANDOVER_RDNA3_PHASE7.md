@@ -29,7 +29,7 @@ pour l'état courant ; §8 donne la reprise immédiate.
 | W28 DSpark (D2) | 2B à `NS=3` : **32,20 vs 20,64 tok/s** (1,56×), texte identique au bit, 33/210 drafts acceptés ; cas selftest `w2a8` M=7 réparé (F16) |
 | W28 collectifs tp>1 (D3) | 18 rows `all_reduce`/`all_gather` portées de libhalo, schemas libr4d, `device.p2p` ; `tp2_collectives_device_test` 2 rangs sur une carte (12 checks) ; jonctions `ar_*` fusionnées encore en stubs |
 | Périmètre v1 (2026-11-16) | vision **livrée** (W26) et MTP Flash-Next **livré** (W25 : NS=3, 1,82×) ; le 27B reste à `NS=0` |
-| Mesures à froid W18 (HC/PLE/QSA par row) | 182 + 147 cas, 0 échec ; `hc_read` **1,77 ms à M=1** (η 0,6 %), η lien **1,7 %** ; MoE par row mesuré en W23 (η 70,5 % à M=32, 51 % w4nl à M=16, 10–12 % à M=1) |
+| Mesures à froid W18 (HC/PLE/QSA par row) | 182 + 147 cas, 0 échec ; `hc_read` **1,77 ms à M=1** (η 0,6 %, **avant le correctif W28**), η lien **1,7 %** (caduc, cf. W28) ; MoE par row mesuré en W23 (η 70,5 % à M=32, 51 % w4nl à M=16, 10–12 % à M=1) |
 | Démo serveur M6 / W19 | préfill 38,7–41,9 tok/s, décodage 4,41 (1 séq.) / 15,5 (4) / 22,1 (6) tok/s ; cache ×12 sur prompt identique ; **R22 résolu** : rejeu 9 tours 24 % → 52,6 % de tokens servis, `no_snapshot` 6 → 2 ; 4 décodeurs ×7,0 à côté d'un préfill |
 | Rejeu 27B / W19–W20 | chargement 15,87 GiB en 2,7 s ; `SEQS=1` préfill 318,8 tok/s (844), décodage 23,2 / 29,4 ; **`SEQS=4` corrigé** (W20) : préfill 317,5 tok/s, 4 requêtes à 67,3 tok/s agrégés |
 | Contexte 16k | KV 1,23 GiB (4 × 16 384) ; prompt de 13 421 tokens servi à 40,9 tok/s ; >16k → 400 |
