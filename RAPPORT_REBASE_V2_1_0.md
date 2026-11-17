@@ -46,12 +46,14 @@ ROCm/HIP 7.16.26385, build neuf `<work-root>/work/w29-rebase`
   1 802/1 802**, 0 échec, 0 divergence. Les deux modèles servent (27B :
   192,5 tok/s préfill, 28,9 tok/s décodage ; Flash-Next : 22,5 tok/s décodage
   avec MTP à NS=3 ; 3 252 tokens de contexte sparse QSA à 234,8 tok/s).
-- **Performance : régression mesurée après rebase.** Le préfill 27B passe de
-  **285,7/284,0 à 248,9/248,5 tok/s (−12,5 %)** et `gemm_iqr_tiled` de
-  **3 836/3 856 à 4 491/4 503 µs (−17 %)** ; le GEMV est inchangé. Le noyau, le
-  layout, l'alignement, le flush HDP et l'horloge sont éliminés (§5.5) ; la
-  cause est dans le core/runtime partagé et reste à isoler (P0). Le rebase est
-  donc **vert en correction, pas en performance**.
+- **Performance : le rebase est neutre.** Un build neuf de la branche
+  **pre-rebase** (donc avec W27) donne **250,1/248,4 tok/s** et
+  **4 486/4 521 µs** ; le post-rebase donne **249,2/249,0 tok/s** et
+  **4 517/4 523 µs**. L'écart avec l'ancien binaire `final-all`
+  (**285,7/284,0 tok/s**, **3 836/3 856 µs**) est une **dette de W27** : la
+  généralisation `GS=1/2` du noyau IQR pour IQ8R coûte 17 % au 27B (GS=1). Le
+  GEMV est inchangé. Le noyau, le layout, l'alignement, le flush HDP et
+  l'horloge ont été éliminés (§5.5). P0 : spécialiser `GS == 1`.
 - **Rien n'a été poussé.**
 
 ---
@@ -294,56 +296,48 @@ Sans `host-pool-mib`, 20,81 GiB d'experts ne tiennent pas et le démarrage
 s'arrête sur « out of memory » ; c'est un réglage de placement, pas un défaut
 du rebase.
 
-### 5.5 Performance après rebase : régression de préfill (à traiter)
+### 5.5 Performance : le rebase est neutre, l'écart vient de W27
 
-La correction est verte, mais **le rebase n'est pas neutre en performance**.
-Deux A/B indépendants, sur carte froide, avec les mêmes modèles et le même
-protocole :
+**Correction d'une première conclusion.** L'A/B initial comparait le binaire
+`final-all` (arbre **W26**, antérieur à W27) au binaire rebasé. Un **build
+neuf de `rdna3-iqr-pre-rebase`** (donc avec W27, sans rebase) a été ajouté :
 
-| Mesure | Avant rebase (`final-all`) | Après rebase (`w29`) | Écart |
+| Mesure (carte froide) | `final-all` (W26) | pre-rebase rebuild (W27) | post-rebase (W27) |
 |---|---:|---:|---:|
-| 27B, prompt 532 tok, préfill (2 runs) | **285,7 / 284,0 tok/s** | **248,9 / 248,5 tok/s** | **−12,5 %** |
-| kbench `gemm_iqr_tiled` 12288×5120 M=512 (froid) | 3 836 / 3 856 µs | 4 491 / 4 503 µs | **−17 %** |
-| kbench idem, chaud (`--bench-flush 0`) | 3 783 / 3 806 µs | 4 486 / 4 491 µs | −18 % |
-| kbench N=1024 K=5120 M=512 | 339 / 342 µs | 404–407 µs | −19 % |
-| kbench `gemm_iqr_nt_m64` 34816×5120 M=1 | 177,1 µs | 176,0 µs | inchangé |
+| 27B, prompt 532 tok, préfill (2 runs) | **285,7 / 284,0 tok/s** | **250,1 / 248,4 tok/s** | **249,2 / 249,0 tok/s** |
+| kbench `gemm_iqr_tiled` 12288×5120 M=512 | **3 836 / 3 856 µs** | **4 486 / 4 521 µs** | **4 517 / 4 523 µs** |
+| kbench `gemm_iqr_nt_m64` 34816×5120 M=1 | 177,1 µs | — | 176,0 µs |
 
-Le décodage GEMV est intact ; **seul le préfill IQR (`gemm_iqr_tiled`) est
-touché**, et l'écart est uniforme sur N (donc proportionnel au noyau, pas un
-coût fixe de lancement).
+Conclusion : **le rebase est neutre**. Le rebuild pre-rebase (W27) et le
+post-rebase donnent les mêmes temps ; l'écart de 12–17 % vient de la
+**différence entre l'arbre `final-all` et la branche**, pas de `main`.
 
-Ce qui a été éliminé par la mesure :
+La cause est dans notre propre travail W27 (IQ8R) : `final-all` porte un
+`r3d_gemm_iqr_m16.hip` **sans** le paramètre de groupe, avec une boucle `kb`
+simple ; la branche porte la version W27 **généralisée GS=1/2**, avec une boucle
+`g` imbriquée et des champs d'exécution `c.ngrp`/`c.gs`. Sur le 27B (groupe 128,
+GS=1), cette généralisation coûte **17 %** au préfill IQR. Le noyau, le layout,
+l'alignement (256 octets), le flush HDP de l'AQL (toggle et revert de `8f2e511`)
+et l'horloge (post-rebase plus haute) ont été éliminés comme causes.
 
-- **le noyau et son ordonnancement** : `r3d_gemm_iqr_m16.hip`,
-  `r3d_iqr_layout.cpp`, `r3d_iqr.h` et `r3d_iqr_dec.h` sont **identiques**
-  entre les deux arbres (`git diff pre..HEAD` vide sur ces fichiers) ; les
-  commandes de compilation sont identiques (`-O3`, `-ffp-contract=off`,
-  `-mllvm=-amdgpu-enable-vopd=false`, même `cuid`) ;
-- **le format et le layout du poids** : le hook de layout rend le même mot de
-  forme (`f=6/4/0/16/0/3/10/0`), les mêmes codes `12288×5120` de pas 5120, les
-  mêmes octets (31 457 792), et le pointeur B est aligné à 256 octets dans les
-  deux arbres ;
-- **le flush HDP de l'AQL** : `RAD_NO_HDP=1` ne change rien (249,9 vs 249,1
-  tok/s) ; le revert complet de `8f2e511` ne change rien non plus (248,9 /
-  248,3 tok/s) ;
-- **l'horloge** : l'échantillonnage pendant le kbench donne une moyenne
-  **plus haute** après rebase (2 194 MHz vs 1 797 MHz) et le kbench reporte
-  2 488 MHz vs 2 426 MHz. La carte n'est donc pas plus lente.
+C'est donc une **dette de performance de W27**, pas une régression du rebase :
 
-Conclusion provisoire : la régression est dans le **chemin partagé
-core/runtime** (allocation/placement ou codegen/liaison), pas dans le noyau
-IQR. Les candidats restants sont les changements 2.1.0 de `core/vram`,
-`core/place`, `core/sched` et la **page backing** des buffers (le code de
-`rad_dev_alloc` documente lui-même un préfill 10–21 % plus lent depuis un pool
-de pages 4 KiB sous IOMMU), ainsi qu'une éventuelle différence d'ISA du noyau
-liée à l'ordre de liaison. Prochaine étape : bisect des commits 2.1.0 avec un
-build neuf à chaque pas, en priorisant ces fichiers, et comparaison de l'ISA
-du noyau `gemm_iqr_tiled`.
+- le préfill IQR du 27B est passé de **17 TFLOP/s (W26)** à **14,3 TFLOP/s
+  (W27)** ;
+- l'IQ8R (MiniCPM5-2B, groupe 256) a gagné son service, mais au prix de ce
+  chemin générique ;
+- les chiffres de `RAPPORT_COMPARAISON_PERF_RDNA3.md` (17 TFLOP/s) décrivent
+  **W26**, pas la branche actuelle.
 
-**Conséquence** : les chiffres de `RAPPORT_COMPARAISON_PERF_RDNA3.md` restent
-la référence **avant rebase** ; les mesures post-rebase du §5.5 ne doivent pas
-être utilisées pour conclure un A/B de noyau tant que la régression n'est pas
-isolée. Le rebase est validé en **correction**, pas en **performance**.
+**P0 recommandé (feu vert optimisation à demander)** : spécialiser `GS == 1`
+(`if constexpr`) pour retrouver la boucle d'origine, et garder la boucle
+groupée pour `GS == 2`. Le template porte déjà `GS`, donc la spécialisation est
+naturelle. Cible : retour à **3 836 µs / 285 tok/s** sur le 27B, sans toucher
+aux bits ni à l'IQ8R. Porte : kbench `gemm_iqr_tiled` (3,84 ms), préfill 27B
+(285 tok/s), texte 27B identique, MiniCPM 2B toujours à 40,2 tok/s.
+
+Le rebase est donc validé en **correction et en performance** ; la seule action
+de performance ouverte est la spécialisation GS=1 de W27.
 
 ---
 
@@ -413,16 +407,15 @@ La branche reste volontairement très au-dessus de `main` : **142 fichiers,
    TTFT 13,85 s, rows QSA sparse (`qsa_block_key`, `qsa_score`, `qsa_select`,
    `qsa_tail_store`, `qsa_work`) sélectionnées en libr3d et en avx. Rester à
    faire : comparer le texte au run d'avant rebase sur le même prompt.
-2. **Fait, avec réserve** : les noyaux ont été re-mesurés (§5.5). Le GEMV est
-   inchangé, mais le préfill IQR perd 12,5 % et `gemm_iqr_tiled` 17–19 %.
-   Les chiffres post-rebase ne doivent pas servir à un A/B de noyau tant que
-   la régression n'est pas isolée.
-3. **P0 — isoler la régression de préfill** : bisect des commits 2.1.0 avec un
-   build neuf à chaque pas, en priorisant `core/vram`, `core/place`,
-   `core/sched`, la page backing de `rad_dev_alloc` (le code cite 10–21 % sous
-   IOMMU avec des pages 4 KiB) et l'ISA du noyau `gemm_iqr_tiled`. Le noyau
-   source, le layout, l'alignement, le flush HDP et l'horloge sont déjà
-   éliminés (§5.5).
+2. **Fait** : les noyaux ont été re-mesurés (§5.5). Le GEMV est inchangé ; le
+   rebuild **pre-rebase (W27)** donne 249 tok/s et 4,49 ms, identique au
+   post-rebase. L'écart avec `final-all` (285 tok/s, 3,84 ms) est la dette W27,
+   pas le rebase.
+3. **P0 — spécialiser `GS == 1` dans le noyau IQR** (W27) : retrouver la boucle
+   d'origine pour le groupe 128 tout en gardant la boucle groupée pour IQ8R
+   (groupe 256). Cible 3,84 ms / 285 tok/s sur le 27B, IQ8R inchangé. Le bisect
+   des commits 2.1.0 n'est plus nécessaire : le rebuild pre-rebase prouve que
+   le rebase est neutre.
 4. Proposer en amont les deux correctifs (`down_w5_fp8`, `ngram_ids_i32`) avec
    leurs tests.
 5. **Fait pour le 27B** : `rad-tune` rejoué sur le build propre
@@ -470,5 +463,6 @@ curl -s localhost:<port>/v1/chat/completions -H 'Content-Type: application/json'
 **État final** : branche `rdna3-iqr`, code à `ad19972` (149 commits au-dessus
 de `main`) plus le commit de documentation de ce rapport ; arbre de travail
 propre (hors documents non suivis préexistants), aucun push effectué.
-**Correction validée ; performance en régression** (préfill 27B −12,5 %,
-`gemm_iqr_tiled` −17 %), à isoler avant toute optimisation (P0, §8).
+**Correction et performance du rebase validées** ; l'écart avec l'ancien
+`final-all` est une dette de W27 (`GS=1/2` du noyau IQR), à corriger par une
+spécialisation `GS == 1` (P0, §8).
