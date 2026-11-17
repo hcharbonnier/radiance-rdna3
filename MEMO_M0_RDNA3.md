@@ -1,5 +1,10 @@
 # Mémo M0 — Go/No-Go du spike IQR (W0)
 
+> **Document historique (2026-11-15).** C'est la pièce de la décision M0 : elle
+> reste telle quelle pour la traçabilité. L'état courant est dans
+> `HANDOVER_RDNA3_PHASE7.md` (190 rows, W28), les chiffres dans
+> `TABLEAU_REEL_IDEAL_RDNA3.md` et `JOURNAL_RDNA3.md`.
+
 Date : 2026-11-15. Périmètre : W0 sur Qwen3.8-27B IQR-V4, gfx1100.
 État de l'arbre : branche `rdna3-iqr`, non commité au moment de la rédaction.
 

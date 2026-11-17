@@ -148,8 +148,9 @@ carte a throttlé (PPT0/PPT1) pendant les 8 minutes de mesure ; HC/PLE, QSA et
 le MoE par row sont repris à froid dans la section suivante. Les 78 cas non
 couverts par kbench étaient hors v1 à cette date :
 MTP 48 (`mtp.draft_head`, `blk.48`), `ngram_hint` sans oracle libref.
-Depuis, R23 (tables MoE) et W25 (MTP) les couvrent : 968/968 ; il reste 10 cas
-`gemm_nt_q_gated` i8a8h sans référence libref et 8 `ngram_hint`.
+Depuis, R23 (tables MoE) et W25 (MTP) les couvrent : 968/968 à l'époque
+(948/948 au HEAD W28) ; restent les 16 schemas sans oracle libref, dont
+`gate_had_quant_i8g` (couvert par un test device) et 8 `ngram_hint`.
 
 ## Flash-Next — rows isolées (W17, 2026-11-16, carte froide)
 
@@ -288,6 +289,10 @@ Borne du rapport §7.3 : 42 Gio copiés une fois à 28 GB/s = 1,61 s pour 4 096 
 vient de `hc_read` (89 tok/s à lui seul, 3,5 % de la borne), pas du MoE : à M=1 le MoE
 tourne à 10–12 % de la bande (borné par le décodage treillis) et à 70,5 % (IQR) / 51 %
 (w4nl) à M=32 / M=16.
+
+**Mesure W18, antérieure au correctif W28** : `hc_read` a depuis été corrigé
+(4,5× à M=1, décodage 4,48 → 12,73 tok/s), donc ce 1,7 % est **caduc** et le
+η lien de bout en bout doit être re-mesuré avant toute conclusion sur M2.
 
 ## M6 — démo serveur Flash-Next (2026-11-16)
 
@@ -529,11 +534,13 @@ plus lente que la carte.
   est 25–32 % **plus lente** et reste éteinte. La cible « WMMA » du rapport n'est
   pas atteinte par cette forme ; c'est la piste W14 (émission/staging, pas la
   résidence).
-- La vision `attn_dense` hd72 gagne 45–49 % de M=32 à M=512 ; la mesure à
-  M=16384 reste à faire (kbench s'arrête à 512 sur ce conteneur).
+- La vision `attn_dense` hd72 gagne 45–49 % de M=32 à M=512 ; un cas à M=16384
+  existe au test device (`18 874 368` valeurs exactes) mais kbench s'arrête à
+  512 sur ce conteneur.
 - h256 et la tête sont mesurés de bout en bout (préfill 301, décodage 21,2 à 819),
-  pas isolément. HC/PLE et MoE restent non mesurés. Une seule carte, benchmarks
-  séquentiels, builds propres.
+  pas isolément. HC, PLE, QSA et le MoE par row sont mesurés à froid (W18/W23) ;
+  `hc_read` et `qsa_score` ont été corrigés en W28. Une seule carte,
+  benchmarks séquentiels, builds propres.
 
 ## À remplir / différé
 
@@ -541,42 +548,42 @@ plus lente que la carte.
 |---|---|---|---|---|
 | W3 | GEMV 27B, split-K | 662,4 GB/s (76,6 %) sur `down` | 864 GB/s | **fait** |
 | W4 | `gemm_iqr_tiled` M=512/4096 | 15,5 / 14,8 TFLOP/s (résident) ; WMMA 11,5 / 11,2 | borne WMMA | WMMA plus lente, éteinte |
-| W5 | `moe_gemm_iqr`, `moe_gemm_w4nl` | — | | **non mesurable** : kbench refuse le format des tables du conteneur (110 cas sautés) |
+| W5 | `moe_gemm_iqr`, `moe_gemm_w4nl` | mesuré en W23 : IQR 70,5 % à M=32, w4nl 51 % à M=16, 10–12 % à M=1 | borne lien | **fait** |
 | W6 | `attn_paged` h256 decode/prefill | inclus 27B : préfill 301, décodage 21,2 | | à isoler |
-| W8/W9 | `hc_read`, `ple_gate`, `ple_conv` | `hc_read` 1,77 ms à M=1 (η 0,6 %) ; `ple_gate` 69 TFLOP/s à M=2 048 | 10,5 µs (borne bande) | **fait** — `hc_read` est le poste dominant |
-| W10 | `attn_dense` hd72 | −49 % à M=512 | | M=16384 non mesuré |
+| W8/W9 | `hc_read`, `ple_gate`, `ple_conv` | `hc_read` **428 µs à M=1** (W28, 4,5×) ; `ple_gate` 69 TFLOP/s à M=2 048 | 10,5 µs (borne bande) | **fait** — reste un second passage (~40× du plancher) |
+| W10 | `attn_dense` hd72 | −49 % à M=512 ; M=16384 exact au test device | | kbench s'arrête à 512 |
 | M1 | 27B tokens/s (préfill, décodage) | 301,0 / 21,2–28,4 (SEQS=1) ; **SEQS=4** : 317,5 tok/s et 67,3 tok/s agrégés sur 4 requêtes | | **dépassé** |
-| M2 | η lien Flash-Next, préfill 2 048 | **1,7 %** (42 tok/s) ; plafond `hc_read` 89 tok/s | 80 % de 2 545 tok/s | **non tenu**, cause identifiée |
-| M4 | QSA par row | `qsa_score` 83,4 ms à M=512 (103 GFLOP/s) ; `qsa_select` 946 µs | | **fait** |
-| M5 | Flash-Next tokens/s | préfill 42,1 / 41,5 tok/s ; décodage 4,0–4,6 | | **fait**, limité par `hc_read` |
-| M6 | Démo serveur (prompts, multi-tour, contention, robustesse) | décodeurs ×7,0 à côté d'un préfill ; cache de préfixe ×12 sur prompt identique, 0 % en rejeu agent | | **fait**, deux limites (tier KV off, snapshots interleavés) |
+| M2 | η lien Flash-Next, préfill 2 048 | **1,7 %** (42 tok/s) mesuré **avant** W28 ; plafond de W18 : `hc_read` 89 tok/s | 80 % de 2 545 tok/s | **à re-mesurer** (décodage 4,48 → 12,73 tok/s) |
+| M4 | QSA par row | `qsa_score` **2,23 ms à M=512** (W28, 36×) ; `qsa_select` 946 µs | | **fait** |
+| M5 | Flash-Next tokens/s | préfill 42,1 / 41,5 tok/s ; décodage **12,73 tok/s** après W28 | | **fait** |
+| M6 | Démo serveur (prompts, multi-tour, contention, robustesse) | décodeurs ×7,0 à côté d'un préfill ; cache de préfixe ×12 sur prompt identique, 52,6 % en rejeu agent (R22) ; tier KV actif (R21) | | **fait** |
 
 ## Optimisations différées (W14+)
 
 Ces noyaux sont livrés et validés, mais pas à leur optimum ; ils restent dans
 l'arbre et sont marqués à optimiser, pas à supprimer.
 
-- **`hc_read_e4m3` (priorité 0, Flash-Next)** : 1,77 ms à M=1 pour 6,55 Mo de
-  poids (η 0,6 % de la borne bande) et 0,23 ms par ligne au-delà de M=8 : la
-  paire de matrices est relue par ligne à ~28 GB/s au lieu d'être amortie par
-  tuile. À 48 appels par pas, c'est ~93 ms/token en décodage et 47 % du préfill
-  de 2 048 tokens. Le commentaire de la row annonce 18,7 µs au décodage : l'écart
-  (×95) doit être profilé côté engine avant de toucher au noyau.
+- **`hc_read_e4m3`** — **premier passage livré (W28)** : le staging LDS coalescé
+  des deux noyaux porte M=1 de 1 941 à **428 µs** (4,5×) et M=512 de 114 à
+  **12,4 ms** (9,2×), l'arithmétique étant inchangée. Reste un écart ~40× au
+  plancher de bande (10,5 µs, ~15 GB/s effectifs) : second passage, servir
+  plusieurs lignes par tranche de poids, sur le même protocole d'A/B.
 - **Tuile WMMA du préfill** : construite, bit-identique, couverte par les tests,
   **éteinte** car 25–32 % plus lente que le `v_dot4` à toutes les formes mesurées.
   Le problème est l'émission et le staging (decode par une seule wave, fragments),
-  pas la résidence : W14 doit la reprendre et la rallumer si elle gagne.
+  pas la résidence.
 - **`gemm_iqr_gated_i8a8h` fusionné** : 512 threads, 136 blocs pour 96 CU (1,4
   bloc/CU) ; essayer un découpage à 256 threads ou un kernel persistant. Gain
   actuel ~1,5 % en décodage, à ne pas régresser.
-- **`attn_dense` hd72 à M=16384** : le gain est mesuré jusqu'à M=512 ; ajouter un
-  cas kbench à 16384 avant d'aller plus loin.
+- **`attn_dense` hd72 à M=16384** : le gain est mesuré jusqu'à M=512 ; un cas
+  device à 16384 existe (18 874 368 valeurs exactes) mais kbench n'en a pas de
+  cas sur ce conteneur.
 - **`attn_paged` h256** : le cache de scores et le pitch 272 sont livrés ; le gain
   isolé n'est pas mesuré et le split du préfill reste interdit par l'ordre exact
   que les tests exigent.
-- **`qsa_score` à M=512** : 83,4 ms (103 GFLOP/s, 2 % du pic) pour 258 Mio
-  d'opérandes ; ~4 s par préfill de 2 048 tokens. Le plan refuse 2 048/4 096
-  lignes (512 Mio/1 Gio), d'où `max-num-batched-tokens: 2048`.
+- **`qsa_score`** — **livré (W28)** : réécriture coalescée/tuilée, M=512
+  **2,23 ms** (36–37×), bit-identique. Le plan refuse toujours 2 048/4 096 lignes
+  (512 Mio/1 Gio), d'où `max-num-batched-tokens: 2048`.
 - **PLE** : mesuré à froid ; `ple_gate` tient 69 TFLOP/s à M=2 048 et M=1 est au
   plancher de lancement, rien à optimiser avant le reste.
 - **Tier KV hôte (M6)** : **actif** depuis R21 (W22a). Les fragments KV sont
@@ -595,6 +602,21 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
   écrits 1 → 7. Compromis : sous le premier intervalle la reprise est hors
   grille, comme `nearest` ; l'accord bit à bit n'y est plus garanti pour un
   tour appendu (un prompt répété reste exact), au-delà `exact` reste strict.
-- **E4M3/rotated** : aucun modèle non-IQR sur l'hôte.
+- **E4M3/rotated** : un modèle non-IQR est désormais servi
+  (`minicpm5-2b-iq8r.rad`, IQ8R groupe 256) ; il couvre les producteurs rotated
+  et le GEMM `i8a8h` à 256 (W27/W28), kbench **384/384**.
+
+## État au 2026-11-17 (W28)
+
+- **`hc_read`** : 4,5× à M=1 (428 µs), 9,2× à M=512 ; décodage Flash-Next
+  **4,48 → 12,73 tok/s**. Reste un second passage (~40× du plancher de bande).
+- **`qsa_score`** : 36× à M=512 (2,23 ms), bit-identique.
+- **MiniCPM5-2B (IQ8R)** : servi à `NS=0` (40,2 tok/s à 60 tokens) et `NS=3`
+  (DSpark, 32,20 vs 20,64, texte identique au bit, acceptation 15,7 %).
+- **`tp>1`** : 18 rows de collectifs livrées, testées à 2 rangs sur une carte ;
+  les jonctions `ar_*` fusionnées restent des stubs.
+- **Validation** : selftest **190 rows / 0 échec / 16 skips** ; kbench Flash-Next
+  **948/948**, 2B **384/384**, 27B **653/653**, 0 échec, 0 divergence ; 27B au
+  texte identique (29,63 vs 29,50 tok/s).
 
 

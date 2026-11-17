@@ -62,7 +62,8 @@ la correction `hc_read` de W28 : décodage 4,48 → 12,73 tok/s)**
       décodage treillis, pas par la bande).
 - [x] **R25 MTP Flash-Next (ADR-7)** — rows device `mtp_enter_e4m3`,
       `logit_rerank_iqr` et `logit_rerank_i8` (contrats `libr4d`), tests
-      device (22 + 36 checks), selftest **164 rows**. Deux bugs préexistants
+      device (22 + 36 checks), selftest **164 rows à l'époque** (190 au HEAD
+      W28). Deux bugs préexistants
       de `gemm_nt_q_w2a8_m16` corrigés (en-tête du poids joint lu sur l'hôte
       alors qu'il vit en VRAM ; chunk de K incompatible à M=1/K=2560). Service
       à `NS=3` : décodage **4,51 → 8,21 tok/s (1,82×)**, texte identique,
@@ -135,9 +136,11 @@ la correction `hc_read` de W28 : décodage 4,48 → 12,73 tok/s)**
       deux modes et 480/480 cas vision, 0 divergence
 - [x] W25 (R25) — MTP de Flash-Next : `mtp_enter_e4m3` et
       `logit_rerank_iqr`/`_i8` en device, `gemm_nt_q_w2a8_m16` corrigé pour
-      un poids joint en VRAM et pour M=1/K=2560 ; **164 rows** au selftest,
-      **968/968** kbench Flash-Next (après R23) et 683/683 27B dans les deux
-      modes ; NS=3 servi, **1,82×** le décodage à texte identique
+      un poids joint en VRAM et pour M=1/K=2560 ; **164 rows** au selftest à
+      l'époque (190 au HEAD W28),
+      **968/968** kbench Flash-Next (après R23 ; 948 au HEAD W28) et 683/683
+      27B à l'époque (653 au HEAD W28) ; NS=3 servi, **1,82×** le décodage à
+      texte identique
 - [x] W23 (R23) — tables MoE posées dans kbench : vue complète des 5 plans
       (sans `fwht128`), échelle IQR ligne×bloc, `TablePointers`
       (slab + pointeurs hôte/device) pour conteneur et replay, timer et

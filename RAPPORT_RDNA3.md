@@ -18,14 +18,17 @@ d'optimisation s'en rapprocher.
 > - **Décodage mesuré : 217–250 ms/pas** (4,0–4,6 tok/s à `NS=0`), et non
 >   30–45 ms/pas. Le poste dominant n'est ni le lien ni le MoE mais **`hc_read`** :
 >   1,77 ms par appel à M=1 pour 6,55 Mo de poids (η 0,6 % de la borne bande),
->   ×48 appels par pas = ~93 ms/token, plus `hc_enter`/`hc_write` au plancher de
->   lancement. Avec le MTP (W25) le décodage passe à **8,21 tok/s** (1,82×).
+>   ×48 appels par pas = ~93 ms/token. Avec le MTP (W25) le décodage passe à
+>   **8,21 tok/s** (1,82×) ; **W28 corrige `hc_read`** (staging LDS, 4,5× à
+>   M=1) et le décodeur atteint **12,73 tok/s** à `NS=0` (2,84×).
 > - **Préfill mesuré : 42 tok/s** (2 290 et 4 570 tokens), et non ~2,5 K tok/s.
->   `hc_read` y prend 47 % (470 ms par appel à M=2 048) ; `qsa_score` ~8 %
->   (83,4 ms à M=512, 103 GFLOP/s) ; `ple_gate` tient 69 TFLOP/s.
-> - **η lien = 1,7 %** de la borne de 2 545 tok/s, donc le critère M2 (≥80 %)
->   n'est pas tenu ; ce n'est pas le MoE qui le fixe : R23 a mesuré le temps par
->   row MoE (IQR 70,5 % de la bande à M=32, w4nl 51 % à M=16, 10–12 % à M=1,
+>   `hc_read` y prenait 47 % (470 ms par appel à M=2 048), corrigé à 12,4 ms à
+>   M=512 en W28 ; `qsa_score` ~8 % (83,4 → **2,23 ms** à M=512) ;
+>   `ple_gate` tient 69 TFLOP/s.
+> - **η lien = 1,7 %** de la borne de 2 545 tok/s mesuré en W18, **avant** le
+>   correctif `hc_read` : ce chiffre est **caduc** et le η de bout en bout doit
+>   être re-mesuré. Ce n'est pas le MoE qui le fixait : R23 a mesuré le temps
+>   par row MoE (IQR 70,5 % de la bande à M=32, w4nl 51 % à M=16, 10–12 % à M=1,
 >   borné par le décodage treillis).
 > - **Multi-tour** : cache de préfixe ×12 sur un prompt identique (4 096 tokens
 >   servis, TTFT 108 → 9 s) ; le rejeu multi-agents servait 0 %, il sert
@@ -374,13 +377,15 @@ Ce que cela change par rapport aux prévisions :
    d'un préfill de 3 000 tokens (+590 %), le préfill tombant à 35 tok/s.
 5. **Ce qui reste non mesuré** : rien de bloquant sur le périmètre v1. Le temps
    par row MoE est **mesuré** depuis R23 : IQR 70,5 % de la bande à M=32,
-   w4nl 51 % à M=16, 10–12 % à M=1 (borné par le décodage treillis) ; kbench
-   Flash-Next **968/968** et 27B **683/683** (0 échec, 0 divergence). L'image
+   w4nl 51 % à M=16, 10–12 % à M=1 (borné par le décodage treillis). Au HEAD
+   W28, kbench donne Flash-Next **948/948**, 2B **384/384** et 27B **653/653**
+   (0 échec, 0 divergence ; 968 et 683 avant que des ops déclarées ne replient
+   des cas élémentaires). L'image
    (W26) et le MTP (W25, `NS=3`, 4,51 → 8,21 tok/s, texte identique,
    acceptation 40,3 %) sont livrés ; les tables MTP 48 et le draft head sont
-   couverts. Restent hors v1 : 10 cas `gemm_nt_q_gated` i8a8h sans référence
-   libref, 8 `ngram_hint` sans oracle, et les 16 schemas sans oracle libre
-   (`selftest`), dont `gate_had_quant_i8g` (couvert par un test device).
+   couverts. Restent hors v1 les 16 schemas sans oracle libref, dont
+   `gate_had_quant_i8g`/`gated_had_quant_i8g` (couverts par un test device) et
+   8 `ngram_hint`.
 
 ### 7.6 W24–W27 : `qsa_score` et IQ8R (2026-11-17)
 
@@ -470,17 +475,18 @@ pendant deux itérations.
 
 ## 9. Décision recommandée
 
-> **Décision révisée (2026-11-16)** : le portage est livré et Flash-Next sert le
-> texte (voir l'encadré en tête et §7.5). La décision restante est l'ordre
-> d'optimisation : (1) instrumenter puis corriger `hc_read` (1,77 ms/appel au lieu
-> des 18,7 µs documentés ; ~40 % du décodage et 47 % du préfill) ; (2) les
-> snapshots en rejeu multi-agents (0 % de cache) — **R22 livré** (52,6 % de
-> tokens servis sur le rejeu 9 tours) et tier KV hôte livré (R21) ;
-> (3) seulement ensuite `qsa_score` à M=512 et le MoE, dont le temps par
-> row reste à mesurer. **Le périmètre élargi du 2026-11-16 (ADR-7) est
-> livré** : la vision (W26) et le MTP de Flash-Next (W25, 1,82× le décodage).
-> La faisabilité n'est plus en question, et « RDNA4 plutôt que porter » n'est
-> plus la bonne alternative.
+> **Décision révisée (2026-11-17)** : le portage est livré et Flash-Next sert le
+> texte (voir l'encadré en tête, §7.5 et §7.6). L'ordre d'optimisation décidé
+> est en grande partie exécuté : (1) **`hc_read` corrigé (W28)** — 4,5× à M=1,
+> décodage 4,48 → 12,73 tok/s ; (2) **snapshots multi-agents livrés (R22)** et
+> **tier KV hôte livré (R21)** ; (3) **`qsa_score` à M=512 livré (W28)**, 36×,
+> et le temps par row MoE mesuré depuis R23. Il reste : le **second passage
+> `hc_read`** (~40× du plancher de bande), les **jonctions `ar_*`** pour servir
+> `tp>1`, et un **η lien de bout en bout à re-mesurer** (le 1,7 % date d'avant
+> W28). **Le périmètre élargi du 2026-11-16 (ADR-7) est livré** : la vision
+> (W26), le MTP de Flash-Next (W25, 1,82×) et le DSpark de MiniCPM5 (W28,
+> 1,56×). La faisabilité n'est plus en question, et « RDNA4 plutôt que porter »
+> n'est plus la bonne alternative.
 
 Plan d'implémentation détaillé, lot par lot, avec tests, jalons et critères de
 sortie : `PLAN_IMPLEMENTATION_RDNA3.md`.
@@ -550,21 +556,23 @@ est incomplète.
 ### 10.1 Ce qui est réellement requis
 
 - **Cible v1 actuelle (Flash-Next, 27B, MiniCPM5-2B)** : aucun op manquant sur
-  les chemins exercés — kbench **968/968** et **683/683**, selftest 169/0/15.
-  Les seuls écarts conditionnels sont ci-dessous.
+  les chemins exercés — kbench **948/948**, **384/384** et **653/653**, selftest
+  190/0/16. Les seuls écarts conditionnels sont ci-dessous.
 - **IQ8R (MiniCPM5-2B, artefact non-IQR)** : le tronc rotated int8 à
   **groupe 256** **charge et sert depuis W27** (producteurs groupe 256,
-  `gemm_nt_q` `i8a8h` groupe 256). Restent, sans besoin pour `NS=0` : les
-  variantes `ar_*`/non fusionnées (`tp > 1`), `gate_had_quant_i8g` et le fold
-  `gemm_nt_q_gated` 256. Le drafter **DSpark** du même conteneur demanderait en
-  plus les ops `dflash_*` (seulement si on sert `NS > 0`).
-- **tp > 1** : `all_reduce`, `all_gather` et les fusions `ar_*` (18 rows) sont
-  absents ; sans eux, `tp=2/4` n'est pas servable. Sans objet sur une carte.
+  `gemm_nt_q` `i8a8h` groupe 256) ; **W28** a ajouté `gate_had_quant_i8g`
+  128/256, le fold `gemm_nt_q_gated` 256 et livré le drafter **DSpark**
+  (`NS=3`, 1,56×, texte identique). Restent, sans besoin pour ce conteneur :
+  les variantes `ar_*`/non fusionnées (`tp > 1`).
+- **tp > 1** : les 18 rows `all_reduce`/`all_gather` sont **livrées et testées
+  à 2 rangs sur une carte (W28)** ; les **jonctions `ar_*` fusionnées** restent
+  des stubs (producteurs aux signatures différentes), donc `tp=2/4` n'est pas
+  encore servable.
 - **Streaming KV** (`kv_store_streamed`, `kv_resolve`) : absent ; requis
   seulement si `--kv-resident`/le tier streamé est activé (le tier hôte actuel
   passe par `gather_rows_u8`/`scatter_rows_u8`).
 - **Autres architectures** (`arch/` : qwen3.5, gemma, bailing, glm5, gemma4,
-  ltx2, flux3, sam, qwen3asr, etc.) : les 238 rows restants. Ils ne sont pas
+  ltx2, flux3, sam, qwen3asr, etc.) : les **218 rows restants**. Ils ne sont pas
   requis par la cible v1, mais le sont si l'une de ces architectures devient
   une cible.
 
@@ -572,21 +580,23 @@ est incomplète.
 
 | famille | rows | ops manquants |
 |---|---:|---|
-| `ar` | 18 | `all_gather`, `all_reduce` |
-| `attn` | 58 | 30 ops : `attn_cross`, `attn_local_rel`, `attn_na3d`, `attn_paged_gate_had_quant`, `attn_paged_gate_quant`, `attn_paged_qrow`, `attn_paged_qrow_tree`, `attn_prefix_self`, `attn_vsa`, `dsa_pool`, `dsa_query`, `dsa_score`, `embed_attn`, `kv_resolve`, `kv_store_streamed`, `ministral_rope`, `mla_attn`, `mla_attn_paged`, `mla_project`, `pixtral_rope`, `position_scale`, `qk_norm_rope`, `qk_norm_rope_gate`, `qk_norm_rope_gate_kv_store`, `qk_norm_rope_gate_kv_store_streamed`, `qkv_norm_rope`, `qkv_norm_rope_kv_store`, `rope_rows`, `sam_attn`, `vsa_select` |
-| `conv` | 8 | `causal_conv1d`, `conv1d`, `conv2d_nhwc`, `conv3d_ndhwc`, `conv_t1d`, `tconv_dw` |
-| `dflash` | 4 | `dflash_conv`, `dflash_markov_greedy`, `dflash_markov_greedy_f32`, `dflash_tree` |
-| `draft` | 4 | `lili_attn`, `lili_cand`, `lili_factor`, `lili_walk` |
 | `elem` | 91 | 85 ops : `bwe_up`, `chan_affine`, `chan_split`, `chan_stats`, `clamp`, `cond_aug`, `conv1d_dw`, `conv2d`, `conv2d_unfold`, `cu_repeat`, `d2s3d`, `d2s_add`, `end_status`, `flow_euler`, `flow_renoise`, `flow_res_multistep`, `flow_x0_step`, `fourier_embed`, `frame_mix_store`, `frame_store`, `gate_add`, `gather_rows2`, `gelu_mul`, `gelu_quick`, `gelu_tanh`, `grid_embed_aa`, `grid_embed_cpe`, `grid_pos3`, `head_gate`, `im2col_nhwc`, `int_affine`, `interleave2`, `iota`, `kd_input`, `kd_step`, `lane_gather`, `lane_store`, `logit_softcap`, `ltx_guide`, `mix_rows`, `mul_weight`, `patch_fold`, `patch_unfold`, `pix_patch`, `point_fourier`, `pool_cols`, `pool_rows`, `randn_lanes`, `ras_pick`, `rel_sinusoid`, `relu`, `resample_nearest`, `resize_bilinear`, `rope_split`, `rvq_embed`, `s2d3d`, `s2d_avg_add`, `scale_rows`, `scatter_add_rows`, `seg_mean`, `seg_mean_bf16_sum`, `seg_sinusoid`, `seg_softmax_pool`, `snake`, `snake_aa`, `stft_logmel`, `sub_i32`, `swiglu_clamped`, `swiglu_step`, `table_add`, `tile_crop`, `tile_grid`, `tile_stitch`, `timestep_embed`, `to_rgba8`, `vol_index`, `vq_encode`, `vtile_crop`, `vtile_gather`, `vtile_join`, `vtile_plan`, `vtile_stitch`, `win_finish`, `win_input`, `win_prep` |
-| `gdn` | 2 | `kda_update`, `ssd_update` |
-| `gemm` | 7 | `gemm_nt_f32`, `lora_expand`, `lora_expand_mm`, `lora_shrink` |
-| `misc` | 1 | `prefetch` |
-| `moe` | 4 | `moe_gather_inv`, `moe_scatter_inv`, `router_sigmoid_group_topk`, `router_sigmoid_topk_scatter` |
+| `attn` | 58 | 30 ops : `attn_cross`, `attn_local_rel`, `attn_na3d`, `attn_paged_gate_had_quant`, `attn_paged_gate_quant`, `attn_paged_qrow`, `attn_paged_qrow_tree`, `attn_prefix_self`, `attn_vsa`, `dsa_pool`, `dsa_query`, `dsa_score`, `embed_attn`, `kv_resolve`, `kv_store_streamed`, `ministral_rope`, `mla_attn`, `mla_attn_paged`, `mla_project`, `pixtral_rope`, `position_scale`, `qk_norm_rope`, `qk_norm_rope_gate`, `qk_norm_rope_gate_kv_store`, `qk_norm_rope_gate_kv_store_streamed`, `qkv_norm_rope`, `qkv_norm_rope_kv_store`, `rope_rows`, `sam_attn`, `vsa_select` |
 | `norm` | 21 | `add_rmsnorm`, `group_norm`, `join_add_scale`, `l2norm_chan`, `ln_mod`, `ln_mod_had_quant_i8g`, `mhc_contract`, `mhc_post`, `mhc_pre`, `mhc_pre_finish`, `mhc_pre_partial`, `norm_add_norm`, `norm_add_norm_route`, `norm_add_norm_route_i8g`, `pixel_norm`, `ple_conv_bias`, `rms_mod`, `rms_mod_had_quant_i8g`, `rms_mod_quant_i8`, `rmsnorm_p`, `rmsnorm_rows` |
-| `quant` | 15 | 11 ops : `ar_ln_had_quant_i8`, `ar_rmsnorm_had_quant_i8g`, `ar_rmsnorm_quant_fp8`, `ar_rmsnorm_quant_i8`, `ar_rmsnorm_quant_i8g`, `gate_had_quant_i8g`, `gate_quant_fp8`, `gelu_mul_quant_i8g`, `gram_accum`, `rmsnorm_had_quant_i8`, `rmsnorm_quant_i8g` |
+| `quant` | 13 | 10 ops : `ar_ln_had_quant_i8`, `ar_rmsnorm_had_quant_i8g`, `ar_rmsnorm_quant_fp8`, `ar_rmsnorm_quant_i8`, `ar_rmsnorm_quant_i8g`, `gate_quant_fp8`, `gelu_mul_quant_i8g`, `gram_accum`, `rmsnorm_had_quant_i8`, `rmsnorm_quant_i8g` — `gate_had_quant_i8g` et le fold gated 256 sont livrés (W28) |
+| `conv` | 8 | `causal_conv1d`, `conv1d`, `conv2d_nhwc`, `conv3d_ndhwc`, `conv_t1d`, `tconv_dw` |
+| `gemm` | 7 | `gemm_nt_f32`, `lora_expand`, `lora_expand_mm`, `lora_shrink` |
+| `moe` | 4 | `moe_gather_inv`, `moe_scatter_inv`, `router_sigmoid_group_topk`, `router_sigmoid_topk_scatter` |
+| `draft` | 4 | `lili_attn`, `lili_cand`, `lili_factor`, `lili_walk` |
+| `dflash` | 4 | `dflash_conv`, `dflash_markov_greedy`, `dflash_markov_greedy_f32`, `dflash_tree` — **non requis par le DSpark de MiniCPM5**, servi en W28 sur les rows existantes |
 | `sample` | 3 | `cfg_topk_sample`, `sample_chain`, `sample_merge_topk` |
+| `gdn` | 2 | `kda_update`, `ssd_update` |
 | `select` | 1 | `pair_argmax` |
 | `vision` | 1 | `pixtral_merge` |
+| `misc` | 1 | `prefetch` |
+
+Total au HEAD W28 : **218 rows / 176 ops**. La famille `ar` (18 rows) est sortie
+de l'écart en W28 ; `quant` est passée de 15 rows / 11 ops à 13 / 10.
 
 ### 10.3 Rows RDNA4-only à recréer pour gfx11
 
@@ -620,11 +630,12 @@ RDNA3, que certaines variantes. Les écarts qui comptent pour une cible :
 | op | variante RDNA4 | état RDNA3 | usage |
 |---|---|---|---|
 | `gemm_nt_q` | `gemm_iq8r_nt_m16`, `gemm_iq8r_tiled` (**i8a8h groupe 256**) | **livré (W27)** : `gemm_iqr_nt_m16_w256`, `gemm_iqr_tiled_w256` | **IQ8R** (MiniCPM5-2B) |
-| `gemm_nt_q_gated` | `gemm_iqr_gated` à groupe 256 | absent (non déclaré par `llama_dense_fp8` pour un poids i8) | IQ8R/MoE gated |
+| `gemm_nt_q_gated` | `gemm_iqr_gated` à groupe 256 | **livré (W28)** : fold gated `i8a8h` 256, un `sub` i32 par 256 | IQ8R/MoE gated |
 | `gemm_nt_q` | `gemm_i8a8_nt_m16`, `gemm_i8a8_tiled` (int8 **non rotated**, groupe 256) | absent | conteneur i8a8 non-IQR |
 | `rmsnorm_had_quant_i8g` | `rmsnorm_had_quant_iq8r` | **livré (W27)** : row `rmsnorm_had_quant_i8g_256_bf16` | IQ8R |
 | `gated_had_quant_i8g` | `gated_had_quant_iq8r` | **livré (W27)** : row `gated_had_quant_i8g_256_bf16` | IQ8R gated |
 | `had_quant_act_i8g` | `had_quant_act_iq8r` | **livré (W27)** : row `had_quant_act_i8g_256_bf16` | IQ8R |
+| `gate_had_quant_i8g` | `gate_had_quant_iq8r` | **livré (W28)** : 128/256, porte en vue 3D à pas de tête | IQ8R gated attention |
 | `mtp_enter` | `mtp_enter_bf16` | absent (`libr3d` : e4m3 seulement) | MTP bf16 |
 | `moe_gemm_q` | `moe_gemm_i8a8`, `moe_gemm_w4a8i8` | absent (RDNA3 : IQR/`w4nl`/e4m3) | autres conteneurs MoE |
 | `attn_paged` | `attn_decode_h64/h512`, gqa1/2/4/8/16 | absent (RDNA3 : h128/h256 ciblés) | autres modèles |
@@ -652,23 +663,25 @@ Les deux producteurs fusionnés restent sans oracle libref (« Not covered »
 dans kbench) ; `act_i8g_group256_device_test` les compare à une référence hôte
 indépendante.
 
-Résultat : le 2B déclare **523 ops / 423 poids** et sert à `NS=0` ; kbench
-ciblé **110/110** (pire rel_l2 4,018e-05 ; GEMM **bit-exact**), selftest
-**169/0/15**, kbench Flash-Next **968/968** et 27B **683/683** dans les deux
-modes. Le service utilise **KV bf16** : les rows `attn_paged`/`kv_store` de cet
-arch ne prennent pas i8 à `head_dim=128`. Restent pour un usage complet les
-variantes `ar_*`/non fusionnées (tp > 1), le fold gated 256 et DSpark.
-
-
+Résultat : le 2B déclare **523 ops / 423 poids** et sert à `NS=0` **puis à
+`NS=3`** (DSpark, W28 : 32,20 vs 20,64 tok/s, texte identique au bit) ; kbench
+ciblé **110/110** (pire rel_l2 4,018e-05 ; GEMM **bit-exact**) et conteneur
+entier **384/384**, selftest **190/0/16**, kbench Flash-Next **948/948** et 27B
+**653/653** (968 et 683 avant W28, quand des ops déclarées ne repliaient pas
+encore des cas élémentaires). Le service utilise **KV bf16** : les rows
+`attn_paged`/`kv_store` de cet arch ne prennent pas i8 à `head_dim=128`. Restent
+pour un usage complet les variantes `ar_*`/non fusionnées (tp > 1).
 
 ### 10.5 Ordre de reprise proposé
 
-1. **P0 — IQ8R groupe 256** (MiniCPM5-2B) — **fait (W27)** pour le tronc à un
-   rang : producteurs groupe 256, `gemm_nt_q` `i8a8h` groupe 256, 2B servi à
-   `NS=0`. Restent `ar_*`/non fusionnés (tp > 1), `gemm_nt_q_gated` 256, et
-   `dflash_*` si le drafter est servi.
-2. **P0 — tp > 1** : `all_reduce`, `all_gather`, `ar_*` (18 rows) si le
-   multi-carte revient dans la cible.
+1. **P0 — IQ8R groupe 256** (MiniCPM5-2B) — **fait (W27/W28)** pour le tronc à
+   un rang : producteurs groupe 256, `gemm_nt_q` `i8a8h` groupe 256,
+   `gate_had_quant_i8g` 128/256, fold gated 256, DSpark (`NS=3`). Restent
+   `ar_*`/non fusionnés (tp > 1), les `dflash_*` n'étant pas requis par ce
+   drafter.
+2. **P0 — tp > 1** — **rows livrées (W28)** : 18 `all_reduce`/`all_gather`,
+   testées à 2 rangs sur une carte. Restent les **jonctions `ar_*` fusionnées**
+   (stubs) avant qu'un modèle `tp>1` se serve.
 3. **P1 — architectures déjà déclarables** : attention/KV (`qk_norm_rope*`,
    `qkv_norm_rope*`, `attn_paged_qrow*`, `attn_prefix_self`, MLA/DSA),
    normes/quant (`norm_add_norm*`, `rms_mod*`, `gate_*`, `rmsnorm_*`),
@@ -680,6 +693,7 @@ variantes `ar_*`/non fusionnées (tp > 1), le fold gated 256 et DSpark.
    l'architecture correspondante entre dans la cible.
 5. **P3 — RDNA4-only** : recréer ou marquer non supporté (§10.3).
 
-**Rappel de périmètre** : la v1 actuelle (Flash-Next + 27B, texte/vision/MTP)
-est complète pour ses chemins exercés ; l'écart de 238 rows est celui de la
-couverture multi-architectures, pas une régression de la v1.
+**Rappel de périmètre** : la v1 actuelle (Flash-Next + 27B + MiniCPM5-2B,
+texte/vision/MTP) est complète pour ses chemins exercés ; l'écart de
+**218 rows** est celui de la couverture multi-architectures, pas une régression
+de la v1.

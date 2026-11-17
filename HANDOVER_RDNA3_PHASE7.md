@@ -228,8 +228,10 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
      **4,48 → 12,73 tok/s** (2,84×). Reste un écart de ~40× au plancher de
      bande (10,5 µs) : la suite est de servir plusieurs lignes par tranche de
      poids (le débit est ~15 GB/s), pas une correction de contrat.
-   - **η lien = 1,7 %** (42 tok/s contre 2 545 tok/s), donc M2 non tenu, et le
-     plafond mesuré est `hc_read`, pas le MoE. Le **temps par row MoE est
+   - **η lien = 1,7 %** (42 tok/s contre 2 545 tok/s) **mesuré en W18, avant
+     le correctif `hc_read`** : le chiffre est caduc, le η de bout en bout est
+     à re-mesurer. Le plafond de W18 était `hc_read`, pas le MoE. Le **temps
+     par row MoE est
      mesuré depuis R23** : IQR 70,5 % de la bande à M=32, w4nl 51 % à M=16,
      10–12 % à M=1 (borné par le décodage treillis) — voir §10 du RAPPORT.
 2. **Optimisations restantes** : WMMA préfill (éteinte, 25–32 % plus lente),

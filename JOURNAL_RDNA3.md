@@ -1137,7 +1137,7 @@ l'ordre), **40,2 tok/s** sur 60 tokens, 69,0 tok/s sur 16, préfill
 `head_dim=128` (`attn_paged`/`kv_store` : bf16/f16/fp8 seulement) : le service
 du 2B utilise bf16.
 
-## 2026-11-17 — W24 : `qsa_score` à M=512, cause mesurée (pas d'optimisation gardée)
+## 2026-11-17 — W24 : `qsa_score` à M=512, cause mesurée (optimisation livrée en W28)
 
 Mesure à froid sur `w27-merge`, `--op qsa_score --bench` : médianes device
 **79,0 / 82,7 / 83,3 ms** sur trois passes (2 842–2 852 MHz, aucun throttler,
@@ -1214,7 +1214,9 @@ libref ; `qsa_score_device_test` 72 checks exacts.
 `w2a8` déclaré `U8` au lieu de `F16`, donc toujours sauté. Cas numérique ajouté
 au bande du drafter (**M=7**, plan joint en mémoire device, rel_l2 1,72e-03).
 Service : **32,20 tok/s contre 20,64** (1,56×), **texte identique au bit**,
-33 drafts acceptés sur 210 (15,7 %) ; kbench 2B 384/384, FN 968/968.
+33 drafts acceptés sur 210 (15,7 %) ; sur sa branche, kbench 2B 384/384 et FN
+968/968 (avant le fix d'intégration `gate_had_quant_i8g` ; l'arbre fusionné
+donne 948/948, voir plus bas).
 
 **W28b folds IQ8R (`4cbcd73`).** `gate_had_quant_i8g` 128/256 (la porte dans son
 propre opérande, deux rotations 128 et un amax par 256) et le fold
@@ -1250,13 +1252,3 @@ l'énumération des rows résolues, pas la couverture.
 **Doc.** `RAPPORT_RDNA3.md` entre dans le dépôt (décision prise) et ses
 §7.6/§10.4–10.5 sont révisés ; `docs/OPS.md` et `libr3d/README.md` étaient déjà
 à jour.
-
-
-
-
-
-
-
-
-
-
