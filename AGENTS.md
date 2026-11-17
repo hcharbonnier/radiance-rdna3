@@ -66,10 +66,21 @@
   corrigé (W20), `w26-vision` l'état FFmpeg/vision (R21 + R26), **`final-all`
   l'état de référence courant** (R21 + R22 + R23 + R25 + R26). Tout A/B se
   fait dans un **nouveau** répertoire avec un build neuf.
-- **Documents** : handover courant `HANDOVER_RDNA3_PHASE7.md` ; état détaillé
-  `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md`, `SUIVI_LOTS_RDNA3.md`,
-  `CHECKLIST_RDNA3.md`. `RAPPORT_RDNA3.md`, `PLAN_IMPLEMENTATION_RDNA3.md`,
-  `API_DISTANTE.md` et `HANDOVER_RDNA3.md` restent hors dépôt.
+- **Documents** : chacun a un rôle distinct, ne pas les fusionner ni en écrire
+  un sixième qui les répète.
+  - `JOURNAL_RDNA3.md` — journal horodaté, une entrée par jour travaillé : les
+    mesures **à leur date**, avec commande, horloges et état de l'arbre. Les
+    chiffres anciens y restent (c'est la trace), même corrigés depuis.
+  - `TABLEAU_REEL_IDEAL_RDNA3.md` — tableau réel/idéal par noyau et par poste
+    (M, forme, η, cause de l'écart). C'est la vue chiffrée de référence ; les
+    sections historiques y sont suivies de l'état courant.
+  - `SUIVI_LOTS_RDNA3.md` — suivi des lots W0→W28 et des jalons M0→M7 (état,
+    reste à faire), plus le registre des risques R1→R28.
+  - `RAPPORT_RDNA3.md` — rapport d'analyse : faisabilité, ISA, bornes, plan
+    d'optimisation, écart RDNA4→RDNA3 par famille (§10). §1–§9 sont
+    historiques et préfixés comme tels ; §7.5/§7.6 et §10 sont vivants.
+  - `MEMO_M0_RDNA3.md` — pièce de la décision M0 (Go/No-Go du spike IQR) ;
+    **document clos**, ne pas mettre à jour, il sert de trace de la décision.
 - **Langue** : documentation et rapports en français ; code et commentaires de
   code en anglais.
 
