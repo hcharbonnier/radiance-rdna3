@@ -193,6 +193,7 @@ flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
   ./build/tests/mtp_enter_e4m3_device_test && ./build/tests/logit_rerank_iqr_device_test && \
   ./build/tests/act_i8g_group256_device_test && ./build/tests/ple_hc_device_test && \
   ./build/tests/tp2_collectives_device_test && \
+  ./build/tests/attn_paged_device_test && \
   ./build/bin/r3d_selftest ./build/radiance_home/kernels/libr3d.so'
 ```
 
@@ -219,8 +220,11 @@ MiniCPM **1 802/1 802**, 0 échec (pires rel_l2 3,619e-03 / 1,520e-02 /
 3,485e-03) ; préfill 27B **288 tok/s** (spécialisation `GS=1`, `faa89fd`),
 Flash-Next long contexte 3 252 tokens **234,8 tok/s** ; cache de tune livré
 dans `build-clean/radiance_home/tune` (bf16 `impl=3`, **5,9×** sur les rows
-tiled). `final-all` est l'arbre **W26** (ne pas l'utiliser comme baseline de
-perf sans rebuild) ; détails dans `RAPPORT_REBASE_V2_1_0.md`.
+tiled) ; `attn_paged_device_test` **8/8** (h256 i8 decode/préfill, gqa6 bs16
+et gqa12 bs4, court + split) à **1 bf16 ULP** de libref — pas bit-exact, la
+décision de contrat reste ouverte avant les multi-rangées. `final-all` est
+l'arbre **W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ;
+détails dans `RAPPORT_REBASE_V2_1_0.md`.
 
 Recette 27B (dense, IQR) : `--kv-cache-dtype i8 --num-speculative-tokens 0`
 (le drafter h128 fenêtré réclame bf16), `--max-num-seqs 4` — le multi-séquence

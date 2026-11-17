@@ -238,6 +238,7 @@ gfx1151), comme attendu. Aucun doublon de row ou de schéma après le rebase
 | `act_i8g_group256_device_test` | 103 checks, 6 cas | — |
 | `ple_hc_device_test` | 48 checks, 8 cas | — |
 | `tp2_collectives_device_test` | 12 checks, 2 cas | — |
+| `attn_paged_device_test` | 8 checks, 8 cas (1 bf16 ULP, pas bit-exact) | — |
 | `moe_iqr_device_test` / `moe_w4nl_device_test` | exact (bf16) | — |
 | `qsa_*_device_test` | block_key 640 valeurs ; score 72 checks ; select 781 checks ; work 819 checks | — |
 | `router_fused_device_test` | 38 checks, 8 cas | — |
@@ -457,10 +458,14 @@ La branche reste volontairement très au-dessus de `main` : **142 fichiers,
 6. Si `main` corrige `down_w5_fp8` ou `ngram_ids` différemment, prendre sa
    version au prochain rebase (les commits `5e98eb9` et `c11c451` sont
    identifiables et peuvent être abandonnés).
-7. **Après GS=1** : les noyaux et les tunes 27B/Flash-Next sont re-mesurés
-   (§5.5) ; reste à mettre à jour `AGENTS.md`,
-   `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md` et
-   `SUIVI_LOTS_RDNA3.md` (195 rows, `main` 2.1.0, GS=1, état W29).
+7. **Fait** : `AGENTS.md`, `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md`
+   et `SUIVI_LOTS_RDNA3.md` sont à jour (195 rows, `main` 2.1.0, GS=1, W29).
+   Reste la décision push/merge et la soumission amont.
+8. **Attention** : `attn_paged_device_test` couvre désormais les rows h256 i8
+   (gqa6 bs16, gqa12 bs4, décodage/préfill, court + split) à **8/8**, avec un
+   accord à **1 bf16 ULP** de libref — **pas bit-exact**. Trancher le contrat
+   (tolérance vs ordre) avant les multi-rangées/GQA/hoisting ; kbench ne
+   chronomètre toujours pas l'attention.
 
 ---
 

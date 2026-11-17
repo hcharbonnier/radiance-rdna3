@@ -217,6 +217,11 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   linéarité en M est le travail d'un GEMV par rangée (normalisation + décodage
   E4M3 + dot), pas un défaut de parallélisme. À M≤4 : 186–512 µs, <0,5 % du
   token ; profiler le graphe servi avant toute refonte.
+- **R34** — *couvert (W29), décision ouverte* : `attn_paged_device_test`
+  couvre les rows h256 i8 (gqa6 bs16, gqa12 bs4) en décodage/préfill, court et
+  split : **8/8**, accord à **1 bf16 ULP** de libref, **pas bit-exact**. La row
+  revendique le bit-exact ; trancher tolérance vs ordre avant toute
+  optimisation multi-rangées (kbench ne chronomètre toujours pas l'attention).
 
 ## W29 — rebase `main` 2.1.0 + GS=1 (2026-11-17)
 
