@@ -1675,9 +1675,11 @@ static int64_t attn_scratch(const RadArgs* a) {
     return want < cap ? want : cap;
 }
 
-/* Split-KV partials for the head_dim-256 int8 decode row: 256 accumulator floats plus the
- * running max and sum (260 floats) per (query row, head, slice), at the band's widest split (16)
- * and capped at 16 MiB. Attaching scratch makes the row non-concurrent, as for the h128 decode. */
+/* Split-KV partials for the head_dim-256 int8 rows: 256 accumulator floats plus the running max
+ * and sum (260 floats) per (query row, head, slice), at the widest split the arena hint asks for
+ * (16) and capped at 16 MiB. Both bands use the arena (decode at q_len 1, prefill for a short
+ * chunk over a long context) and the shim halves the ladder until it fits, down to splits = 1.
+ * Attaching scratch makes the row non-concurrent, as for the h128 decode. */
 static int64_t attn_h256_scratch(const RadArgs* a) {
     if (!a || a->n_t < 1 || a->t[0].rank == 0) return 0;
     long long n_head = 0, head_dim = 0;
@@ -4690,8 +4692,10 @@ static const RadKernelInfo kKernels[] = {
  * The head_dim-256 int8 body, banded on q_len and paired by geometry. Four lanes own one output
  * row (64 dims each); a workgroup carries 4 tokens (gqa 12 / decode), 8 (gqa 6 / decode,
  * gqa 12 / prefill) or 16 (gqa 6 / prefill), so every staged cache block is shared by all of a
- * tile's rows in one KV head. The decode row split-KVs into 260-float records; the prefill row is
- * a single pass. Both read the cache's per-slot f16 K/V scales and have no descale planes.
+ * tile's rows in one KV head. Both rows split-KV into 260-float records when the engine offers a
+ * scratch arena: decode needs it to fill the card at q_len 1, and prefill needs it because a short
+ * chunk fixes the tile count while the key walk grows with the context. Both read the cache's
+ * per-slot f16 K/V scales and have no descale planes.
  */
 { "attn_paged_i8_h256_gqa12_decode", "attn_paged", "attn",
   "paged attention over an int8 head_dim-256 cache, 24 query heads over 2 KV heads, 4-token "
@@ -4709,13 +4713,13 @@ static const RadKernelInfo kKernels[] = {
 
 { "attn_paged_i8_h256_gqa12_prefill", "attn_paged", "attn",
   "the same int8 head_dim-256 body over a prefill chunk, 24 query heads over 2 KV heads",
-  "head_dim 256; gqa 12; block_size 4; q_len >= 17; six waves a workgroup (8 tokens a tile); no "
-  "split pass",
+  "head_dim 256; gqa 12; block_size 4; q_len >= 17; six waves a workgroup (8 tokens a tile); "
+  "split-KV over the key range when the engine offers a scratch arena",
   "bf16 q and out, i8 cache with per-slot f16 K/V scales (no descales), i32 block_table and "
   "seqused",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_PREFILL,
   ROW(cAttnH256Gqa12Prefill), NOTUNE,
-  nullptr, nullptr, r3d_rad_attn_prefill_h256, nullptr, nullptr, nullptr,
+  nullptr, nullptr, r3d_rad_attn_prefill_h256, attn_h256_scratch, nullptr, nullptr,
   r3d_shape_attn_paged_i8 },
 
 { "attn_paged_i8_h256_gqa6_decode", "attn_paged", "attn",
@@ -4732,13 +4736,13 @@ static const RadKernelInfo kKernels[] = {
 
 { "attn_paged_i8_h256_gqa6_prefill", "attn_paged", "attn",
   "the same int8 head_dim-256 body over a prefill chunk at the 27B geometry",
-  "head_dim 256; gqa 6; block_size 16; q_len >= 17; six waves a workgroup (16 tokens a tile); no "
-  "split pass",
+  "head_dim 256; gqa 6; block_size 16; q_len >= 17; six waves a workgroup (16 tokens a tile); "
+  "split-KV over the key range when the engine offers a scratch arena",
   "bf16 q and out, i8 cache with per-slot f16 K/V scales (no descales), i32 block_table and "
   "seqused",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_PREFILL,
   ROW(cAttnH256Gqa6Prefill), NOTUNE,
-  nullptr, nullptr, r3d_rad_attn_prefill_h256, nullptr, nullptr, nullptr,
+  nullptr, nullptr, r3d_rad_attn_prefill_h256, attn_h256_scratch, nullptr, nullptr,
   r3d_shape_attn_paged_i8 },
 
 

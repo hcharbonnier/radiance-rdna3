@@ -58,11 +58,13 @@
  * reference's two-pass form: the dot is recomputed with the same operands in the same order.
  * `nkeys * kRows <= kScores` is a workgroup-uniform decision, so both paths compute the same bytes.
  *
- * Split-KV (decode only) stores four-lane partial rows of 260 floats (256 accumulators, sum,
- * max) and a second kernel rescales them. splits = 1 is the reference's key order; splits > 1
- * changes the softmax's parentheses and is the documented last-ulp departure. The shim lowers
- * splits until the arena the engine offers fits, down to 1, so the band is never refused for lack
- * of scratch.
+ * Split-KV stores four-lane partial rows of 260 floats (256 accumulators, sum, max) and a second
+ * kernel rescales them. splits = 1 is the reference's key order; splits > 1 changes the softmax's
+ * parentheses and is the documented last-ulp departure. Both entries use it: decode needs it to
+ * fill the card at q_len 1, and prefill needs it because a short chunk fixes the tile count (17
+ * tokens is two 16-token tiles, eight workgroups) and leaves the whole key walk serial. The shim
+ * lowers splits until the arena the engine offers fits, down to 1, so no band is ever refused for
+ * lack of scratch.
  *
  * ============================== what the shims refuse ==============================
  *
@@ -690,6 +692,19 @@ int pick_splits(int tiles, int num_seqs, int kv_heads)
     return sp;
 }
 
+/* The prefill band's ladder. Its tile count is fixed by the chunk length -- 17 tokens is two
+ * tiles, eight workgroups at gqa 6 -- while the work grows with the context, so key splits are
+ * the only lever that scales there. The target is the 128 workgroups a 96-CU card holds at six
+ * waves; a slice past the cache's block count carries no key (the caller clamps it away), and the
+ * shim halves the ladder when the arena does not fit. */
+int pick_prefill_splits(int tiles, int num_seqs, int kv_heads)
+{
+    const long long groups = (long long)tiles * num_seqs * kv_heads;
+    int sp = 1;
+    while (sp < kSplitMax && groups * sp < 128) sp *= 2;
+    return sp;
+}
+
 int launch(const Args& A, long stream)
 {
     const int gqa = A.n_head / A.kv_heads;
@@ -775,17 +790,16 @@ extern "C" int r3d_attn_prefill_h256(long q, long kv, long bt, long seqused, lon
                                      int num_seqs, int q_len, int head_dim, int gqa, int n_head,
                                      int block_size, int bt_cols, int bt_rs, int bt_cs,
                                      int max_ctx, int window, int causal, float scale, int kv_dt,
-                                     long q_ld, long out_ld, long scratch, long stream)
+                                     long q_ld, long out_ld, int splits, long scratch, long stream)
 {
-    (void)scratch;
+    if (splits < 0) return -2;
     Args A;
     const int e = fill(A, q, kv, bt, seqused, cu, out, cu ? q_len : 0, num_seqs,
                        cu ? 0 : q_len, head_dim, gqa, n_head, block_size, bt_cols, bt_rs, bt_cs,
-                       max_ctx, window, causal, scale, kv_dt, q_ld, out_ld, 1, 0);
+                       max_ctx, window, causal, scale, kv_dt, q_ld, out_ld,
+                       splits > 0 ? splits : 1, scratch);
     if (e) return e;
     A.band = 1;
-    A.splits = 1;
-    A.part = nullptr;
     return launch(A, stream);
 }
 
@@ -874,12 +888,16 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
     if (!r3d_aligned(Q->data, 16) || !r3d_aligned(KV->data, 4) || !r3d_aligned(O->data, 16))
         return R3D_NO(RAD_E_ALIGN);
 
-    int splits = decode ? 0 : 1;
     const long long per = ragged ? (rows + n_seq - 1) / n_seq : q_len;
     const int waves = decode ? 3 : 6;
     const int tpb = kRowsWave * waves / gqa;
     const int tiles = (int)((per + tpb - 1) / tpb);
-    if (splits == 0) splits = pick_splits(tiles, (int)n_seq, kv_heads);
+    int splits = decode ? pick_splits(tiles, (int)n_seq, kv_heads)
+                        : pick_prefill_splits(tiles, (int)n_seq, kv_heads);
+    /* A slice past the cache's block count holds no key: it would only write an empty partial
+     * record. */
+    const int max_blocks = (int)((max_ctx + block_size - 1) / block_size);
+    if (splits > max_blocks) splits = max_blocks;
     if (splits > kSplitMax) splits = kSplitMax;
     if (splits > 1) {
         for (;;) {
@@ -902,7 +920,8 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
                                 r3d_addr(CU), r3d_addr(O), (int)n_seq,
                                 (int)(ragged ? rows : q_len), head_dim, gqa, n_head, block_size,
                                 (int)bt_cols, (int)bt_rs, (int)bt_cs, max_ctx, window, causal,
-                                scale, (int)KV->dtype, qld, old, (long)(uintptr_t)nullptr,
+                                scale, (int)KV->dtype, qld, old, splits,
+                                (long)(uintptr_t)(splits > 1 ? a->scratch : nullptr),
                                 (long)(uintptr_t)s);
     if (e == 0) return RAD_OK;
     return R3D_NO(e == -1 ? RAD_E_DTYPE : e == -2 ? RAD_E_SHAPE
