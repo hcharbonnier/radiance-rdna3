@@ -368,3 +368,64 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 
 Si la cible se limite au **27B texte**, seuls 5.1–5.7 et 8.1/8.5–8.7 restent ;
 le reste concerne Flash-Next.
+
+## D. Écart RDNA4 → RDNA3 : kernels à porter ou recréer (2026-11-17)
+
+Mesure à l'état `de81ffe` : `libr4d/r4d_rows.cpp` (**457 rows, 274 ops**) contre
+`libr3d/r3d_rows.cpp` (**164 rows, 101 ops**), soit **238 rows / 179 ops** sans
+équivalent RDNA3. La liste complète (op par op, famille par famille) est dans
+`RAPPORT_RDNA3.md` §10 ; cette section est la feuille de route.
+
+- **La cible v1 actuelle n'a aucun op manquant** sur ses chemins exercés
+  (kbench 968/968, 683/683 ; selftest 164/0/15). Les lignes ci-dessous sont
+  conditionnées par le périmètre multi-architectures.
+- [ ] **D0 — décider le périmètre** : toutes les architectures `arch/` (238
+      rows) ou seulement la cible v1 + l'artefact IQ8R ? Sans cette décision,
+      D5–D9 restent hors engagement.
+- [ ] **D1 — IQ8R groupe 256 (MiniCPM5-2B, non-IQR)** : `rmsnorm_had_quant_iq8r`,
+      `ar_rmsnorm_had_quant_iq8r`, `gate_had_quant_iq8r`, le producteur non
+      groupé `rmsnorm_had_quant_i8`, `rmsnorm_quant_i8g`, et les variantes
+      **groupe 256** de `gemm_nt_q`/`gemm_nt_q_gated` en `i8a8h` (les rows
+      actuelles n'acceptent que 128). Test : le 2B charge et sert à `NS=0`.
+- [ ] **D2 — DSpark (MiniCPM5 à NS > 0)** : `dflash_conv`,
+      `dflash_markov_greedy`, `dflash_markov_greedy_f32`, `dflash_tree` ; plus
+      `row_topk_merge`, `sample_merge_topk`, `pair_argmax` si le sélecteur les
+      demande. Inutile pour R9 à `NS=0`.
+- [ ] **D3 — multi-carte (`tp>1`)** : `all_reduce`, `all_gather` et les fusions
+      `ar_*` (**18 rows**, 2 ops). Sans objet sur une carte, requis pour
+      `tp=2/4`.
+- [ ] **D4 — streaming KV** : `kv_store_streamed` (fp8/i8/bf16) et
+      `kv_resolve_i32` ; le tier hôte actuel n'en a pas besoin.
+- [ ] **D5 — attention/KV des autres architectures (30 ops, 58 rows)** :
+      `attn_cross`, `attn_local_rel`, `attn_na3d`, `attn_paged_gate_{quant,had_quant}`,
+      `attn_paged_qrow{,_tree}`, `attn_prefix_self`, `attn_vsa`, `dsa_{pool,query,score}`,
+      `embed_attn`, `kv_resolve`, `kv_store_streamed`, `ministral_rope`, `mla_*`,
+      `pixtral_rope`, `position_scale`, `qk_norm_rope*`, `qkv_norm_rope*`,
+      `rope_rows`, `sam_attn`, `vsa_select`.
+- [ ] **D6 — normes et quantisation (21 + 11 ops, 36 rows)** :
+      `add_rmsnorm`, `group_norm`, `join_add_scale`, `l2norm_chan`, `ln_mod*`,
+      `mhc_*`, `norm_add_norm*`, `pixel_norm`, `ple_conv_bias`, `rms_mod*`,
+      `rmsnorm_p`, `rmsnorm_rows`, `gate_{quant_fp8,had_quant_i8g}`,
+      `gelu_mul_quant_i8g`, `gram_accum`, `rmsnorm_had_quant_i8`, `rmsnorm_quant_i8g`.
+- [ ] **D7 — MoE/router inverses (4 ops)** : `moe_gather_inv`, `moe_scatter_inv`,
+      `router_sigmoid_group_topk`, `router_sigmoid_topk_scatter`.
+- [ ] **D8 — sampler/sélection (4 ops)** : `sample_chain`, `sample_merge_topk`,
+      `cfg_topk_sample`, `pair_argmax`.
+- [ ] **D9 — média et génération (hors v1 sauf cible)** : `elem` (**85 ops**,
+      dont `gelu_mul`, `gelu_quick`, `gelu_tanh`, `mul_weight`, `scale_rows`,
+      `seg_*`, `snake*`, `swiglu_*`, `flow_*`, `conv2d`, `patch_*`, `vtile_*`,
+      `tile_*`), `conv` (6), `vision` (`pixtral_merge`), `draft`/`dflash` (8),
+      `gemm`/`lora` (4), `gdn` (`kda_update`, `ssd_update`), `misc` (`prefetch`).
+- [ ] **D10 — rows RDNA4-only à recréer pour gfx11** : `lora_*_wmma`,
+      `mla_attn_rows/matrix_bf16` et variantes `_fp8kv`, `dsa_score_fp8`
+      (`dsa_pool`/`dsa_query` à vérifier), `dequant_w4_bf16` (fragments WMMA),
+      `moe_gemm_{w4a8,i8a8,w4a8i8}*` et `_mod4` (le RDNA3 a des équivalents
+      IQR/`w4nl`, pas ces formats). Écrire
+      `v_dot4`/`v_mfma_f32_16x16x16_bf16` ou déclarer la forme non servie.
+      Liste non exhaustive : vérifier le fichier `libr4d/r4d_*.hip` de chaque
+      row manquante avant de la classer portable ou à recréer.
+
+Ordre recommandé : **D1 → D2** (artefact non-IQR), **D3** si multi-carte,
+**D5–D8** si une architecture correspondante entre dans la cible, **D9–D10**
+en dernier. Ne pas rouvrir les rows déjà servies (IQR, `w4nl`, paged h128/h256,
+QSA, vision Qwen, MTP) : elles ne font pas partie de l'écart.
