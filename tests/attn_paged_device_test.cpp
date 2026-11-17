@@ -233,6 +233,86 @@ bool case_ok(const char* name, int n_head, int gqa, int hd, int block_size, int 
     return exact ? same_bf16(a, b, name) : close_bf16(a, b, name, 0.02f, 0.02f);
 }
 
+/* Device timing for the attention row, no oracle: warm up, then the median of
+ * three 20-launch batches. Used with RAD_ATTN_BENCH=1 to fill the gap kbench
+ * leaves (libref declines the paged operands). */
+bool bench_case(const char* name, int n_head, int gqa, int hd, int block_size, int q_len,
+                int ctx) {
+    char prefix[64];
+    std::snprintf(prefix, sizeof prefix, "attn_paged_i8_h256_gqa%d_%s", gqa,
+                  q_len <= 16 ? "decode" : "prefill");
+    const RadKernelInfo* kd = g_r3d.find("attn_paged", RAD_DOMAIN_DEVICE, prefix);
+    if (!kd) return true;
+    const int kv_heads = n_head / gqa;
+    const int blocks = (ctx + block_size - 1) / block_size;
+    const int row_bytes = 2 * hd + 4;
+    const size_t qn = (size_t)q_len * n_head * hd;
+    const size_t kvn = (size_t)blocks * kv_heads * block_size * row_bytes;
+
+    auto qh = rand_bf16(qn, 11u + (unsigned)q_len);
+    std::vector<int8_t> kvh(kvn);
+    std::mt19937 rng(13u + (unsigned)block_size);
+    std::uniform_int_distribution<int> U(-127, 127);
+    for (size_t i = 0; i < (size_t)blocks * kv_heads * block_size; ++i) {
+        int8_t* slot = (int8_t*)&kvh[i * row_bytes];
+        for (int d = 0; d < 2 * hd; ++d) slot[d] = (int8_t)U(rng);
+        const uint16_t sc = 0x2118u;
+        std::memcpy((uint8_t*)slot + 2 * hd, &sc, 2);
+        std::memcpy((uint8_t*)slot + 2 * hd + 2, &sc, 2);
+    }
+    std::vector<int32_t> bth((size_t)blocks);
+    for (int b = 0; b < blocks; ++b) bth[b] = b;
+    std::vector<int32_t> suh = { ctx };
+    std::vector<int32_t> cuh = { 0, q_len };
+
+    Dev dq(qn * 2), dkv(kvn), dbt((size_t)blocks * 4), dsu(4), dcu(8), dout(qn * 2);
+    up(dq, qh.data(), dq.bytes); up(dkv, kvh.data(), dkv.bytes);
+    up(dbt, bth.data(), dbt.bytes); up(dsu, suh.data(), dsu.bytes);
+    up(dcu, cuh.data(), dcu.bytes);
+
+    auto p = std::vector<RadParam>{
+        pi("q_len", q_len), pi("head_dim", hd), pi("gqa", gqa), pi("block_size", block_size),
+        pi("causal", 1), pi("window", 0), ps("q_dtype", "bf16"), ps("kv_dtype", "i8"),
+        pf("scale", 1.0 / std::sqrt((double)hd)), pi("max_ctx", ctx),
+        pi("n_head", n_head), pi("max_seqs", 1), pi("prefill_fp8", 0)
+    };
+    std::vector<RadTensor> t = {
+        ten(dq.p, RAD_BF16, { q_len, n_head, hd }),
+        ten(dkv.p, RAD_I8, { blocks, kv_heads, block_size, row_bytes }),
+        ten(dbt.p, RAD_I32, { 1, blocks }), ten(dsu.p, RAD_I32, { 1 }),
+        ten(nullptr, RAD_F32, { 0 }), ten(nullptr, RAD_F32, { 0 }),
+        ten(q_len > 1 ? dcu.p : nullptr, RAD_I32, { q_len > 1 ? 2 : 0 }),
+        ten(dout.p, RAD_BF16, { q_len, n_head, hd })
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof a);
+    a.t = t.data();
+    a.n_t = (int)t.size();
+    a.p = p.data();
+    a.n_p = (int)p.size();
+
+    for (int i = 0; i < 5; ++i) kd->launch(&a, (RadStream)0);
+    hipDeviceSynchronize();
+    float best = 1e30f;
+    for (int batch = 0; batch < 3; ++batch) {
+        hipEvent_t e0, e1;
+        hipEventCreate(&e0);
+        hipEventCreate(&e1);
+        hipEventRecord(e0, (hipStream_t)0);
+        for (int i = 0; i < 20; ++i) kd->launch(&a, (RadStream)0);
+        hipEventRecord(e1, (hipStream_t)0);
+        hipEventSynchronize(e1);
+        float ms = 0.0f;
+        hipEventElapsedTime(&ms, e0, e1);
+        hipEventDestroy(e0);
+        hipEventDestroy(e1);
+        if (ms < best) best = ms;
+    }
+    std::printf("ATTNBENCH %-22s ctx=%6d q=%3d  %8.1f us\n", name, ctx, q_len,
+                best * 1000.0f / 20.0f);
+    return true;
+}
+
 }  // namespace
 
 /* Observed on gfx1100: every case agrees with ref_attn_paged within one bf16
@@ -279,6 +359,20 @@ TEST(attn_paged_h256_gqa12_block4_decode_split_matches_libref_within_bf16) {
 TEST(attn_paged_h256_gqa12_block4_prefill_split_matches_libref_within_bf16) {
     if (!ready()) return;
     CHECK(case_ok("h256/gqa12/bs4 prefill split", 24, 12, 256, 4, 17, 32, false));
+}
+
+TEST(attn_paged_h256_bench) {
+    if (!std::getenv("RAD_ATTN_BENCH")) return;
+    if (!ready()) return;
+    bench_case("gqa6/bs16 decode", 24, 6, 256, 16, 1, 512);
+    bench_case("gqa6/bs16 decode", 24, 6, 256, 16, 1, 2048);
+    bench_case("gqa6/bs16 decode", 24, 6, 256, 16, 1, 8192);
+    bench_case("gqa6/bs16 decode", 24, 6, 256, 16, 1, 32768);
+    bench_case("gqa12/bs4 decode", 24, 12, 256, 4, 1, 512);
+    bench_case("gqa12/bs4 decode", 24, 12, 256, 4, 1, 8192);
+    bench_case("gqa12/bs4 decode", 24, 12, 256, 4, 1, 32768);
+    bench_case("gqa6/bs16 prefill", 24, 6, 256, 16, 17, 2048);
+    bench_case("gqa6/bs16 prefill", 24, 6, 256, 16, 17, 8192);
 }
 
 RAD_TEST_MAIN()
