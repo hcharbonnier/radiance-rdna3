@@ -397,6 +397,14 @@ TEST(attn_paged_h256_bench) {
     bench_case("gqa12/bs4 decode", 24, 12, 256, 4, 1, 32768);
     bench_case("gqa6/bs16 prefill", 24, 6, 256, 16, 17, 2048);
     bench_case("gqa6/bs16 prefill", 24, 6, 256, 16, 17, 8192);
+    bench_case("gqa6/bs16 prefill", 24, 6, 256, 16, 17, 32768);
+    bench_case("gqa6/bs16 prefill", 24, 6, 256, 16, 128, 2048);
+    bench_case("gqa6/bs16 prefill", 24, 6, 256, 16, 128, 8192);
+    bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 17, 2048);
+    bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 17, 8192);
+    bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 17, 32768);
+    bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 128, 2048);
+    bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 128, 8192);
 }
 
 RAD_TEST_MAIN()
