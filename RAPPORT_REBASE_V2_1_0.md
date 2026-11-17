@@ -349,6 +349,15 @@ Correction validée : `iqr_device_test`, `iqr_parity_test` et
 température 0) est **identique** entre l'arbre W27 sans GS=1 et l'arbre
 patché (`choices` égales). L'IQ8R (groupe 256) garde le chemin `GS=2`, inchangé.
 
+Autres noyaux mesurés sur le build patché : IQR tiled Flash-Next
+**2 053,8 µs** (12288×2560 M=512) et **2 675,9 µs** (16384×2560), identiques à
+W26 ; MoE **231,2 µs** (M=1) / **4 009 µs** (M=512) ; bf16 défaut inchangé
+(776,8 / 788,4 µs) ; **`hc_read` 355,1 µs / 12 323,5 µs** grâce à W21
+(5–9× mieux que W26) ; `mtp_enter` **186,2 µs / 59 385 µs** (linéaire,
+inchangé) ; `logit_rerank` 32,9 µs. La géométrie `qsa_score` des fixtures a
+changé (n=128, heads=4, blocks=65 536, seqs=8 : 85,3 / 400,0 µs) et n'est pas
+comparable aux chiffres W26.
+
 Le rebase est donc validé en **correction et en performance**, et la dette de
 préfill W27 est soldée.
 
@@ -423,9 +432,10 @@ La branche reste volontairement très au-dessus de `main` : **142 fichiers,
 2. **Fait** : les noyaux ont été re-mesurés (§5.5). Le GEMV est inchangé ; le
    rebuild **pre-rebase (W27)** donne 249 tok/s et 4,49 ms, identique au
    post-rebase. L'écart avec `final-all` (285 tok/s, 3,84 ms) était la dette
-   W27, pas le rebase ; le patch GS=1 restaure 3 839 µs et 288 tok/s. Reste à
-   re-mesurer bf16/vision, MoE, `hc_read`, `mtp_enter`, QSA et l'attention sur
-   le build patché.
+   W27, pas le rebase ; le patch GS=1 restaure 3 839 µs et 288 tok/s. bf16,
+   MoE, `hc_read`, `mtp_enter`, QSA et `logit_rerank` ont été re-mesurés sur le
+   build patché (§5.5) ; l'attention reste sans couverture kbench (seul le
+   service long-contexte l'exerce).
 3. **Fait (`faa89fd`)** : spécialisation `GS == 1` (noyau resident restauré de
    W26, `GS=2` conservé pour IQ8R). kbench **27B 3 181/3 181**, **Flash-Next
    4 786/4 786**, **MiniCPM 1 802/1 802**, 0 échec ; texte 27B identique ;
@@ -443,11 +453,10 @@ La branche reste volontairement très au-dessus de `main` : **142 fichiers,
 6. Si `main` corrige `down_w5_fp8` ou `ngram_ids` différemment, prendre sa
    version au prochain rebase (les commits `5e98eb9` et `c11c451` sont
    identifiables et peuvent être abandonnés).
-7. **Après GS=1** : re-mesurer bf16/vision, MoE, `hc_read`, `mtp_enter`, QSA et
-   l'attention sur `build-clean` patché ; rejouer `rad-tune` sur Flash-Next ;
-   mettre à jour `AGENTS.md`, `TABLEAU_REEL_IDEAL_RDNA3.md`,
-   `JOURNAL_RDNA3.md` et `SUIVI_LOTS_RDNA3.md` (195 rows, `main` 2.1.0,
-   GS=1, état W29).
+7. **Après GS=1** : les noyaux sont re-mesurés (§5.5) ; reste à rejouer
+   `rad-tune` sur Flash-Next et à mettre à jour `AGENTS.md`,
+   `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md` et
+   `SUIVI_LOTS_RDNA3.md` (195 rows, `main` 2.1.0, GS=1, état W29).
 
 ---
 
