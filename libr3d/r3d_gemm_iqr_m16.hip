@@ -65,15 +65,17 @@ using namespace r3d_iqr_dev;
 constexpr int kIqrWave = 32;
 constexpr int kMTMax = 16;
 
-template <class F, int MT>
+template <class F, int MT, int GS>
 __global__ void __launch_bounds__(kIqrWave) R3D_WAVES(4)
 gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
                     const uint8_t* __restrict__ b, const uint8_t* __restrict__ bs,
                     uint16_t* __restrict__ y, int M, int N, int K, int a_ld, int y_ld,
                     uint32_t run_tiles) {
+    static_assert(GS == 1 || GS == 2, "a scale group is one or two 128-K blocks");
     const uint32_t lane = threadIdx.x & (kIqrWave - 1);
     const uint32_t rt = blockIdx.x;
     const uint32_t nkb = (uint32_t)(K / 128);
+    const uint32_t ngrp = nkb / (uint32_t)GS;
     Ctx c;
     c.W = b;
     c.S = bs;
@@ -81,6 +83,8 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
     c.nkb = nkb;
     c.run_tiles = run_tiles;
     c.tab = nullptr;
+    c.ngrp = ngrp;
+    c.gs = (uint32_t)GS;
 
     /* One 16x128 int8 tile, the GEMV's row partials (a stride of 33 words avoids a 16-way bank
      * conflict when the 16 row owners read one lane column), and the form's table when it has one. */
@@ -97,24 +101,29 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
 
     if constexpr (MT == 1) {
         float acc = 0.0f;
-        for (uint32_t kb = 0; kb < nkb; ++kb) {
-            const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
-            uint32_t w[16];
-            Dec<F>::rows(r, c, 1.0f, w);
-            Dec<F>::unzero(c, rt, kb, w);
-            const uint32_t a4 = *(const uint32_t*)(a + kb * 128 + 4u * lane);
+        for (uint32_t g = 0; g < ngrp; ++g) {
+            int sub = 0;
+            for (int j = 0; j < GS; ++j) {
+                const uint32_t kb = g * GS + (uint32_t)j;
+                const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
+                uint32_t w[16];
+                Dec<F>::rows(r, c, 1.0f, w);
+                Dec<F>::unzero(c, rt, kb, w);
+                const uint32_t a4 = *(const uint32_t*)(a + kb * 128 + 4u * lane);
 #pragma unroll
-            for (int q = 0; q < 16; ++q) sP[q * 33 + lane] = dot4_i8(a4, w[q], 0);
-            __syncthreads();
+                for (int q = 0; q < 16; ++q) sP[q * 33 + lane] = dot4_i8(a4, w[q], 0);
+                __syncthreads();
+                if (lane < 16) {
+#pragma unroll
+                    for (int l = 0; l < 32; ++l) sub += sP[lane * 33 + l];
+                }
+                __syncthreads();
+            }
             if (lane < 16) {
-                int sub = 0;
-#pragma unroll
-                for (int l = 0; l < 32; ++l) sub += sP[lane * 33 + l];
-                const float sa = as[kb];   /* M = 1: every weight row shares the token's scale */
-                const float sb = fold_f32<F>(c, row0 + lane, kb);
+                const float sa = as[g];   /* M = 1: every weight row shares the token's scale */
+                const float sb = fold_f32<F>(c, row0 + lane, g * GS);
                 acc += (float)sub * sa * sb;
             }
-            __syncthreads();
         }
         if (lane < 16)
             y[(long long)0 * y_ld + row0 + lane] =
@@ -127,15 +136,36 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
 #pragma unroll
     for (int i = 0; i < NP; ++i) acc[i] = 0.0f;
 
-    for (uint32_t kb = 0; kb < nkb; ++kb) {
-        const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
-        uint32_t w[16];
-        Dec<F>::rows(r, c, 1.0f, w);
-        Dec<F>::unzero(c, rt, kb, w);
+    for (uint32_t g = 0; g < ngrp; ++g) {
+        int sub[NP];
 #pragma unroll
-        for (int q = 0; q < 16; ++q) *(uint32_t*)(sW + q * 128 + 4u * lane) = w[q];
-        __syncthreads();
+        for (int i = 0; i < NP; ++i) sub[i] = 0;
+        for (int j = 0; j < GS; ++j) {
+            const uint32_t kb = g * GS + (uint32_t)j;
+            const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
+            uint32_t w[16];
+            Dec<F>::rows(r, c, 1.0f, w);
+            Dec<F>::unzero(c, rt, kb, w);
+#pragma unroll
+            for (int q = 0; q < 16; ++q) *(uint32_t*)(sW + q * 128 + 4u * lane) = w[q];
+            __syncthreads();
 
+#pragma unroll
+            for (int i = 0; i < NP; ++i) {
+                const int p = (int)lane + kIqrWave * i;
+                if constexpr (MT * 16 < kIqrWave) {
+                    if (p >= MT * 16) continue;
+                }
+                const int m = p / 16, q = p % 16;
+                if (m >= M) continue;
+                const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
+                const uint32_t* wp = (const uint32_t*)(sW + q * 128);
+#pragma unroll
+                for (int c4 = 0; c4 < 32; ++c4)
+                    sub[i] = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub[i]);
+            }
+            __syncthreads();
+        }
 #pragma unroll
         for (int i = 0; i < NP; ++i) {
             const int p = (int)lane + kIqrWave * i;
@@ -144,17 +174,10 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
             }
             const int m = p / 16, q = p % 16;
             if (m >= M) continue;
-            int sub = 0;
-            const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
-            const uint32_t* wp = (const uint32_t*)(sW + q * 128);
-#pragma unroll
-            for (int c4 = 0; c4 < 32; ++c4)
-                sub = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub);
-            const float sa = as[m * nkb + kb];
-            const float sb = fold_f32<F>(c, row0 + q, kb);
-            acc[i] += (float)sub * sa * sb;
+            const float sa = as[m * (int)ngrp + (int)g];
+            const float sb = fold_f32<F>(c, row0 + q, g * GS);
+            acc[i] += (float)sub[i] * sa * sb;
         }
-        __syncthreads();
     }
 
 #pragma unroll
@@ -190,15 +213,17 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
 constexpr int kIqrResidentWaves = 4;   /* 16-token slices a workgroup: 64 tokens a weight tile */
 constexpr int kIqrSWPitch = 33;        /* dwords a staged weight row: 33 mod 32 = 1, bank-free */
 
-template <class F, int W>
+template <class F, int W, int GS>
 __global__ void __launch_bounds__(W * kIqrWave) R3D_WAVES(4)
 gemm_iqr_resident_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
                          const uint8_t* __restrict__ b, const uint8_t* __restrict__ bs,
                          uint16_t* __restrict__ y, int M, int N, int K, int a_ld, int y_ld,
                          uint32_t run_tiles) {
+    static_assert(GS == 1 || GS == 2, "a scale group is one or two 128-K blocks");
     const uint32_t lane = threadIdx.x & (kIqrWave - 1);
     const uint32_t wave = threadIdx.x / kIqrWave;
     const uint32_t nkb = (uint32_t)(K / 128);
+    const uint32_t ngrp = nkb / (uint32_t)GS;
     const uint32_t nm = ((uint32_t)M + 16u * W - 1u) / (16u * W);
     /* Consecutive blocks share a weight tile, so the L2 stream a group of blocks reads is one. */
     const uint32_t rt = (uint32_t)blockIdx.x / nm;
@@ -210,6 +235,8 @@ gemm_iqr_resident_kernel(const int8_t* __restrict__ a, const float* __restrict__
     c.nkb = nkb;
     c.run_tiles = run_tiles;
     c.tab = nullptr;
+    c.ngrp = ngrp;
+    c.gs = (uint32_t)GS;
 
     /* The decoded 16x128 int8 tile, shared by the workgroup's W slices, and the form's table. */
     __shared__ uint32_t sW[16 * kIqrSWPitch];
@@ -226,34 +253,46 @@ gemm_iqr_resident_kernel(const int8_t* __restrict__ a, const float* __restrict__
 #pragma unroll
     for (int i = 0; i < NP; ++i) acc[i] = 0.0f;
 
-    for (uint32_t kb = 0; kb < nkb; ++kb) {
-        if (wave == 0) {
-            const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
-            uint32_t w[16];
-            Dec<F>::rows(r, c, 1.0f, w);
-            Dec<F>::unzero(c, rt, kb, w);
+    for (uint32_t g = 0; g < ngrp; ++g) {
+        int sub[NP];
 #pragma unroll
-            for (int q = 0; q < 16; ++q) sW[q * kIqrSWPitch + lane] = w[q];
-        }
-        __syncthreads();
+        for (int i = 0; i < NP; ++i) sub[i] = 0;
+        for (int j = 0; j < GS; ++j) {
+            const uint32_t kb = g * GS + (uint32_t)j;
+            if (wave == 0) {
+                const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
+                uint32_t w[16];
+                Dec<F>::rows(r, c, 1.0f, w);
+                Dec<F>::unzero(c, rt, kb, w);
+#pragma unroll
+                for (int q = 0; q < 16; ++q) sW[q * kIqrSWPitch + lane] = w[q];
+            }
+            __syncthreads();
 
+#pragma unroll
+            for (int i = 0; i < NP; ++i) {
+                const int p = (int)lane + kIqrWave * i;
+                const uint32_t mu = m0 + (uint32_t)(p / 16);
+                if (mu >= (uint32_t)M) continue;
+                const int m = (int)mu, q = p % 16;
+                const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
+                const uint32_t* wp = sW + q * kIqrSWPitch;
+#pragma unroll
+                for (int c4 = 0; c4 < 32; ++c4)
+                    sub[i] = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub[i]);
+            }
+            __syncthreads();
+        }
 #pragma unroll
         for (int i = 0; i < NP; ++i) {
             const int p = (int)lane + kIqrWave * i;
             const uint32_t mu = m0 + (uint32_t)(p / 16);
             if (mu >= (uint32_t)M) continue;
             const int m = (int)mu, q = p % 16;
-            int sub = 0;
-            const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
-            const uint32_t* wp = sW + q * kIqrSWPitch;
-#pragma unroll
-            for (int c4 = 0; c4 < 32; ++c4)
-                sub = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub);
-            const float sa = as[m * nkb + kb];
-            const float sb = fold_f32<F>(c, row0 + q, kb);
-            acc[i] += (float)sub * sa * sb;
+            const float sa = as[m * (int)ngrp + (int)g];
+            const float sb = fold_f32<F>(c, row0 + q, g * GS);
+            acc[i] += (float)sub[i] * sa * sb;
         }
-        __syncthreads();
     }
 
 #pragma unroll
@@ -298,15 +337,17 @@ constexpr int kIqrWmmaWaves = 4;    /* 16-token slices a workgroup: 64 tokens a 
 constexpr int kIqrWmmaMinM = 1 << 30;    /* at or above this the wave matrix runs; raise past M to
                                           * force the v_dot4 tile (the switch, there is no other) */
 
-template <class F, int W>
+template <class F, int W, int GS>
 __global__ void __launch_bounds__(W * kIqrWave) R3D_WAVES(4)
 gemm_iqr_wmma_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
                      const uint8_t* __restrict__ b, const uint8_t* __restrict__ bs,
                      uint16_t* __restrict__ y, int M, int N, int K, int a_ld, int y_ld,
                      uint32_t run_tiles) {
+    static_assert(GS == 1 || GS == 2, "a scale group is one or two 128-K blocks");
     const uint32_t lane = threadIdx.x & (kIqrWave - 1);
     const uint32_t wave = threadIdx.x / kIqrWave;
     const uint32_t nkb = (uint32_t)(K / 128);
+    const uint32_t ngrp = nkb / (uint32_t)GS;
     const uint32_t nm = ((uint32_t)M + 16u * W - 1u) / (16u * W);
     const uint32_t rt = (uint32_t)blockIdx.x / nm;
     const uint32_t m0 = ((uint32_t)blockIdx.x % nm) * (16u * W) + wave * 16u;
@@ -317,6 +358,8 @@ gemm_iqr_wmma_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
     c.nkb = nkb;
     c.run_tiles = run_tiles;
     c.tab = nullptr;
+    c.ngrp = ngrp;
+    c.gs = (uint32_t)GS;
 
     /* The decoded 16x128 weight unit (the B fragment), each wave's 16x128 activation tile, and the
      * form's table. */
@@ -342,42 +385,45 @@ gemm_iqr_wmma_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
 
     v8float acc = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
 
-    for (uint32_t kb = 0; kb < nkb; ++kb) {
-        if (wave == 0) {
-            const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
-            uint32_t w[16];
-            Dec<F>::rows(r, c, 1.0f, w);
-            Dec<F>::unzero(c, rt, kb, w);
-#pragma unroll
-            for (int qq = 0; qq < 16; ++qq) sW[qq * kIqrSWPitch + lane] = w[qq];
-        }
-        /* Dwords, so the shim's 4-byte alignment is enough; lane l reads dword l of each row. */
-        for (int i = (int)lane; i < 16 * (128 / 4); i += kIqrWave) {
-            const int row = i / (128 / 4), d = i % (128 / 4);
-            const uint32_t rr = m0 + (uint32_t)row < (uint32_t)M ? m0 + (uint32_t)row
-                                                                : (uint32_t)(M - 1);
-            sA[wave][row * kIqrSWPitch + d] =
-                *(const uint32_t*)(a + (size_t)rr * a_ld + (size_t)kb * 128 + 4u * (uint32_t)d);
-        }
-        __syncthreads();
-
-        const uint32_t* ap = sA[wave] + (size_t)q * kIqrSWPitch;
-        const uint32_t* wp = sW + (size_t)q * kIqrSWPitch;
+    for (uint32_t g = 0; g < ngrp; ++g) {
         v8int sub = v8int{ 0, 0, 0, 0, 0, 0, 0, 0 };
+        for (int j = 0; j < GS; ++j) {
+            const uint32_t kb = g * GS + (uint32_t)j;
+            if (wave == 0) {
+                const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
+                uint32_t w[16];
+                Dec<F>::rows(r, c, 1.0f, w);
+                Dec<F>::unzero(c, rt, kb, w);
 #pragma unroll
-        for (int k = 0; k < 128; k += 16) {
-            const r3d_u32x4 aq = *(const r3d_u32x4*)(ap + k / 4);
-            const r3d_u32x4 bq = *(const r3d_u32x4*)(wp + k / 4);
-            sub = wmma_i8(v4int{ (int)aq.x, (int)aq.y, (int)aq.z, (int)aq.w },
-                          v4int{ (int)bq.x, (int)bq.y, (int)bq.z, (int)bq.w }, sub);
+                for (int qq = 0; qq < 16; ++qq) sW[qq * kIqrSWPitch + lane] = w[qq];
+            }
+            /* Dwords, so the shim's 4-byte alignment is enough; lane l reads dword l of each row. */
+            for (int i = (int)lane; i < 16 * (128 / 4); i += kIqrWave) {
+                const int row = i / (128 / 4), d = i % (128 / 4);
+                const uint32_t rr = m0 + (uint32_t)row < (uint32_t)M ? m0 + (uint32_t)row
+                                                                    : (uint32_t)(M - 1);
+                sA[wave][row * kIqrSWPitch + d] =
+                    *(const uint32_t*)(a + (size_t)rr * a_ld + (size_t)kb * 128 + 4u * (uint32_t)d);
+            }
+            __syncthreads();
+
+            const uint32_t* ap = sA[wave] + (size_t)q * kIqrSWPitch;
+            const uint32_t* wp = sW + (size_t)q * kIqrSWPitch;
+#pragma unroll
+            for (int k = 0; k < 128; k += 16) {
+                const r3d_u32x4 aq = *(const r3d_u32x4*)(ap + k / 4);
+                const r3d_u32x4 bq = *(const r3d_u32x4*)(wp + k / 4);
+                sub = wmma_i8(v4int{ (int)aq.x, (int)aq.y, (int)aq.z, (int)aq.w },
+                              v4int{ (int)bq.x, (int)bq.y, (int)bq.z, (int)bq.w }, sub);
+            }
+            __syncthreads();
         }
-        const float sb = fold_f32<F>(c, row0 + q, kb);
+        const float sb = fold_f32<F>(c, row0 + q, g * GS);
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
-            const float t = (float)sub[e] * as[(size_t)dm[e] * nkb + kb];
+            const float t = (float)sub[e] * as[(size_t)dm[e] * ngrp + g];
             acc[e] += t * sb;
         }
-        __syncthreads();
     }
 
     const float rowsc = row_scale<F>(c, row0 + q);
@@ -426,33 +472,34 @@ int form_supported(const Form& f) {
 using namespace r3d_iqr;
 
 /* The launcher, on addresses, so the templates stay in this unit. */
-template <class F, int MT>
+template <class F, int MT, int GS = 1>
 static int launch_mt(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M, int N,
                      int K, int a_ld, int y_ld, uint32_t run_tiles, long stream) {
     const dim3 grid((unsigned)(N / 16)), block(kIqrWave);
-    R3D_KLAUNCH(R3D_KNAME((gemm_iqr_m16_kernel<F, MT>)), grid, block, (hipStream_t)stream,
+    R3D_KLAUNCH(R3D_KNAME((gemm_iqr_m16_kernel<F, MT, GS>)), grid, block, (hipStream_t)stream,
                 (const int8_t*)a, (const float*)as, b, bs, (uint16_t*)y, M, N, K, a_ld, y_ld,
                 run_tiles);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
 /* The decode band's dispatch: one launch a form, MT chosen from M. */
-template <uint32_t KIND, uint32_t B, uint32_t LV, uint32_t L, uint32_t LRB, uint32_t SC>
+template <uint32_t KIND, uint32_t B, uint32_t LV, uint32_t L, uint32_t LRB, uint32_t SC,
+          uint32_t GS = 1>
 static int launch_mt_form(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
                           int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream,
                           int mt) {
     using F = FormT<KIND, B, LV, L, LRB, SC>;
     switch (mt) {
-        case 1:  return launch_mt<F, 1>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
-        case 2:  return launch_mt<F, 2>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
-        case 4:  return launch_mt<F, 4>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
-        case 8:  return launch_mt<F, 8>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
-        default: return launch_mt<F, 16>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+        case 1:  return launch_mt<F, 1, GS>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+        case 2:  return launch_mt<F, 2, GS>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+        case 4:  return launch_mt<F, 4, GS>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+        case 8:  return launch_mt<F, 8, GS>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+        default: return launch_mt<F, 16, GS>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
     }
 }
 
 /* The resident tile's launch: one workgroup a (weight tile, 64-token block). */
-template <class F>
+template <class F, int GS = 1>
 static int launch_resident(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
                            int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream) {
     constexpr int W = kIqrResidentWaves;
@@ -461,7 +508,7 @@ static int launch_resident(const uint8_t* b, const uint8_t* bs, long a, long as,
     const long long blocks = nt * nm;
     if (blocks > 0x7FFFFFFFll) return -2;   /* no launch geometry this large */
     const dim3 grid((unsigned)blocks), block(W * kIqrWave);
-    R3D_KLAUNCH(R3D_KNAME((gemm_iqr_resident_kernel<F, W>)), grid, block, (hipStream_t)stream,
+    R3D_KLAUNCH(R3D_KNAME((gemm_iqr_resident_kernel<F, W, GS>)), grid, block, (hipStream_t)stream,
                 (const int8_t*)a, (const float*)as, b, bs, (uint16_t*)y, M, N, K, a_ld, y_ld,
                 run_tiles);
     return hipGetLastError() == hipSuccess ? 0 : -4;
@@ -469,7 +516,7 @@ static int launch_resident(const uint8_t* b, const uint8_t* bs, long a, long as,
 
 /* The wave-matrix tile's launch: the same (weight tile, 64-token block) geometry, the group on
  * the int8 WMMA. */
-template <class F>
+template <class F, int GS = 1>
 static int launch_wmma(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
                        int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream) {
     constexpr int W = kIqrWmmaWaves;
@@ -478,20 +525,21 @@ static int launch_wmma(const uint8_t* b, const uint8_t* bs, long a, long as, lon
     const long long blocks = nt * nm;
     if (blocks > 0x7FFFFFFFll) return -2;   /* no launch geometry this large */
     const dim3 grid((unsigned)blocks), block(W * kIqrWave);
-    R3D_KLAUNCH(R3D_KNAME((gemm_iqr_wmma_kernel<F, W>)), grid, block, (hipStream_t)stream,
+    R3D_KLAUNCH(R3D_KNAME((gemm_iqr_wmma_kernel<F, W, GS>)), grid, block, (hipStream_t)stream,
                 (const int8_t*)a, (const float*)as, b, bs, (uint16_t*)y, M, N, K, a_ld, y_ld,
                 run_tiles);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
 /* The tiled row's dispatch: the same residency and wave-matrix switch for every form. */
-template <uint32_t KIND, uint32_t B, uint32_t LV, uint32_t L, uint32_t LRB, uint32_t SC>
+template <uint32_t KIND, uint32_t B, uint32_t LV, uint32_t L, uint32_t LRB, uint32_t SC,
+          uint32_t GS = 1>
 static int launch_tiled_form(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
                              int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream) {
     using F = FormT<KIND, B, LV, L, LRB, SC>;
-    if (M >= kIqrWmmaMinM) return launch_wmma<F>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles,
-                                                 stream);
-    return launch_resident<F>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+    if (M >= kIqrWmmaMinM) return launch_wmma<F, GS>(b, bs, a, as, y, M, N, K, a_ld, y_ld,
+                                                    run_tiles, stream);
+    return launch_resident<F, GS>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
 }
 
 /* The split-K slice rule and launcher (r3d_gemm_iqr_splitk.hip). */
@@ -509,6 +557,9 @@ extern "C" int64_t r3d_rad_gemm_nt_q_iqr_m16_scratch(const RadArgs* a) {
     if (!a) return 0;
     long long N = 0, K = 0;
     if (!rad_args_geti(a, "N", &N) || !rad_args_geti(a, "K", &K)) return 0;
+    /* IQ8R's 256-wide group has no split kernel: its two blocks fold once, so the split would cut
+     * a group. */
+    if (r3d_geti_or(a, "group", 128) != 128) return 0;
     const int splits = r3d_iqr_split_slices(N, K);
     if (splits <= 1) return 0;
     const long long bytes = (long long)splits * N * 4;
@@ -516,13 +567,16 @@ extern "C" int64_t r3d_rad_gemm_nt_q_iqr_m16_scratch(const RadArgs* a) {
 }
 
 extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M, int N, int K,
-                                int a_ld, int y_ld, uint32_t word, long scratch, long scratch_bytes,
-                                long stream) {
+                                int a_ld, int y_ld, uint32_t word, int group, long scratch,
+                                long scratch_bytes, long stream) {
     const Form f = form(word);
     if (!form_supported(f)) return -6;
     if (!a || !as || !b || !bs || !y) return -1;
     if (M < 1 || M > kMTMax || N < 1 || K < 128) return -2;
-    if (N % 16 || K % 128) return -2;
+    if (group != 128 && group != 256) return -2;
+    if (N % 16 || K % group) return -2;
+    /* The 256-wide group is IQ8R's rotated int8 grid; no other form has a layout at that width. */
+    if (group == 256 && (f.kind != kSigned || f.bits != 8 || f.scale != kBf16)) return -6;
     const unsigned lrun = (unsigned)((word >> 22) & 15u);
     if (is_trellis(f.kind) && (lrun < 4 || (N % (int)(1u << lrun)))) return -2;
     const uint32_t run = is_trellis(f.kind) ? (1u << lrun) / 16u : 0u;
@@ -536,6 +590,11 @@ extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M,
         return -5;
     const uint8_t* B_ = (const uint8_t*)b;
     const uint8_t* S_ = (const uint8_t*)bs;
+
+    /* The 256-wide group: two 128-K blocks per fold. */
+    if (group == 256)
+        return launch_mt_form<kSigned, 8, 0, 0, 0, kBf16, 2>(B_, S_, a, as, y, M, N, K, a_ld, y_ld,
+                                                             run, stream, mt);
 
     /* The split band: the GEMV (M = 1) at a narrow N, when the caller's scratch holds the
      * partials the row's hook asked for. Without it the unsplit path below runs, unchanged, so a
@@ -604,12 +663,14 @@ extern "C" int r3d_gemm_iqr_m16(long a, long as, long b, long bs, long y, int M,
  * arithmetic per (token, row) is the decode band's, so either is bit-identical to the chunked
  * launch this replaces. */
 extern "C" int r3d_gemm_iqr_tiled(long a, long as, long b, long bs, long y, int M, int N, int K,
-                                  int a_ld, int y_ld, uint32_t word, long stream) {
+                                  int a_ld, int y_ld, uint32_t word, int group, long stream) {
     const Form f = form(word);
     if (!form_supported(f)) return -6;
     if (!a || !as || !b || !bs || !y) return -1;
     if (M < 1 || N < 1 || K < 128) return -2;
-    if (N % 16 || K % 128) return -2;
+    if (group != 128 && group != 256) return -2;
+    if (N % 16 || K % group) return -2;
+    if (group == 256 && (f.kind != kSigned || f.bits != 8 || f.scale != kBf16)) return -6;
     const unsigned lrun = (unsigned)((word >> 22) & 15u);
     if (is_trellis(f.kind) && (lrun < 4 || (N % (int)(1u << lrun)))) return -2;
     if (!a_ld) a_ld = K;
@@ -621,6 +682,10 @@ extern "C" int r3d_gemm_iqr_tiled(long a, long as, long b, long bs, long y, int 
     const uint8_t* B_ = (const uint8_t*)b;
     const uint8_t* S_ = (const uint8_t*)bs;
     const uint32_t run = is_trellis(f.kind) ? (1u << lrun) / 16u : 0u;
+
+    if (group == 256)
+        return launch_tiled_form<kSigned, 8, 0, 0, 0, kBf16, 2>(B_, S_, a, as, y, M, N, K, a_ld,
+                                                                 y_ld, run, stream);
 
 #define R3D_IQR_TILED_FORM(KIND, B, LV, L, LRB, SC)                                               \
     return launch_tiled_form<KIND, B, LV, L, LRB, SC>(B_, S_, a, as, y, M, N, K, a_ld, y_ld, run, \
@@ -698,9 +763,10 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* arg, RadStream s) {
     (void)fs;
 
     const long long N = r3d_geti_or(arg, "N", 0), K = r3d_geti_or(arg, "K", 0);
+    const long long group = r3d_geti_or(arg, "group", 128);
     if (N < 1 || K < 1) return R3D_NO(RAD_E_SHAPE);
-    if (K % 128 || N % 16) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_geti_or(arg, "group", 128) != 128) return R3D_NO(RAD_E_SHAPE);
+    if (group != 128 && group != 256) return R3D_NO(RAD_E_SHAPE);
+    if (K % group || N % 16) return R3D_NO(RAD_E_SHAPE);
     const unsigned lrun = (unsigned)((B->dtype >> 22) & 15u);
     if (is_trellis(fw.kind) && (lrun < 4 || (N % (long long)(1u << lrun))))
         return R3D_NO(RAD_E_SHAPE);
@@ -710,7 +776,7 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* arg, RadStream s) {
     const long long M = ynel / N;
     if (M < 1 || M > kMTMax) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(A) < M * K) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(AS) < M * (K / 128)) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(AS) < M * (K / group)) return R3D_NO(RAD_E_SHAPE);
     /* The private planes are described by their layout (r3d_iqr.h): [N, K] and the form's scale
      * plane with the stored dtype; the core allocated layout.bytes for each. A `block=1x*` row
      * scale lays its plane out over N*K logical entries (packed), not [N, K/128], so the scale
@@ -729,7 +795,8 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* arg, RadStream s) {
 
     const int rc = r3d_gemm_iqr_m16(r3d_addr(A), r3d_addr(AS), r3d_addr(B), r3d_addr(BS),
                                     r3d_addr(Y), (int)M, (int)N, (int)K, (int)ap, (int)yp,
-                                    B->dtype, (long)arg->scratch, arg->scratch_bytes, (long)s);
+                                    B->dtype, (int)group, (long)arg->scratch, arg->scratch_bytes,
+                                    (long)s);
     if (rc == -1) return R3D_NO(RAD_E_INVAL);
     if (rc == -2) return R3D_NO(RAD_E_SHAPE);
     if (rc == -3) return R3D_NO(RAD_E_STRIDE);
@@ -761,8 +828,10 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_tiled(const RadArgs* arg, RadStream s) {
     if (!form_supported(fw)) return R3D_NO(RAD_E_UNSUPPORTED);
 
     const long long N = r3d_geti_or(arg, "N", 0), K = r3d_geti_or(arg, "K", 0);
-    if (N < 1 || K < 1 || K % 128 || N % 16) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_geti_or(arg, "group", 128) != 128) return R3D_NO(RAD_E_SHAPE);
+    const long long group = r3d_geti_or(arg, "group", 128);
+    if (N < 1 || K < 1) return R3D_NO(RAD_E_SHAPE);
+    if (group != 128 && group != 256) return R3D_NO(RAD_E_SHAPE);
+    if (K % group || N % 16) return R3D_NO(RAD_E_SHAPE);
     const unsigned lrun = (unsigned)((B->dtype >> 22) & 15u);
     if (is_trellis(fw.kind) && (lrun < 4 || (N % (long long)(1u << lrun))))
         return R3D_NO(RAD_E_SHAPE);
@@ -771,7 +840,7 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_tiled(const RadArgs* arg, RadStream s) {
     if (ynel % N) return R3D_NO(RAD_E_SHAPE);
     const long long M = ynel / N;
     if (M < 1) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(A) < M * K || r3d_numel(AS) < M * (K / 128)) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(A) < M * K || r3d_numel(AS) < M * (K / group)) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(B) != N * K || r3d_numel(BS) < 1) return R3D_NO(RAD_E_SHAPE);
 
     const long long ap = r3d_row_pitch(A);
@@ -785,7 +854,7 @@ extern "C" int r3d_rad_gemm_nt_q_iqr_tiled(const RadArgs* arg, RadStream s) {
 
     const int rc = r3d_gemm_iqr_tiled(r3d_addr(A), r3d_addr(AS), r3d_addr(B), r3d_addr(BS),
                                       r3d_addr(Y), (int)M, (int)N, (int)K, (int)ap, (int)yp,
-                                      B->dtype, (long)s);
+                                      B->dtype, (int)group, (long)s);
     if (rc == -1) return R3D_NO(RAD_E_INVAL);
     if (rc == -2) return R3D_NO(RAD_E_SHAPE);
     if (rc == -3) return R3D_NO(RAD_E_STRIDE);

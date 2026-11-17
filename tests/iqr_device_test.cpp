@@ -229,6 +229,7 @@ struct Case {
     Kind kind = kTrellisMad;
     int pattern = 0;      /* 0: random codes, 1: all zero, 2: all one bits */
     uint32_t LV = 0;      /* Grid: log2 V */
+    int64_t group = 128;  /* the scale group: 128, or 256 for IQ8R */
 };
 
 /* Split-K sums S slab partials instead of the reference's one ascending chain: the same group
@@ -309,6 +310,7 @@ std::vector<int8_t> decode_rows(const W& w, Kind kind, uint32_t B, uint32_t LV, 
 std::vector<uint16_t> reference(const W& w, const Case& c, const std::vector<int8_t>& a,
                                 const std::vector<float>& as, const uint8_t* sb, int64_t sbytes) {
     const int64_t nkb = c.K / 128;
+    const int64_t ngrp = c.K / c.group;
     (void)sbytes;
     const Form f{ c.kind, c.B, c.LV, c.L, c.RB, c.sc, 0, 0 };
     const std::vector<int8_t> dec =
@@ -318,20 +320,22 @@ std::vector<uint16_t> reference(const W& w, const Case& c, const std::vector<int
     for (int m = 0; m < c.M; ++m)
         for (int64_t n = 0; n < c.N; ++n) {
             float acc = 0.0f;
-            for (int64_t kb = 0; kb < nkb; ++kb) {
+            for (int64_t gi = 0; gi < ngrp; ++gi) {
+                /* libref's order: one exact i32 sub over the whole scale group, then
+                 * (sub * a_scale) * w_scale, groups ascending. */
                 int sub = 0;
-                for (int64_t k = 0; k < 128; ++k)
-                    sub += (int)a[(size_t)(m * c.K + kb * 128 + k)] *
-                           (int)dec[(size_t)(n * c.K + kb * 128 + k)];
+                for (int64_t k = 0; k < c.group; ++k)
+                    sub += (int)a[(size_t)(m * c.K + gi * c.group + k)] *
+                           (int)dec[(size_t)(n * c.K + gi * c.group + k)];
                 float sw;
                 if (c.sc == kRowF32) {
                     const float* cf = (const float*)(sb + cf_off(f, c.N, c.K));
-                    sw = cf[kb];
+                    sw = cf[gi];
                 } else {
-                    const int64_t i = tile_major(n, kb, nkb);
+                    const int64_t i = tile_major(n, gi, ngrp);
                     sw = bf16_to_f32(*(const uint16_t*)(sb + i * 2));
                 }
-                const float t1 = (float)sub * as[(size_t)(m * nkb + kb)];
+                const float t1 = (float)sub * as[(size_t)(m * ngrp + gi)];
                 const float t2 = t1 * sw;
                 acc += t2;
             }
@@ -344,7 +348,14 @@ std::vector<uint16_t> reference(const W& w, const Case& c, const std::vector<int
 bool run_case(const Case& c) {
     W w;
     rad_enc_clear(&w.enc);
-    if (c.kind == kTrellisMad) {
+    if (c.group == 256) {
+        /* IQ8R: the rotated int8 grid with a u8 level per (row, 256) under a bf16 row level, the
+         * two stored as the product the GEMM folds (arch/common/rad_fp8.h). */
+        rad_enc_copy_str(w.enc.scheme, "affine");
+        rad_enc_add_plane(&w.enc, "codes", RAD_I8, 1, 1);
+        rad_enc_add_plane(&w.enc, "scale", RAD_U8, 1, 256);
+        rad_enc_add_plane(&w.enc, "scale.1", RAD_BF16, 1, 0);
+    } else if (c.kind == kTrellisMad) {
         rad_enc_copy_str(w.enc.scheme, "trellis");
         rad_enc_add_plane(&w.enc, "codes", kU[c.B], 1, 1);
         if (c.sc == kRowF32) {
@@ -413,7 +424,12 @@ bool run_case(const Case& c) {
             }
         }
     }
-    if (c.sc == kRowF32) {
+    if (c.group == 256) {
+        uint8_t* s1 = (uint8_t*)w.data[(size_t)w.find("scale")].data();
+        for (int64_t i = 0; i < c.N * (c.K / c.group); ++i) s1[i] = (uint8_t)(1 + i % 13);
+        uint16_t* s2 = (uint16_t*)w.data[(size_t)w.find("scale.1")].data();
+        for (int64_t n = 0; n < c.N; ++n) s2[n] = f32_to_bf16(0.0007f + 0.0001f * (float)(n % 5));
+    } else if (c.sc == kRowF32) {
         float* rs = (float*)w.data[(size_t)w.find("scale")].data();
         for (int64_t n = 0; n < c.N; ++n) rs[n] = 0.001f + 0.0005f * (float)(n % 7);
         float* cf = (float*)w.data[(size_t)w.find("scale.col")].data();
@@ -424,7 +440,7 @@ bool run_case(const Case& c) {
             sc[i] = f32_to_bf16(0.002f + 0.0001f * (float)(i % 11));
     }
 
-    const std::vector<RadParam> lp = { pint("N", c.N), pint("K", c.K), pint("group", 128),
+    const std::vector<RadParam> lp = { pint("N", c.N), pint("K", c.K), pint("group", c.group),
                                        pstr("dtype", "i8a8h") };
     /* Each operand gets the planes of its own role, as the loader selects them. */
     std::vector<int> selB, selS;
@@ -473,9 +489,9 @@ bool run_case(const Case& c) {
         return false;
     }
 
-    const int64_t nkb = c.K / 128;
+    const int64_t ngrp = c.K / c.group;
     std::vector<int8_t> a((size_t)(c.M * c.K));
-    std::vector<float> as((size_t)(c.M * nkb));
+    std::vector<float> as((size_t)(c.M * ngrp));
     for (auto& v : a) v = (int8_t)((int)(rnd() % 255) - 127);
     for (auto& v : as) v = 0.01f + 0.001f * (float)(rnd() % 7);
     std::vector<uint16_t> y((size_t)(c.M * c.N), 0xDEADu);
@@ -512,7 +528,7 @@ bool run_case(const Case& c) {
     tas.dtype = RAD_F32;
     tas.rank = 2;
     tas.shape[0] = c.M;
-    tas.shape[1] = nkb;
+    tas.shape[1] = ngrp;
     rad_tensor_pack(&tas);
     tb.data = dB;
     tb.dtype = L.dtype;
@@ -524,7 +540,7 @@ bool run_case(const Case& c) {
     tbs.dtype = LS.dtype;
     tbs.rank = 2;
     tbs.shape[0] = c.N;
-    tbs.shape[1] = nkb;
+    tbs.shape[1] = ngrp;
     rad_tensor_pack(&tbs);
     ty.data = dY;
     ty.dtype = RAD_BF16;
@@ -535,7 +551,7 @@ bool run_case(const Case& c) {
     RadTensor ops[7] = { ta, tas, tb, tbs, ty, RadTensor{}, RadTensor{} };
 
     const RadParam params[] = { pint("M", c.M), pint("N", c.N), pint("K", c.K),
-                                pint("group", 128), pstr("dtype", "i8a8h") };
+                                pint("group", c.group), pstr("dtype", "i8a8h") };
     RadArgs args{};
     args.t = ops;
     args.n_t = 7;
@@ -550,6 +566,12 @@ bool run_case(const Case& c) {
     int64_t npart = 0;
     if (c.M <= 16 && lib().gemm_scratch) {
         npart = lib().gemm_scratch(&args);
+        if (c.group == 256 && npart != 0) {
+            std::fprintf(stderr, "%s: the 256-wide group must not ask for split scratch (%lld)\n",
+                         c.what, (long long)npart);
+            clean();
+            return false;
+        }
         if (lib().slices) splits = lib().slices(c.N, c.K);
         if (c.split) {
             if (!lib().slices || splits < 2) {
@@ -945,6 +967,26 @@ TEST(iqr_gemm_on_the_card_matches_the_host_reference) {
          * shim's unsplit fallback) or is wide enough that the split rule declines. */
         { "down 5120x17408 u4 L16 one-f32-row, GEMV split-K", 4, 16, 0, kRowF32, 5120, 17408, 1,
           true },
+        /* IQ8R's 256-wide scale group (MiniCPM5's non-IQR trunk): the same rotated int8 code
+         * order, one bf16 scale per (row, 256) made of a u8 level and a bf16 row level, folded
+         * once over two 128-K blocks. The decode band's entry (M = 1, 4, 8 and 16), the resident
+         * entry (M > 16), several groups (K = 1024), and the int8 rails. Last, so the draws above
+         * (and the split-K case's rounding edge) are unchanged. */
+        { "iq8r i8 g256 bf16, GEMV", 8, 0, 0, kBf16, 256, 512, 1, false, kSigned, 0, 0, 256 },
+        { "iq8r i8 g256 bf16, 4 tokens (MT 4)", 8, 0, 0, kBf16, 256, 768, 4, false, kSigned, 0, 0,
+          256 },
+        { "iq8r i8 g256 bf16, 8 tokens (MT 8)", 8, 0, 0, kBf16, 256, 768, 8, false, kSigned, 0, 0,
+          256 },
+        { "iq8r i8 g256 bf16, 16 tokens", 8, 0, 0, kBf16, 256, 512, 16, false, kSigned, 0, 0,
+          256 },
+        { "iq8r i8 g256 bf16, 64 tokens (resident)", 8, 0, 0, kBf16, 256, 1024, 64, false, kSigned,
+          0, 0, 256 },
+        { "iq8r i8 g256 bf16, 512 tokens (resident)", 8, 0, 0, kBf16, 256, 1024, 512, false,
+          kSigned, 0, 0, 256 },
+        { "iq8r i8 g256 bf16 zero codes, GEMV", 8, 0, 0, kBf16, 256, 512, 1, false, kSigned, 1, 0,
+          256 },
+        { "iq8r i8 g256 bf16 -128/127 codes, 16 tokens", 8, 0, 0, kBf16, 256, 512, 16, false,
+          kSigned, 3, 0, 256 },
     };
     for (const Case& c : cases) CHECK(run_case(c));
 }

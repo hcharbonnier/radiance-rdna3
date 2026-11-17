@@ -41,6 +41,10 @@ struct Ctx {
     const int8_t* tab;      /* the form's table, in LDS when the kernel stages it */
     uint32_t N, nkb;
     uint32_t run_tiles;     /* a trellis run's 16-row tiles */
+    /* The scale plane's K groups (`nkb / gs`), and the 128-K blocks a group spans: 1, or 2 for
+     * IQ8R's one scale per (row, 256). Zero means nkb, the 128-group kernels. */
+    uint32_t ngrp = 0;
+    uint32_t gs = 1;
 };
 
 /* Bits [s, s + n) of the 64 bits hi:lo, n <= 32 (constants after unrolling). On byte bounds one
@@ -101,10 +105,13 @@ __device__ __forceinline__ uint32_t bf16_bits(float x) {
     return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
 }
 
-/* A row's own scale for 128-K block kb, as bf16 bits. */
+/* A row's own scale for 128-K block kb, as bf16 bits. The scale plane is tile-major over the
+ * scale group (`gs` 128-K blocks, 1 or 2), so kb's group is kb / gs. */
 template <class F>
 __device__ __forceinline__ uint32_t own_scale(const Ctx& c, uint32_t r, uint32_t kb) {
-    const size_t i = ((size_t)(r / 16u) * c.nkb + kb) * 16u + r % 16u;
+    const uint32_t ngrp = c.ngrp ? c.ngrp : c.nkb;
+    const uint32_t gs = c.gs ? c.gs : 1u;
+    const size_t i = ((size_t)(r / 16u) * ngrp + kb / gs) * 16u + r % 16u;
     if constexpr (F::SC == kBf16) {
         return ((const uint16_t*)c.S)[i];
     } else {

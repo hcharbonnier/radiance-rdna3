@@ -114,13 +114,35 @@ bool scale_form(const RadEncoding* enc, int want_planes, uint32_t* out) {
 }
 
 /* Which IQR form `enc` is at transform `tr`, and the entries its table holds. Int8 codes are not
- * one: the int8 GEMMs read them as they are. */
-bool classify(const RadEncoding* enc, const char* tr, Form* f, int64_t* entries) {
+ * one: the int8 GEMMs read them as they are. `group` is the scale group along K: 128, or 256 for
+ * IQ8R, which is the rotated int8 grid at twice the scale width (arch/common/rad_fp8.h). */
+bool iq8r_codes(const RadEncoding* enc) {
+    if (!enc || !rad_enc_is(enc, "affine") || enc->n_planes != 3 ||
+        std::strncmp(enc->transform, "fwht128", RAD_ENC_STR) != 0)
+        return false;
+    if (enc->plane[0].dtype != RAD_I8 || enc->plane[0].block[1] != 1) return false;
+    const RadEncPlane* sc = rad_enc_plane(enc, "scale");
+    const RadEncPlane* s2 = rad_enc_plane(enc, "scale.1");
+    return sc && sc->dtype == RAD_U8 && sc->kind == RAD_PLANE_TILED && sc->block[0] == 1 &&
+           sc->block[1] == 256 && s2 && s2->dtype == RAD_BF16 && s2->kind == RAD_PLANE_TILED &&
+           s2->block[0] == 1 && s2->block[1] == 0;
+}
+
+bool classify(const RadEncoding* enc, const char* tr, Form* f, int64_t* entries,
+              int64_t group = 128) {
     *f = Form{};
     *entries = 0;
     if (!enc || std::strncmp(enc->transform, tr, RAD_ENC_STR) != 0) return false;
     const RadEncPlane& cp = enc->plane[0];
     if (std::strncmp(cp.role, "codes", RAD_ENC_STR) != 0) return false;
+    /* IQ8R: the same 16x128 code order as the rotated int8 grid, one bf16 scale per (row, 256)
+     * made of a u8 level and a bf16 row level. */
+    if (group == 256) {
+        if (!iq8r_codes(enc)) return false;
+        f->kind = kSigned; f->bits = 8; f->scale = kBf16;
+        return true;
+    }
+    if (group != 128) return false;
     if (rad_enc_is(enc, "trellis")) {
         const RadEncPlane* tp = rad_enc_plane(enc, "trellis");
         /* tcq_code=mad: A and B beside the table, the values computed where they are read */
@@ -192,7 +214,7 @@ bool classify(const RadEncoding* enc, const char* tr, Form* f, int64_t* entries)
     return false;
 }
 
-struct Geom { long long N, K, nkb; };
+struct Geom { long long N, K, nkb, ngrp, group; };
 
 /* tcq_code=mad's value of state `st`: bytesum((st * A + B) mod 2^32 & 0x3F3F3F3F) - 126, the
  * product from the low 24 bits of each factor (libquant's grid_tcq_mad_values). */
@@ -204,10 +226,12 @@ inline int mad_value(uint32_t st, uint32_t a, uint32_t b) {
 int geom(const RadParam* p, int n_p, Geom* g) {
     g->N = r3d_pgeti_or(p, n_p, "N", 0);
     g->K = r3d_pgeti_or(p, n_p, "K", 0);
+    g->group = r3d_pgeti_or(p, n_p, "group", 128);
     if (g->N <= 0 || g->K <= 0) return RAD_E_SHAPE;
-    if (r3d_pgeti_or(p, n_p, "group", 128) != 128) return RAD_E_SHAPE;
-    if (g->N % 16 || g->K % 128) return RAD_E_SHAPE;
+    if (g->group != 128 && g->group != 256) return RAD_E_SHAPE;
+    if (g->N % 16 || g->K % g->group) return RAD_E_SHAPE;
     g->nkb = g->K / 128;
+    g->ngrp = g->K / g->group;
     return RAD_OK;
 }
 
@@ -252,7 +276,8 @@ int weight_view(const RadParam* p, int n_p, const RadEncoding* enc, const int* s
     if (rc != RAD_OK) return rc;
     const char* d = r3d_pgets(p, n_p, "dtype");
     const bool rot = d && std::strcmp(d, "i8a8h") == 0;
-    if (!classify(enc, rot ? "fwht128" : "", f, entries) || !built(word(*f))) return RAD_E_DTYPE;
+    if (!classify(enc, rot ? "fwht128" : "", f, entries, g->group) || !built(word(*f)))
+        return RAD_E_DTYPE;
     if (!planes_of(enc, sel, pl, n, v) || !v->codes) return RAD_E_SHAPE;
     const bool aux = f->kind != kSigned;
     if (aux != (v->aux != nullptr) || (f->kind == kTrellisMad) != (v->mad != nullptr))
@@ -543,8 +568,16 @@ int scale_view(const RadParam* p, int n_p, const RadEncoding* enc, const int* se
     const char* d = r3d_pgets(p, n_p, "dtype");
     const bool rot = d && std::strcmp(d, "i8a8h") == 0;
     int64_t entries = 0;
-    if (!classify(enc, rot ? "fwht128" : "", f, &entries) || !built(word(*f))) return RAD_E_DTYPE;
+    if (!classify(enc, rot ? "fwht128" : "", f, &entries, g->group) || !built(word(*f)))
+        return RAD_E_DTYPE;
     if (!planes_of(enc, sel, pl, n, v) || !v->scale || v->codes || v->aux) return RAD_E_SHAPE;
+    /* IQ8R: the u8 level per (row, 256) and the bf16 level a row, stored as their bf16 product. */
+    if (g->group == 256) {
+        if (!v->scale2 || !enc_dims(*v->scale, g->N, g->ngrp) ||
+            !enc_dims(*v->scale2, g->N, 1))
+            return RAD_E_SHAPE;
+        return RAD_OK;
+    }
     if (f->scale == kRowF32) {
         if (v->scale2 || !enc_dims(*v->scale, g->N, 1)) return RAD_E_SHAPE;
         if (v->colf && !enc_dims(*v->colf, 1, g->nkb)) return RAD_E_SHAPE;
@@ -560,8 +593,18 @@ int scale_view(const RadParam* p, int n_p, const RadEncoding* enc, const int* se
 }
 
 int scale_relayout(const Form& f, const Geom& g, const Planes& v, uint8_t* d, int64_t bytes) {
-    if (bytes != scale_bytes(f, g.N, g.K) || !v.scale->data) return RAD_E_SHAPE;
+    if (bytes != scale_bytes(f, g.N, g.K, g.group) || !v.scale->data) return RAD_E_SHAPE;
     std::memset(d, 0, (size_t)bytes);
+    if (g.group == 256) {
+        /* IQ8R: each stored level pair becomes the one bf16 the fold multiplies by, tile-major. */
+        for (long long r = 0; r < g.N; ++r) {
+            const uint8_t* s1 = enc_row(*v.scale, r);
+            const float s2 = rad_load_f32(v.scale2->data, v.scale2->dtype, r);
+            for (long long kb = 0; kb < g.ngrp; ++kb)
+                rad_store_f32(d, RAD_BF16, tile_major(r, kb, g.ngrp), (float)s1[kb] * s2);
+        }
+        return RAD_OK;
+    }
     if (f.scale == kRowF32) {
         float* rs = (float*)d;
         float* cf = (float*)(d + cf_off(f, g.N, g.K));
@@ -597,7 +640,9 @@ int scale_relayout(const Form& f, const Geom& g, const Planes& v, uint8_t* d, in
 
 int scale_unrelayout(const Form& f, const Geom& g, const Planes& v, const uint8_t* s,
                      int64_t bytes) {
-    if (bytes != scale_bytes(f, g.N, g.K) || !v.scale->data) return RAD_E_SHAPE;
+    if (bytes != scale_bytes(f, g.N, g.K, g.group) || !v.scale->data) return RAD_E_SHAPE;
+    /* IQ8R's product does not come apart into its two stored levels. */
+    if (g.group == 256) return RAD_E_UNSUPPORTED;
     if (f.scale == kRowF32) {
         const float* rs = (const float*)s;
         const float* cf = (const float*)(s + cf_off(f, g.N, g.K));
@@ -673,7 +718,8 @@ extern "C" int r3d_rad_layout_iqr(const RadParam* p, int n_p, int operand, const
             trace_refused("layout", operand, rc, enc, sel, n);
             return rc;
         }
-        lfill(out, "r3d.iqr.s", R3D_DT_IQR_S | word(f), g.N, g.nkb, scale_bytes(f, g.N, g.K));
+        lfill(out, "r3d.iqr.s", R3D_DT_IQR_S | word(f), g.N, g.ngrp,
+              scale_bytes(f, g.N, g.K, g.group));
         return RAD_OK;
     }
     return RAD_E_UNSUPPORTED;

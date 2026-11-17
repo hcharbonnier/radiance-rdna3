@@ -138,28 +138,34 @@ R3D_IQR_HD constexpr int64_t weight_bytes(const Form& f, int64_t N, int64_t K) {
     return aux_off(f, N, K) + align256(aux_bytes(f, N, K) + 16);
 }
 
-/* The scale buffer. kRowF32: the rows' f32 scales, then at cf_off() the blocks' f32 factors. */
-R3D_IQR_HD constexpr int64_t s1_bytes(const Form& f, int64_t N, int64_t K) {
-    return f.scale == kRowF32 ? N * 4 : N * (K / 128) * (f.scale == kBf16 ? 2 : 1);
+/* The scale buffer. kRowF32: the rows' f32 scales, then at cf_off() the blocks' f32 factors.
+ *
+ * `group` is the K width one scale covers: 128, or 256 for IQ8R. Only the bf16 plane has a wider
+ * group; every other scale form is one per 128 and ignores it. The form word does not carry the
+ * group, so callers pass it (the launch's `group` parameter). */
+R3D_IQR_HD constexpr int64_t s1_bytes(const Form& f, int64_t N, int64_t K, int64_t group = 128) {
+    const int64_t g = f.scale == kBf16 ? group : 128;
+    return f.scale == kRowF32 ? N * 4 : N * (K / g) * (f.scale == kBf16 ? 2 : 1);
 }
-R3D_IQR_HD constexpr int64_t cf_off(const Form& f, int64_t N, int64_t K) {
-    return align256(s1_bytes(f, N, K));
+R3D_IQR_HD constexpr int64_t cf_off(const Form& f, int64_t N, int64_t K, int64_t group = 128) {
+    return align256(s1_bytes(f, N, K, group));
 }
-R3D_IQR_HD constexpr int64_t s2_off(const Form& f, int64_t N, int64_t K) {
-    return align256(s1_bytes(f, N, K));
+R3D_IQR_HD constexpr int64_t s2_off(const Form& f, int64_t N, int64_t K, int64_t group = 128) {
+    return align256(s1_bytes(f, N, K, group));
 }
 R3D_IQR_HD constexpr int64_t s2_bytes(const Form& f, int64_t N) {
     return f.scale == kE4m3Tensor ? 16 : f.scale == kE4m3Row ? 4 * N : 0;
 }
-R3D_IQR_HD constexpr int64_t blk_off(const Form& f, int64_t N, int64_t K) {
-    return s2_off(f, N, K) + align256(s2_bytes(f, N));
+R3D_IQR_HD constexpr int64_t blk_off(const Form& f, int64_t N, int64_t K, int64_t group = 128) {
+    return s2_off(f, N, K, group) + align256(s2_bytes(f, N));
 }
-R3D_IQR_HD constexpr int64_t scale_bytes(const Form& f, int64_t N, int64_t K) {
-    return f.scale == kRowF32 ? cf_off(f, N, K) + align256((K / 128) * 4)
-         : blk_off(f, N, K) + (f.lrb ? align256((N >> f.lrb) * (K / 128) * 2) : 0);
+R3D_IQR_HD constexpr int64_t scale_bytes(const Form& f, int64_t N, int64_t K, int64_t group = 128) {
+    return f.scale == kRowF32 ? cf_off(f, N, K, group) + align256((K / 128) * 4)
+         : blk_off(f, N, K, group) + (f.lrb ? align256((N >> f.lrb) * (K / 128) * 2) : 0);
 }
 
-/* The tile-major index of (row r, 128-K block kb). */
+/* The tile-major index of (row r, block kb): a 128-K block, or a scale group `nkb` entries wide
+ * (IQ8R's 256-K group). */
 R3D_IQR_HD constexpr int64_t tile_major(int64_t r, int64_t kb, int64_t nkb) {
     return ((r / 16) * nkb + kb) * 16 + r % 16;
 }
@@ -172,7 +178,8 @@ R3D_IQR_HD constexpr int64_t tile_major(int64_t r, int64_t kb, int64_t nkb) {
  * the same geometry (the mixed MTP bands). The remaining trellis and E4M3 forms stay declared here
  * for the rows that consume them but are refused by the dense shims. */
 #define R3D_IQR_FORMS(X)                                                                          \
-    /* the rotated int8 grid (i8a8h): the codes themselves under a bf16 scale a (row, 128) */     \
+    /* the rotated int8 grid (i8a8h): the codes themselves under a bf16 scale a (row, 128), or a
+     * (row, 256) for IQ8R's group (the launch's `group`, not the form word) */                  \
     X(kSigned, 8, 0, 0, 0, kBf16)                                                                 \
     /* IQR-V1: scalar tables, vector grids, 6-bit codes under a zero */                           \
     X(kTable, 2, 0, 0, 0, kBf16) X(kTable, 3, 0, 0, 0, kBf16) X(kTable, 4, 0, 0, 0, kBf16)        \

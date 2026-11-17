@@ -1997,6 +1997,13 @@ static const RadConstraint cGemmQIqrM16[]   = { C_IN("dtype", "i8a8h"), C_EQ("gr
  * M > 16 must exist even before the tiled kernel does. */
 static const RadConstraint cGemmQIqrTiled[] = { C_IN("dtype", "i8a8h"), C_EQ("group", 128),
                                                 C_GE("M", 1), C_DIV("K", 128), C_DIV("N", 16) };
+/* IQ8R's 256-wide scale group (arch/common/rad_fp8.h's linear_is_iq8r): the same rotated int8
+ * grid and code order, one bf16 scale per (row, 256) folded once over two 128-K blocks. */
+static const RadConstraint cGemmQIqrM16W256[]   = { C_IN("dtype", "i8a8h"), C_EQ("group", 256),
+                                                    C_GE("M", 1), C_LE("M", 16), C_DIV("K", 256),
+                                                    C_DIV("N", 16) };
+static const RadConstraint cGemmQIqrTiledW256[] = { C_IN("dtype", "i8a8h"), C_EQ("group", 256),
+                                                    C_GE("M", 1), C_DIV("K", 256), C_DIV("N", 16) };
 
 /* The w8a8 wave-matrix arm at prefill heights. 17 <= M <= 127 complements cGemmQW8A8M16's
  * M <= 16, so the two rows never compete for a band. K % 128 is the scale group. */
@@ -3488,6 +3495,36 @@ static const RadKernelInfo kKernels[] = {
   "an exact i32 sub-sum and the reference's two f32 factors",
   RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_TILED,
   ROW(cGemmQIqrTiled), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_tiled,
+  nullptr, r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
+  r3d_shape_gemm_nt_q, r3d_rad_unrelayout_iqr },
+
+{ "gemm_iqr_nt_m16_w256", "gemm_nt_q", "gemm",
+  "gemm_nt_q over an IQ8R weight at decode heights: the rotated int8 grid at a 256-wide scale "
+  "group, so an exact i32 sub-sum runs over two 128-K blocks and folds once with the "
+  "(token, 256) and (row, 256) scales",
+  "M <= 16; K a multiple of 256 and N of 16; group 256",
+  "I8 a row-major with an f32 scale per (row, 256 of K), I8 codes b with one bf16 scale per "
+  "(row, 256) (the container's u8 and bf16 levels' product), bf16 y; groups ascend, each "
+  "group's sub is one i32 dot and its two f32 factors multiply left to right",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_M16,
+  ROW(cGemmQIqrM16W256), NOTUNE,
+  /* No scratch hook: the 256-wide group never splits, and a hook that always answered 0 would
+   * mark this decode row non-concurrent (rad_kernel_concurrent is `scratch == nullptr`). The
+   * m16 hook itself still answers 0 for group 256. */
+  nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_m16, nullptr,
+  r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
+  r3d_shape_gemm_nt_q, r3d_rad_unrelayout_iqr },
+
+{ "gemm_iqr_tiled_w256", "gemm_nt_q", "gemm",
+  "gemm_iqr_tiled at IQ8R's 256-wide scale group: the resident 16-row tile decodes each 128-K "
+  "block once and the group's two blocks fold once",
+  "M >= 1, K a multiple of 256 and N of 16; group 256",
+  "I8 a row-major with an f32 scale per (row, 256 of K), I8 codes b with one bf16 scale per "
+  "(row, 256), bf16 y; per group an exact i32 sub-sum over its two blocks and the two f32 "
+  "factors",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_TILED,
+  ROW(cGemmQIqrTiledW256), NOTUNE,
   nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_tiled,
   nullptr, r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
   r3d_shape_gemm_nt_q, r3d_rad_unrelayout_iqr },
