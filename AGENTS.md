@@ -63,9 +63,9 @@
   throttlé (PPT0/PPT1) est invalide. Comparer à la borne (plancher de lancement,
   débit mémoire) et pas seulement entre versions.
 - **Arbres hôte** : `w15-main` est l'état `a772d70`, `w20-r24` l'état
-  corrigé (W20), **`w26-vision` l'état de référence courant** (FFmpeg, vision
-  servie, R21 + R26). Tout A/B se fait dans un **nouveau** répertoire avec un
-  build neuf.
+  corrigé (W20), `w26-vision` l'état FFmpeg/vision (R21 + R26), **`final-all`
+  l'état de référence courant** (R21 + R22 + R23 + R25 + R26). Tout A/B se
+  fait dans un **nouveau** répertoire avec un build neuf.
 - **Documents** : handover courant `HANDOVER_RDNA3_PHASE7.md` ; état détaillé
   `TABLEAU_REEL_IDEAL_RDNA3.md`, `JOURNAL_RDNA3.md`, `SUIVI_LOTS_RDNA3.md`,
   `CHECKLIST_RDNA3.md`. `RAPPORT_RDNA3.md`, `PLAN_IMPLEMENTATION_RDNA3.md`,
@@ -176,17 +176,17 @@ for (op, geom), d in sorted(rows.items()):
 
 ```bash
 flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
-  ./build/tests/sched_test && ./build/tests/engine_e2e_test && \
+  ./build/tests/sched_test && ./build/tests/engine_e2e_test && ./build/tests/fixture_test && \
   ./build/tests/iqr_device_test && ./build/tests/logits_bf16_device_test && \
   ./build/tests/gather_rows_u8_device_test && ./build/tests/vision_rows_device_test && \
   ./build/tests/mtp_enter_e4m3_device_test && ./build/tests/logit_rerank_iqr_device_test && \
   ./build/bin/r3d_selftest ./build/radiance_home/kernels/libr3d.so'
 ```
 
-État de référence de la branche (R21 + R22 + R25 + R26, merge `1d90bae`) : **164
+État de référence de la branche (R21 + R22 + R23 + R25 + R26, merge `de81ffe`) : **164
 rows, 0 échec, 15 skips** ; `sched_test` **548 782 checks, 0 échec** et
 `engine_e2e_test` **909 checks, 0 échec** (3 skips) ; `kbench` Flash-Next
-**872/872** et 27B **605/605**, 0 échec,
+**968/968** et 27B **683/683**, 0 échec,
 0 divergence, **dans les deux modes** (défaut et `--band-capacity`). Test de
 contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
 `gather_rows_u8_device_test` couvre les rows u8 du tier KV (fragment 4 128 octets,
@@ -226,7 +226,9 @@ est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill ≈ 318 tok/s
   joint `rad.planes` d'une row device peut vivre en VRAM : un shim ne doit pas
   lire son en-tête sur l'hôte (SIGSEGV, corrigé dans `gemm_nt_q_w2a8_m16`),
   et le MT du bras `w2a8` doit avoir un chunk qui divise K (M=1/K=2560 → MT=4).
-  Les tables MTP 48 restent « Not covered » par kbench (R23), pas les rows.
+  Les tables MTP 48 et le draft head sont couverts par kbench (968/968) ;
+  restent 10 cas `gemm_nt_q_gated` i8a8h sans référence libref et 8
+  `ngram_hint`.
 - Le paramètre rangé d'une row (`M`) est un **plafond de bande**, jamais le
   nombre de lignes du pas : l'étendue est sur les tenseurs. Une row qui compare
   les deux casse le multi-séquence du moteur (bug R24, corrigé en W20) ;

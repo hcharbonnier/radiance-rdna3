@@ -1012,6 +1012,77 @@ build FFmpeg) :
 Soit **1,82×** le décodage à texte identique, sans changer le préfill. Le 27B
 reste à `NS=0` (son drafter h128 exige un KV bf16).
 
+## 2026-11-16 — W23 : tables MoE posées dans kbench (R23)
+
+**Cause double, toute côté outillage.** Le poids IQR du conteneur a cinq plans
+(`codes`, `scale`, `trellis`, `trellis.mad`, `scale.col`) ; la row en déclare
+une **vue** de trois plans, et `enc_selection_logical` refuse « 3 of 5 planes,
+which decode to nothing on their own ». kbench retombait sur un tirage
+synthétique, puis le relayout comparait la table `trellis` à des
+`trellis.mad` tirés indépendamment → `RAD_E_FORMAT`. Pour `w4nl`,
+`kf_lay_table` empilait les entrées à la taille déclarée (codes u4) alors que
+le layout joint est plus grand : `RAD_E_SHAPE`. Le moteur, lui, passe une
+**table de pointeurs** (`stride[0] == 0`), forme que les noyaux IQR/w4nl
+exigent.
+
+**Correctif** (branche `rdna3-r23-kbench`, commits `7720703`, `93d9e2b`) :
+- `tools/kfixture` : complète la vue codes d'un treillis avec tous les plans ;
+  décode la vue d'échelle comme `scale[ligne] × scale.col[bloc 128]` ; n'applique
+  pas `fwht128` (le `Dec` des rows IQR ne le fait pas) ;
+  `kf_lay_entries` dispose une entrée par expert.
+- `tools/rad_kbench` : `TablePointers` construit un slab d'entrées alignées et
+  un tableau de pointeurs hôte/device, pour le chemin conteneur et le replay ;
+  marges et rotation froide suivent la taille pointée ; une référence dont le
+  hook de description **décline** (`RAD_E_UNSUPPORTED`) ne fait plus décrire
+  les opérandes par la row device (cas `gemm_nt_q_gated` i8a8h).
+- `tools/kbench_timer` : la table de pointeurs fait tourner son slab et
+  régénère ses têtes (`R > 1`) ; `TimedOperand` porte `slab/slab_bytes/
+  entry_stride`, `bytes` reste le buffer pointé.
+- `libr3d/r3d_iqr_layout.cpp` : refuse les formes MoE IQR que `form_supported`
+  ne sert pas, au lieu de les accepter puis de les faire refuser au lancement.
+- `tests/fixture_test.cpp` : deux tests de la vue codes/échelle IQR et un des
+  entrées séparées.
+
+**Couverture et mesure.** Sur le conteneur Flash-Next, le run demandé fait
+**832/832** vérifiés, 0 échec, 0 divergence (pire rel_l2 3,162e-3) ; la
+non-régression `--kernels libr3d:libref --max-cases 1` passe de 856 à
+**952/952** dans les deux modes, pire rel_l2 1,206e-2 ; tous libs
+**4930/4930**, pire 1,520e-2. Après fusion avec W25, l'arbre final fait
+**968/968** (les 14 cas `mtp.draft_head` sont servis par `logit_rerank_i8`,
+les 110 cas MoE par R23) et 27B **683/683** ; il reste 10 cas
+`gemm_nt_q_gated` i8a8h sans référence libref et 8 `ngram_hint` sans oracle.
+
+Temps par row et η lien (η = experts lus × octets / temps / 603 GB/s, débit de
+copie froide à 256 MiB ; experts lus = borne haute `min(n_expert, M·top_k)`) :
+
+| `moe_gemm_iqr` M | µs device | η | `moe_gemm_w4nl` M | µs device | η |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 230,2 | 0,118 | 1 | 292,6 | 0,096 |
+| 4 | 382,8 | 0,283 | 4 | 499,2 | 0,225 |
+| 16 | 696,0 | 0,625 | 16 | 876,7 | 0,512 |
+| 32 | 1 229,4 | **0,705** | 32 | 1 801,6 | 0,498 |
+| 64 | 2 311,2 | 0,601 | 64 | 2 929,7 | 0,491 |
+| 512 | 3 989,3 | 0,350 | 512 | 8 757,0 | 0,164 |
+
+`gemm_iqr` dense : N=2560/K=2560 M=1 → 17,86 µs, 373 GB/s, η 0,619 ;
+N=16384/K=2560 M=1 → 57,19 µs, 460 GB/s, η 0,763 ; M=16 → 70,61 µs, η 0,159.
+Lecture : le décodage MoE M=1 n'est pas borné par la bande (10–12 %) mais par
+le décodage treillis et le faible parallélisme par expert ; l'IQR atteint
+425 GB/s (70 %) à M=32 puis redevient compute-bound (35 % à M=512) ; le w4nl
+plafonne à 309 GB/s (51 %) à M=16.
+
+Validation : `fixture_test`, `iqr_device_test` 67/67, `moe_iqr_device_test`
+15/15, `moe_w4nl_device_test` 18/18, `moe_iqr_test` 45/45, `logits_bf16`,
+`gather_rows_u8`, `vision`, selftest 164/0/15 sur l'arbre fusionné ; kbench
+**968/968** (Flash-Next) et **683/683** (27B) dans les deux modes, 0 échec,
+0 divergence. Carte : 2 613 MHz moyens, aucun throttler, plancher 3,06 µs,
+copie froide 603 GB/s.
+
+Restent non couverts : 10 `gemm_nt_q_gated` i8a8h (libref n'a pas la
+référence), 8 `ngram_hint` (pas d'oracle), 20 formes IQR des fixtures non
+servies (refusées à la déclaration), et la rotation froide `R > 1` d'une table
+de pointeurs (revue, non mesurée sur ce conteneur).
+
 
 
 

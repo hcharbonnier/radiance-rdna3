@@ -146,8 +146,10 @@ rel_l2 3,619e-3 et 1,206e-2, identiques) **et** dans les mêmes chiffres en
 Les timings par row du premier run kbench ne sont **pas exploitables** : la
 carte a throttlé (PPT0/PPT1) pendant les 8 minutes de mesure ; HC/PLE, QSA et
 le MoE par row sont repris à froid dans la section suivante. Les 78 cas non
-couverts par kbench sont hors v1 :
+couverts par kbench étaient hors v1 à cette date :
 MTP 48 (`mtp.draft_head`, `blk.48`), `ngram_hint` sans oracle libref.
+Depuis, R23 (tables MoE) et W25 (MTP) les couvrent : 968/968 ; il reste 10 cas
+`gemm_nt_q_gated` i8a8h sans référence libref et 8 `ngram_hint`.
 
 ## Flash-Next — rows isolées (W17, 2026-11-16, carte froide)
 
@@ -229,25 +231,38 @@ reste sans oracle.
 à optimiser (12 couches × 4 sous-lots de 512 = ~4 s par préfill de 2 048 tokens, 8 % du temps
 mesuré). `qsa_select` reste ALU/table. Les autres rows sont au plancher.
 
-### MoE — non mesurable sur ce conteneur
+### MoE — mesuré (W23, 2026-11-16)
 
-`kbench` refuse de poser les tables d'experts du conteneur : les 110 cas `moe_gemm_q` sont
-**sautés, pas échoués** (140 cas `moe_gather`/`moe_scatter`/router vérifiés, 0 échec).
+kbench pose désormais les tables du conteneur : la vue complète des 5 plans
+(sans `fwht128`), l'échelle IQR lue comme `scale[ligne] × scale.col[bloc 128]`
+et la **table de pointeurs** du moteur (slab + pointeurs hôte/device, conteneur
+et replay). Le run passe de 856 à **968/968** cas (0 échec, 0 divergence) avec
+W25 ; η = experts lus × octets / temps / 603 GB/s (copie froide 256 MiB),
+experts lus = borne haute `min(n_expert, M·top_k)`.
 
-- `moe_gemm_iqr cannot lay out the table 'w' from trellis:codes=u4[1x1],scale=f32[1x*],trellis=i8{65536x1},trellis.mad=u32{2x1},scale.col=f32[*x128]/fwht128: container format error` (50 cas)
-- `moe_gemm_w4nl cannot lay out the table 'w' from affine:codes=u4[1x1],scale=fp8_e4m3[1x64],scale.1=f32[*x*],table=f32{1x16}/fwht128: shape this kernel does not serve` (60 cas)
+| M | `moe_gemm_iqr` µs | η IQR | `moe_gemm_w4nl` µs | η w4nl |
+|---:|---:|---:|---:|---:|
+| 1 | 230,2 | 0,118 | 292,6 | 0,096 |
+| 4 | 382,8 | 0,283 | 499,2 | 0,225 |
+| 16 | 696,0 | 0,625 | 876,7 | **0,512** |
+| 32 | 1 229,4 | **0,705** | 1 801,6 | 0,498 |
+| 64 | 2 311,2 | 0,601 | 2 929,7 | 0,491 |
+| 512 | 3 989,3 | 0,350 | 8 757,0 | 0,164 |
 
-Conséquence : ni le temps par row MoE ni η lien par noyau ne sont produisibles par `kbench`
-sur cet artefact. Il faut aligner les tags de format du conteneur et du hook de layout, ou
-passer par une fixture (`--record`).
+`gemm_iqr` dense : N=16384/K=2560 M=1 → 57,19 µs, 460 GB/s (η 0,763) ; M=16 →
+70,61 µs (η 0,159). Lecture : à M=1 le MoE n'est pas borné par la bande
+(10–12 %) mais par le décodage treillis et le parallélisme par expert ; l'IQR
+atteint 425 GB/s (70 %) à M=32 puis redevient compute-bound (35 % à M=512) ;
+le w4nl plafonne à 309 GB/s (51 %) à M=16.
 
 ### η lien (M2)
 
 Borne du rapport §7.3 : 42 Gio copiés une fois à 28 GB/s = 1,61 s pour 4 096 tokens, soit
 2 545 tok/s. Flash-Next mesuré : **42 tok/s** de préfill (2 290 tokens en 54,3 s), donc
 **η ≈ 1,7 %**, très loin des 80 % du critère. L'attribution par row montre que le plafond
-vient de `hc_read` (89 tok/s à lui seul, 3,5 % de la borne), pas du MoE ; le temps MoE n'est
-pas isolable sur ce conteneur.
+vient de `hc_read` (89 tok/s à lui seul, 3,5 % de la borne), pas du MoE : à M=1 le MoE
+tourne à 10–12 % de la bande (borné par le décodage treillis) et à 70,5 % (IQR) / 51 %
+(w4nl) à M=32 / M=16.
 
 ## M6 — démo serveur Flash-Next (2026-11-16)
 
@@ -417,8 +432,9 @@ cas M=1/K=2560). Serveur Flash-Next, même prompt, greedy, `max_tokens 256`,
 | texte | 1 322 car. | **identique** (1 322 car.) |
 | acceptation | — | **40,3 %** (66,1 / 60,5 / 37,0 % aux profondeurs 1–3) |
 
-**1,82×** le décodage à texte identique, sans toucher au préfill. Les tables
-MTP 48 (`moe_gemm_q`) restent « Not covered » par kbench : c'est R23.
+**1,82×** le décodage à texte identique, sans toucher au préfill. Les 14 cas
+`mtp.draft_head` et les tables MTP 48 sont couverts par kbench (R23 + W25,
+968/968).
 
 ### Ce que M6 ne démontre pas
 
@@ -427,8 +443,8 @@ MTP 48 (`moe_gemm_q`) restent « Not covered » par kbench : c'est R23.
   exercé une session de 200k ; il faudrait ~10 × plus de pool.
 - L'image/vision : **levé en W26** (voir § Vision) ; la vidéo et l'audio ne sont pas
   testés.
-- Le MTP de Flash-Next : **levé en W25** (voir § MTP) ; seule la couverture
-  kbench des tables MTP 48 reste attachée à R23.
+- Le MTP de Flash-Next : **levé en W25** (voir § MTP) ; la couverture kbench
+  des tables MTP 48 est faite en R23 (968/968).
 
 ## Lecture
 

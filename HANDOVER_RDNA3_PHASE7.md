@@ -1,10 +1,10 @@
-# Handover — RDNA3, phase 7 (W14–W20, R21, R22, R25 et R26 livrés)
+# Handover final — RDNA3, phase 7 (R21, R22, R23, R25 et R26 livrés)
 
-2026-11-16. Branche `rdna3-iqr`, état code `1d90bae` (W20 : contrat
-capacité/étendue ; R21 : tier KV hôte ; R22 : snapshots courts ; R25 : MTP
-servi ; R26 : vision servie). **Périmètre révisé le 2026-11-16** : la vision et
-le MTP de Flash-Next entrent dans la cible (ADR-7, qui supersède l'ADR-6) et
-sont **livrés**. Ce document remplace
+2026-11-16. Branche `rdna3-iqr`, état code `de81ffe` (W20 : contrat
+capacité/étendue ; R21 : tier KV hôte ; R22 : snapshots courts ; R23 : tables
+MoE dans kbench ; R25 : MTP servi ; R26 : vision servie). **Périmètre révisé le
+2026-11-16** : la vision et le MTP de Flash-Next entrent dans la cible (ADR-7,
+qui supersède l'ADR-6) et sont **livrés**. Ce document remplace
 `HANDOVER_RDNA3_PHASE6.md` pour l'état courant ; §8 donne la reprise immédiate.
 
 ## 1. État vérifié
@@ -13,15 +13,16 @@ sont **livrés**. Ce document remplace
 |---|---|
 | `r3d_selftest` complet | **164 rows, 0 échec, 15 skips** |
 | Tests device | `iqr_device_test`, `logits_bf16_device_test`, 4 tests QSA, `moe_iqr_test`, `moe_iqr_device_test`, `moe_w4nl`, `kv_store_b4`, `gather_rows_u8`, `mtp_enter_e4m3`, `logit_rerank_iqr`, `rope` h128, router, `gemm_nt` N=1, vision, GDN had : **tous verts** |
-| kbench Flash-Next (`--kernels libr3d:libref`) | **872/872, 0 échec, 0 divergence**, pire rel_l2 1,206e-2 ; **872/872 aussi en `--band-capacity`** (W25) |
-| kbench 27B | **605/605, 0 échec** dans les deux modes (W20), pire rel_l2 3,6e-3 |
+| kbench Flash-Next (`--kernels libr3d:libref`) | **968/968, 0 échec, 0 divergence**, pire rel_l2 1,206e-2 ; **968/968 aussi en `--band-capacity`** (R23 + W25) |
+| kbench 27B | **683/683, 0 échec** dans les deux modes (R23 ; 605 avant), pire rel_l2 3,619e-3 |
 | Contrat capacité (W20) | `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` : rouge sur `a772d70`, vert sur `fae6c44` |
 | R21 tier KV (W22a) | rows u8 `gather_rows`/`scatter_rows` ; Flash-Next **2 groupes, 51,38 Kio/entrée**, 27B **1 groupe, 516 Kio** ; rejeu 27B : `to_host` 471, `promoted` 245, 0 échec (hash de vérification actif) |
-| R25 MTP (W25) | rows `mtp_enter_e4m3`, `logit_rerank_iqr`/`_i8` ; selftest 164 ; kbench **872/872** (FN) et 605/605 (27B) dans les deux modes ; NS=3 servi : **4,51 → 8,21 tok/s (1,82×)**, texte identique, acceptation 40,3 % (66/61/37 % aux profondeurs 1–3) |
-| R26 vision (W26) | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3, ffmpeg 8.0) ; tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16 384 patches ; `capabilities.image=true` ; 512² : 256 tokens image (281 avec le texte), TTFT 8,19 s ; 1024² : 1 024 tokens, TTFT 28,73 s ; 2048² : 4 096 tokens, TTFT 121,5 s ; 3000² redimensionnée ; 18 cas de robustesse (2 images, alpha/JPEG, 4 × 400) sans fuite ; 480/480 cas vision et 872/872 kbench, 0 divergence |
+| R25 MTP (W25) | rows `mtp_enter_e4m3`, `logit_rerank_iqr`/`_i8` ; selftest 164 ; kbench **968/968** (FN) et 683/683 (27B) dans les deux modes ; NS=3 servi : **4,51 → 8,21 tok/s (1,82×)**, texte identique, acceptation 40,3 % (66/61/37 % aux profondeurs 1–3) |
+| R23 MoE kbench (W23) | tables MoE posées (5 plans, échelle IQR ligne×bloc, table de pointeurs) ; kbench 952 → **968/968** après W25 ; η MoE : IQR 70,5 % à M=32, w4nl 51 % à M=16 ; M=1 borné par le treillis (10–12 %) |
+| R26 vision (W26) | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3, ffmpeg 8.0) ; tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16 384 patches ; `capabilities.image=true` ; 512² : 256 tokens image (281 avec le texte), TTFT 8,19 s ; 1024² : 1 024 tokens, TTFT 28,73 s ; 2048² : 4 096 tokens, TTFT 121,5 s ; 3000² redimensionnée ; 18 cas de robustesse (2 images, alpha/JPEG, 4 × 400) sans fuite ; 480/480 cas vision et 968/968 kbench, 0 divergence |
 | R22 snapshots (W22b) | ancre de queue sous le premier intervalle ; rejeu 9 tours : tokens servis 24 % → **52,6 %**, préfill recalculé −37 %, `no_snapshot` 6 → 2, checkpoints 1 → 7 ; `sched_test` 548 782 checks, `engine_e2e_test` et tests device verts |
 | Périmètre v1 (2026-11-16) | vision **livrée** (W26) et MTP Flash-Next **livré** (W25 : NS=3, 1,82×) ; le 27B reste à `NS=0` |
-| Mesures à froid W18 (HC/PLE/QSA par row) | 182 + 147 cas, 0 échec ; `hc_read` **1,77 ms à M=1** (η 0,6 %), η lien **1,7 %**, MoE par row bloqué (format du conteneur) |
+| Mesures à froid W18 (HC/PLE/QSA par row) | 182 + 147 cas, 0 échec ; `hc_read` **1,77 ms à M=1** (η 0,6 %), η lien **1,7 %** ; MoE par row mesuré en W23 (η 70,5 % à M=32, 51 % w4nl à M=16, 10–12 % à M=1) |
 | Démo serveur M6 / W19 | préfill 38,7–41,9 tok/s, décodage 4,41 (1 séq.) / 15,5 (4) / 22,1 (6) tok/s ; cache ×12 sur prompt identique ; **R22 résolu** : rejeu 9 tours 24 % → 52,6 % de tokens servis, `no_snapshot` 6 → 2 ; 4 décodeurs ×7,0 à côté d'un préfill |
 | Rejeu 27B / W19–W20 | chargement 15,87 GiB en 2,7 s ; `SEQS=1` préfill 318,8 tok/s (844), décodage 23,2 / 29,4 ; **`SEQS=4` corrigé** (W20) : préfill 317,5 tok/s, 4 requêtes à 67,3 tok/s agrégés |
 | Contexte 16k | KV 1,23 GiB (4 × 16 384) ; prompt de 13 421 tokens servi à 40,9 tok/s ; >16k → 400 |
@@ -78,6 +79,16 @@ sont **livrés**. Ce document remplace
   un tour appendu (un prompt répété reste exact), et au-delà de l'intervalle
   `exact` reste strict. `sched_test` 548 782 checks, `engine_e2e_test` et
   tests device verts.
+- **W23 (R23)** : les tables MoE du conteneur sont posées dans kbench. La row
+  IQR ne voit qu'une vue de 3 des 5 plans (`codes, scale, trellis,
+  trellis.mad, scale.col`) ; le reader reconstruit la vue complète (sans
+  `fwht128`, que le `Dec` n'applique pas), décode l'échelle IQR comme
+  `scale[ligne] × scale.col[bloc 128]`, et le moteur passe une **table de
+  pointeurs** que kbench reproduit (slab + pointeurs hôte/device, container et
+  replay). Les formes IQR non servies sont refusées au layout. kbench passe de
+  856 à **952/952**, puis **968/968** avec W25 (0 échec, 0 divergence) ; le
+  temps par row et l'η sont mesurés (IQR 70,5 % à M=32, w4nl 51 % à M=16 ;
+  10–12 % à M=1, borné par le décodage treillis).
 - **W26 (R26)** : vision servie. Build `-DRAD_WITH_FFMPEG=ON` (l'hôte a
   libavformat 62.3 / ffmpeg 8.0 ; il exige les paquets `libav*-dev`, `sudo`
   n'est pas accordé à `<gpu-user>`). La tour (856,68 Mio) est en VRAM, le staging
@@ -252,7 +263,8 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
    `rdna3-cleanup-helpers`).
 8. **Hors v1** : codebook `w4nl` dans `w4a8` seulement. Le MTP de Flash-Next
    est **livré** (W25) : rows device, service à `NS=3`, 1,82× le décodage ;
-   seule la couverture kbench des tables MTP 48 reste attachée à R23. Le 27B
+   la couverture kbench des tables MTP 48 et du draft head est faite
+   (968/968). Le 27B
    garde `NS=0` (drafter h128 bf16).
 
 ## 7. Non ajouté volontairement
@@ -269,7 +281,7 @@ synthèse », `SUIVI_LOTS_RDNA3.md` § « Prochains lots », puis
 protocole kbench et les consignes de travail.
 
 **Où en est le programme.** Flash-Next texte et vision sont servis, le 27B
-aussi, kbench 872/872 et 605/605 dans les deux modes, le tier KV hôte fonctionne
+aussi, kbench 968/968 et 683/683 dans les deux modes, le tier KV hôte fonctionne
 (R21), un tour image passe (R26) et le MTP de Flash-Next est servi (R25,
 1,82× le décodage). Le périmètre v1 a été **élargi le 2026-11-16** (ADR-7) :
 la vision et le MTP sont **livrés**. Ne pas rouvrir les contrats clos
@@ -282,15 +294,13 @@ vert ; W21 reprend la première place dès que le feu vert est donné.
    vert est donné : 1,77 ms à M=1 (η 0,6 %) et 0,23 ms/ligne, ~40 % du décodage
    et 47 % du préfill. Commencer par `--profile-ops true` (temps device par op)
    sur Flash-Next ; la forme deux-grilles et la température sont déjà écartées.
-2. **W23 MoE (R23)** — poser les tables du conteneur dans kbench (tags de format
-   ou fixture `--record`), puis mesurer le temps par row et l'η lien par noyau.
-3. **W24 QSA et doc** — `qsa_score` à M=512, doc OPS/README, décision sur
-   `RAPPORT_RDNA3.md`, handover final.
+2. **W24 QSA et doc** — `qsa_score` à M=512, décision sur `RAPPORT_RDNA3.md`,
+   handover final. La doc OPS/README est faite.
 
 **Décisions qui appartiennent à l'utilisateur** : (1) feu vert pour
 l'optimisation noyau (W21) ; (2) ajout de `RAPPORT_RDNA3.md` au dépôt. La
-vision et le MTP sont tranchés (ADR-7, 2026-11-16 : inclus) et la vision est
-livrée.
+vision et le MTP sont tranchés (ADR-7, 2026-11-16 : inclus) et tous deux sont
+livrés.
 
 **Discipline de mesure.** Un chiffre sans commande, sans horloge et sans état de
 la carte ne compte pas. Carte froide, `flock`, un seul processus, build neuf pour

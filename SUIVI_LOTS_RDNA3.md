@@ -13,7 +13,7 @@
 | W2 — décodeur device | en cours | 1,5 sem | treillis + table/grille faits ; `kSigned`/`w4nl` en W15 |
 | W3 — GEMM M ≤ 16 | **terminé (2026-11-15)** | 1,5 sem | GEMV 86 % ; split-K `down` 76,6 % (1,55×) |
 | W4 — m64 et préfill | **terminé (résident) ; WMMA éteinte** | 2,5 sem | tuile résidente 15,5 TFLOP/s ; WMMA 25–32 % plus lente, à reprendre en W14 |
-| W5 — MoE IQR | **en cours** | 4 sem | treillis + run map + référence hôte verts ; **`w4nl` livré** (MTP 48 inclus) ; restent formes mixtes par couche et experts bf16 protégés ; **temps par row non mesurable sur ce conteneur** (kbench refuse le format des tables) |
+| W5 — MoE IQR | **en cours** | 4 sem | treillis + run map + référence hôte verts ; **`w4nl` livré** (MTP 48 inclus) ; restent formes mixtes par couche et experts bf16 protégés ; temps par row mesuré en W23 (η 70,5 % IQR à M=32, 51 % w4nl à M=16) |
 | W6 — attention h256/GQA/KV i8 | **terminé (revu, 15/15 device)** | 3,5 sem | kv_store i8 block 4 et rope imrope h128 livrés en W15 |
 | W7 — QSA | **terminé (2026-11-16, 4 ops)** | 2,5 sem | tests libref verts ; perf mesurée en W18 (`qsa_score` 83,4 ms à M=512, 103 GFLOP/s) |
 | W8 — HC | **terminé (revu, device vert)** | 3,5 sem | refus `M=5` corrigé ; coûts mesurés en W18 (`hc_read` 1,77 ms à M=1, η 0,6 %) |
@@ -26,33 +26,34 @@
 | W15 — rows Flash-Next | **terminé** | 2 sem | `kSigned` 8, `gdn_conv_recurrent_update_had`, `kv_store` b4, `rope` h128, router fusionné, `gemm_nt` N=1, rows vision, `moe_gemm_w4nl` ; **159 rows / 0 échec / 15 skips** |
 | W16 — bring-up Flash-Next | **terminé (2026-11-16)** | 1 sem | serveur 121 GB servi : préfill 42 tok/s, décodage 4,0–4,6 tok/s, 4 séquences ; 0 bande device manquante |
 | W17 — corrections kbench | **terminé (2026-11-16)** | 1 sem | `logits_gemm_bf16` corrigé (échelle 1×128), 3 formes QSA alignées ; kbench **856/856, 0 échec, 0 divergence** |
-| W18 — mesures à froid | **terminé (2026-11-16)** | — | HC/PLE/QSA par row, 0 échec : `hc_read` 1,77 ms à M=1 (η 0,6 %), η lien 1,7 %, MoE par row bloqué par le format du conteneur |
+| W18 — mesures à froid | **terminé (2026-11-16)** | — | HC/PLE/QSA par row, 0 échec : `hc_read` 1,77 ms à M=1 (η 0,6 %), η lien 1,7 %, MoE par row mesuré en W23 |
 | W19 — démo M6, robustesse, 16k | **terminé (2026-11-16)** | — | prompts distincts, 1/4/6 séquences, cache de préfixe, 13 421 tokens à 16k, contention, erreurs ; tier KV hôte off et 0 % en rejeu multi-agents documentés |
 | W20 — contrat capacité/étendue | **terminé (2026-11-16)** | — | R24 corrigé (`logits_gemm_vocab_iqr`), même faute trouvée et corrigée dans 3 rows router ; mode `kbench --band-capacity` ; selftest 159/0/15, kbench 856/856 dans les deux modes, 27B `SEQS=4` à 67,3 tok/s |
 | M0 — Go/No-Go | **GO (2026-11-15)** | fin S3 | `MEMO_M0_RDNA3.md` |
 | M1 — dense IQR | **atteint et dépassé : 27B texte, décodage 28,4 tok/s (16 tok) / 21,2 (819), préfill 301 tok/s à 819** | fin S8 | W15 : WMMA, occupation gated, mesure M=16384 |
 | M2 — η lien ≥ 80 % | **non tenu : 1,7 %** (42 tok/s contre 2 545) | fin S10 | le plafond mesuré est `hc_read` (89 tok/s), pas le MoE |
 | M3 — QSA | **atteint** : équivalent au dense, 103 GFLOP/s à M=512 | fin S10 | `qsa_score` reste le poste QSA à optimiser |
-| M4 — coûts documentés | **atteint** : HC, PLE, QSA par row à froid | fin S10 | MoE par row bloqué (format des tables) |
+| M4 — coûts documentés | **atteint** : HC, PLE, QSA par row à froid, MoE par row en W23 | fin S10 | η MoE 70,5 % à M=32 (IQR), 51 % à M=16 (w4nl), 10–12 % à M=1 |
 | M5 — Flash-Next texte | **atteint** : 1/4/6 séquences, 8k et 16k, robustesse ; **vision livrée** (W26) | fin S12 | image 512²/1024² servie, `capabilities.image=true` |
 | M6 — démo serveur | **atteint** | fin S12 | R21 (tier KV) et R22 (snapshots courts) résolus ; vision livrée (W26) |
 
 ## Prochains lots (W21–W24)
 
-État : W0–W20 livrés, **W22 (R21 et R22) livré**, **W25 (MTP) livré**,
-**W26 (vision) livré** ; M0, M1, M3, M4, M5, M6 atteints ; **M2 non tenu**
-(η lien 1,7 %). **Périmètre révisé le 2026-11-16** (ADR-7) : la vision et le
-MTP de Flash-Next entrent dans la cible ; tous deux sont livrés, l'ADR-6 est
-supersédé et `num-speculative-tokens: 0` n'est plus qu'un repli. L'ordre
-ci-dessous est celui de la valeur décroissante.
+État : W0–W20 livrés, **W22 (R21 et R22) livré**, **W23 (MoE mesurable)
+livré**, **W25 (MTP) livré**, **W26 (vision) livré** ; M0, M1, M3, M4, M5, M6
+atteints ; **M2 non tenu** (η lien 1,7 %). **Périmètre révisé le 2026-11-16**
+(ADR-7) : la vision et le MTP de Flash-Next entrent dans la cible ; tous deux
+sont livrés, l'ADR-6 est supersédé et `num-speculative-tokens: 0` n'est plus
+qu'un repli. L'ordre ci-dessous est celui de la valeur décroissante.
 
 | lot | contenu | entrée | critère de sortie |
 |---|---|---|---|
 | **W21 — `hc_read` (R20)** | profil `--profile-ops true` sur Flash-Next, attribution du coût (lecture relue par ligne ? décodage E4M3 ? latence ?), correction | mesures W18 (1,77 ms à M=1), A/B deux-grilles déjà fait (mêmes temps) | `hc_read` M=1 ramené vers la borne de la row (≈20 µs) ou cause écrite ; décodage Flash-Next ≥ ×2 ; kbench 856/856 |
 | **W22 — cache multi-tour (R21, R22)** — **fait** | R21 : rows u8 `gather_rows`/`scatter_rows` (fragments KV opaques, 4 128 octets), test `gather_rows_u8_device_test` ; R22 : ancre de queue pour un prompt sous le premier intervalle, rejeu 9 tours 24 % → **52,6 %** de tokens servis, `no_snapshot` 6 → 2, checkpoints 1 → 7 | tier actif sur Flash-Next (2 groupes, 51,38 Kio/entrée) et 27B (516 Kio/entrée) ; **0 % en rejeu agent** avant R22 | tier KV actif ; conversation de 3 tours > 0 token servi ; 32k tenu ; `no_snapshot` disparaît (hors premiers tours de sous-agents) |
-| **W23 — MoE mesurable (R23)** | aligner les tags de format conteneur ↔ hook de layout, ou fixture `--record` ; puis temps par row et η lien par noyau | 110 cas `moe_gemm_q` sautés | kbench couvre `moe_gemm_q` sur le conteneur ; η lien MoE calculé ; 2.11/2.12 tranchés |
+| **W23 — MoE mesurable (R23)** — **fait** | vue complète des 5 plans (sans `fwht128`), échelle IQR ligne×bloc, `TablePointers` (slab + pointeurs hôte/device) container/replay, timer et marges ; formes IQR non servies refusées au layout | 110 cas `moe_gemm_q` sautés | kbench **968/968** (0 échec, 0 divergence) ; η MoE : IQR 70,5 % à M=32, w4nl 51 % à M=16 ; M=1 borné par le treillis (10–12 %) |
 | **W24 — QSA et clôture doc** | `qsa_score` à M=512 (3.8), doc des 5 ops QSA (3.9), `docs/OPS.md` + `libr3d/README.md` (1.5/5.7/8.6), `RAPPORT` (5.6), handover final (8.7) | 83,4 ms à M=512 (2 % du pic) | `qsa_score` ≥ 20 % du pic ou cause écrite ; doc publiée ; décision d'ajout du RAPPORT prise |
-| **W25 — MTP Flash-Next (R25, ADR-7)** — **fait** | rows `mtp_enter_e4m3`, `logit_rerank_iqr`/`_i8`, tests device ; corrige `gemm_nt_q_w2a8_m16` (en-tête joint lu sur l'hôte, chunk de K à M=1) ; `NS=3` servi | plugin `qwen4exp_fp8` déclare les ops MTP à `NS > 0` ; libr3d n'avait aucune des rows ; tables MTP 48 non posées par kbench | décodage **4,51 → 8,21 tok/s (1,82×)**, texte identique, acceptation 40,3 % ; kbench 872/872 (FN) et 605/605 (27B) ; **reste** les tables MTP 48 de kbench (R23) |
+| **W25 — MTP Flash-Next (R25, ADR-7)** — **fait** | rows `mtp_enter_e4m3`, `logit_rerank_iqr`/`_i8`, tests device ; corrige `gemm_nt_q_w2a8_m16` (en-tête joint lu sur l'hôte, chunk de K à M=1) ; `NS=3` servi | plugin `qwen4exp_fp8` déclare les ops MTP à `NS > 0` ; libr3d n'avait aucune des rows ; tables MTP 48 non posées par kbench | décodage **4,51 → 8,21 tok/s (1,82×)**, texte identique, acceptation 40,3 % ;   kbench **968/968** (FN) et 683/683 (27B) ; les 14 cas `mtp.draft_head` et
+  les tables MTP 48 sont couverts (R23) |
 | **W26 — vision servie (R26, ADR-7)** — **fait** | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3 / ffmpeg 8.0), corpus de 4 PNG sur l'hôte, tours image 512² et 1024² (`data:` URL), `capabilities.image=true` | tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16384 patches | 512² : 256 tokens image, TTFT 8,19 s ; 1024² : 1024 tokens, TTFT 28,73 s ; réponses correctes ; 856/856 kbench dans les deux modes, 480/480 cas vision |
 
 Hors v1 et non planifié : codebook `w4nl` dans `w4a8` seulement. Le MTP et la
@@ -155,18 +156,20 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   bit n'est garanti que pour un prompt répété ; au-delà, `exact` reste strict.
   Les 2 `no_snapshot` restants sont les premiers tours des sous-agents (rien à
   reprendre avant leur propre ancre).
-- **R23** — `kbench` ne peut pas poser les tables MoE du conteneur (110 cas
-  sautés : « container format error » sur le treillis, « shape this kernel does
-  not serve » sur `w4nl`), donc le temps par row MoE et η lien par noyau ne
-  sont pas mesurables sur cet artefact ; aligner les tags de format ou passer
-  par une fixture `--record`.
+- **R23** — *résolu* (W23) : la vue complète des 5 plans est décodée (sans
+  `fwht128`), l'échelle IQR est le produit ligne×bloc, et les tables MoE sont
+  passées comme **table de pointeurs** (slab + pointeurs hôte/device) au
+  conteneur comme au replay. kbench passe à 968/968, 0 échec, 0 divergence ;
+  η MoE : IQR 70,5 % à M=32, w4nl 51 % à M=16, M=1 à 10–12 % (borné par le
+  décodage treillis).
 - **R25** — *résolu* (W25) : rows `mtp_enter_e4m3` et `logit_rerank_iqr`/`_i8`
   en device, plus deux corrections de `gemm_nt_q_w2a8_m16` (en-tête du poids
   joint lu sur l'hôte alors qu'il vit en VRAM ; MT dont le chunk ne divise pas
   K à M=1/K=2560). Flash-Next sert à `NS=3` : **4,51 → 8,21 tok/s (1,82×)**,
   texte identique, acceptation 40,3 % (66/61/37 % aux profondeurs 1–3).
-  kbench 872/872 (FN) et 605/605 (27B) dans les deux modes. Reste la
-  couverture des tables MTP 48 par kbench (R23). Le 27B reste à `NS=0`.
+  kbench 968/968 (FN) et 683/683 (27B) dans les deux modes ; les tables
+  MTP 48 et le draft head sont couverts par kbench (R23). Le 27B reste à
+  `NS=0`.
 - **R26** — *résolu* (W26) : build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3,
   ffmpeg 8.0), tour de 27 blocs (856,68 Mio) placée en VRAM, staging média de
   48,27 Mio pour 16 384 patches. `capabilities.image=true` ; image 512² servie
