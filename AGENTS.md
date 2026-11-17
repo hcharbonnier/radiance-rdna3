@@ -180,11 +180,12 @@ flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
   ./build/tests/iqr_device_test && ./build/tests/logits_bf16_device_test && \
   ./build/tests/gather_rows_u8_device_test && ./build/tests/vision_rows_device_test && \
   ./build/tests/mtp_enter_e4m3_device_test && ./build/tests/logit_rerank_iqr_device_test && \
+  ./build/tests/act_i8g_group256_device_test && \
   ./build/bin/r3d_selftest ./build/radiance_home/kernels/libr3d.so'
 ```
 
-État de référence de la branche (R21 + R22 + R23 + R25 + R26, merge `de81ffe`) : **164
-rows, 0 échec, 15 skips** ; `sched_test` **548 782 checks, 0 échec** et
+État de référence de la branche (R21 + R22 + R23 + R25 + R26 + W27) :
+**169 rows, 0 échec, 15 skips** ; `sched_test` **548 782 checks, 0 échec** et
 `engine_e2e_test` **909 checks, 0 échec** (3 skips) ; `kbench` Flash-Next
 **968/968** et 27B **683/683**, 0 échec,
 0 divergence, **dans les deux modes** (défaut et `--band-capacity`). Test de
@@ -221,6 +222,13 @@ est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill ≈ 318 tok/s
   régression. Les cas **MTP 48** sont en revanche exigibles depuis l'ADR-7
   (2026-11-16, vision et MTP de Flash-Next dans la cible) : un MTP non couvert
   est un manque à combler (lot W25), pas une exclusion.
+- **IQ8R (groupe 256)** : servi (W27). Le GEMM `i8a8h` groupe 256 lit une
+  échelle bf16 par (row, 256) = produit u8×bf16, un seul `sub` i32 par 256 ;
+  split-K est refusé à cette largeur. Les producteurs fusionnés
+  `rmsnorm_had_quant_i8g` et `gated_had_quant_i8g` n'ont **pas d'oracle libref**
+  (kbench les laisse « Not covered ») : leur correctness passe par
+  `act_i8g_group256_device_test`. Le 2B se sert en **KV bf16** (l'arch refuse i8
+  à `head_dim=128`).
 - **MTP** : Flash-Next se sert à `NS=3` (1,82× le décodage, texte identique,
   acceptation ~40 %) ; le 27B reste à `NS=0` (drafter h128 bf16). Un poids
   joint `rad.planes` d'une row device peut vivre en VRAM : un shim ne doit pas

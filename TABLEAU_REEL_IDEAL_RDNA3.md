@@ -446,6 +446,48 @@ cas M=1/K=2560). Serveur Flash-Next, même prompt, greedy, `max_tokens 256`,
 - Le MTP de Flash-Next : **levé en W25** (voir § MTP) ; la couverture kbench
   des tables MTP 48 est faite en R23 (968/968).
 
+## MiniCPM5-2B IQ8R (W27, 2026-11-17)
+
+Premier conteneur non-IQR servi : 3,04 Gio, 42 couches, `n_embd` 2 048,
+`n_ff` 6 144, 16 têtes / 2 KV, tête vocabulaire i8 groupe 128. `NS=0`,
+`--tp 1`, `--max-model-len 4096`, `--max-num-seqs 1`, **KV bf16** (les rows
+`attn_paged`/`kv_store` de cet arch refusent i8 à `head_dim=128`), build neuf
+`w27-merge`.
+
+| | valeur |
+|---|---|
+| déclaration | **523 ops, 423 poids**, 2 groupes KV |
+| résolution IQ8R | `gemm_nt_q` groupe 256 → `gemm_iqr_nt_m16_w256` (M ≤ 16) / `gemm_iqr_tiled_w256` ; producteurs → `*_256_bf16` |
+| kbench ciblé (4 ops) | **110/110**, pire rel_l2 4,018e-05, GEMM bit-exact |
+| décodage | **40,2 tok/s** (60 tokens) ; 69,0 tok/s (16 tokens) |
+| préfill | 184–367 tok/s (prompts de 5–10 tokens) |
+| texte | cohérent (capitales, listes) |
+
+Les deux producteurs fusionnés (`rmsnorm_had_quant_i8g`,
+`gated_had_quant_i8g`) n'ont pas d'oracle `libref` : kbench les laisse « Not
+covered », le test `act_i8g_group256_device_test` les compare à une référence
+hôte indépendante (67 checks). `had_quant_act_i8g` a un repli AVX.
+
+## `qsa_score` à M=512 (W24, 2026-11-17)
+
+Flash-Next, `--op qsa_score --bench --max-cases 1`, trois passes alternées sur
+`w27-merge` (base) et `w27-qsa` (essai), carte à 65 W au repos avant la série :
+
+| passe | M=512 device | horloge | throttle |
+|---|---:|---:|---|
+| base 1 | 78,98 ms | 2 852 MHz | aucun |
+| base 2 | 82,68 ms | 2 842 MHz | aucun |
+| base 3 | 83,33 ms | 2 842 MHz | aucun |
+| essai ILP 4 blocs | 163,5 / 163,0 / 163,0 ms | 2 450–2 464 MHz | aucun |
+| row hôte AVX (même cas) | **9,00 ms** (32 threads) | — | — |
+
+Le débit base est 103 GFLOP/s (2 % du pic) sur 258,5 MiB d'opérandes. Cause :
+une warp lit 32 pages de blocs **distinctes** au même offset (un thread = un
+bloc), 2 octets utiles par secteur de 32 ; la row est bornée par L2. L'essai
+ILP (quatre chaînes f32 indépendantes par thread, arithmétique inchangée,
+exacte au test) double le nombre de pages par instruction et **perd 2×** : il
+est retiré. La suite est une réécriture coalescée/tuilée, pas un déroulage.
+
 ## Lecture
 
 - Le GEMV large atteint 86 % ; la forme `down` était à 49,5 %, le split-K la

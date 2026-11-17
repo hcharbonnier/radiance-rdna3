@@ -1,7 +1,7 @@
 # Suivi des lots — RDNA3
 
-État au 2026-11-16. Les estimations sont celles du plan ; « reste » est mis à jour
-à chaque session. Le suivi détaillé des tâches restantes est dans
+État au 2026-11-17. Les estimations sont celles du plan ; « reste » est mis à
+jour à chaque session. Le suivi détaillé des tâches restantes est dans
 `CHECKLIST_RDNA3.md` ; l'audit du conteneur Flash-Next est dans
 `FLASH_NEXT_AUDIT.md`. Ne pas réécrire `PLAN_IMPLEMENTATION_RDNA3.md`.
 
@@ -40,21 +40,23 @@
 ## Prochains lots (W21–W24)
 
 État : W0–W20 livrés, **W22 (R21 et R22) livré**, **W23 (MoE mesurable)
-livré**, **W25 (MTP) livré**, **W26 (vision) livré** ; M0, M1, M3, M4, M5, M6
-atteints ; **M2 non tenu** (η lien 1,7 %). **Périmètre révisé le 2026-11-16**
-(ADR-7) : la vision et le MTP de Flash-Next entrent dans la cible ; tous deux
-sont livrés, l'ADR-6 est supersédé et `num-speculative-tokens: 0` n'est plus
-qu'un repli. L'ordre ci-dessous est celui de la valeur décroissante.
+livré**, **W25 (MTP) livré**, **W26 (vision) livré**, **W27 (IQ8R) livré** ; M0,
+M1, M3, M4, M5, M6 atteints ; **M2 non tenu** (η lien 1,7 %). **Périmètre
+révisé le 2026-11-16** (ADR-7) : la vision et le MTP de Flash-Next entrent dans
+la cible ; tous deux sont livrés, l'ADR-6 est supersédé et
+`num-speculative-tokens: 0` n'est plus qu'un repli. L'ordre ci-dessous est
+celui de la valeur décroissante.
 
 | lot | contenu | entrée | critère de sortie |
 |---|---|---|---|
 | **W21 — `hc_read` (R20)** | profil `--profile-ops true` sur Flash-Next, attribution du coût (lecture relue par ligne ? décodage E4M3 ? latence ?), correction | mesures W18 (1,77 ms à M=1), A/B deux-grilles déjà fait (mêmes temps) | `hc_read` M=1 ramené vers la borne de la row (≈20 µs) ou cause écrite ; décodage Flash-Next ≥ ×2 ; kbench 856/856 |
 | **W22 — cache multi-tour (R21, R22)** — **fait** | R21 : rows u8 `gather_rows`/`scatter_rows` (fragments KV opaques, 4 128 octets), test `gather_rows_u8_device_test` ; R22 : ancre de queue pour un prompt sous le premier intervalle, rejeu 9 tours 24 % → **52,6 %** de tokens servis, `no_snapshot` 6 → 2, checkpoints 1 → 7 | tier actif sur Flash-Next (2 groupes, 51,38 Kio/entrée) et 27B (516 Kio/entrée) ; **0 % en rejeu agent** avant R22 | tier KV actif ; conversation de 3 tours > 0 token servi ; 32k tenu ; `no_snapshot` disparaît (hors premiers tours de sous-agents) |
 | **W23 — MoE mesurable (R23)** — **fait** | vue complète des 5 plans (sans `fwht128`), échelle IQR ligne×bloc, `TablePointers` (slab + pointeurs hôte/device) container/replay, timer et marges ; formes IQR non servies refusées au layout | 110 cas `moe_gemm_q` sautés | kbench **968/968** (0 échec, 0 divergence) ; η MoE : IQR 70,5 % à M=32, w4nl 51 % à M=16 ; M=1 borné par le treillis (10–12 %) |
-| **W24 — QSA et clôture doc** | `qsa_score` à M=512 (3.8), doc des 5 ops QSA (3.9), `docs/OPS.md` + `libr3d/README.md` (1.5/5.7/8.6), `RAPPORT` (5.6), handover final (8.7) | 83,4 ms à M=512 (2 % du pic) | `qsa_score` ≥ 20 % du pic ou cause écrite ; doc publiée ; décision d'ajout du RAPPORT prise |
+| **W24 — QSA et clôture doc** — **fait (cause écrite)** | `qsa_score` à M=512 mesuré à froid (79,0/82,7/83,3 ms, 103 GFLOP/s, aucun throttler) ; cause établie : une warp lit **32 pages distinctes** au même offset (un thread = un bloc), soit 16× d'amplification de secteur — la row est bornée par L2, pas par le calcul ; un déroulage 4 blocs/thread (chaînes indépendantes) donne **163 ms, 2× plus lent** et est retiré ; la row hôte AVX fait 9,0 ms sur 32 threads. Doc : `docs/OPS.md`/README déjà à jour ; `RAPPORT_RDNA3.md` **ajouté au dépôt** et §10.4–10.5 révisés | 83,4 ms à M=512 (2 % du pic) | cause écrite, avec l'A/B ; reste une réécriture coalescée/tuilée (LDS) pour viser ≥ 20 % du pic |
 | **W25 — MTP Flash-Next (R25, ADR-7)** — **fait** | rows `mtp_enter_e4m3`, `logit_rerank_iqr`/`_i8`, tests device ; corrige `gemm_nt_q_w2a8_m16` (en-tête joint lu sur l'hôte, chunk de K à M=1) ; `NS=3` servi | plugin `qwen4exp_fp8` déclare les ops MTP à `NS > 0` ; libr3d n'avait aucune des rows ; tables MTP 48 non posées par kbench | décodage **4,51 → 8,21 tok/s (1,82×)**, texte identique, acceptation 40,3 % ;   kbench **968/968** (FN) et 683/683 (27B) ; les 14 cas `mtp.draft_head` et
   les tables MTP 48 sont couverts (R23) |
 | **W26 — vision servie (R26, ADR-7)** — **fait** | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3 / ffmpeg 8.0), corpus de 4 PNG sur l'hôte, tours image 512² et 1024² (`data:` URL), `capabilities.image=true` | tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16384 patches | 512² : 256 tokens image, TTFT 8,19 s ; 1024² : 1024 tokens, TTFT 28,73 s ; réponses correctes ; 856/856 kbench dans les deux modes, 480/480 cas vision |
+| **W27 — IQ8R groupe 256 (D1, P0)** — **fait** | `gemm_nt_q` `i8a8h` groupe 256 : encodage IQ8R au layout (produit bf16 des deux niveaux u8/bf16, une échelle par 256), noyaux m16/résident/WMMA templatés sur le groupe (un seul `sub` i32 sur deux blocs 128), rows `gemm_iqr_nt_m16_w256`/`gemm_iqr_tiled_w256`, split-K refusé ; producteurs `rmsnorm_had_quant_i8g`, `had_quant_act_i8g`, `gated_had_quant_i8g` en groupe 256 (deux rotations 128, un amax/scale par 256) et leurs rows `*_256_bf16` | `nq_h.declare` échouait (groupe 256 contre 128) ; le 2B ne chargeait pas | selftest **169 rows / 0 échec / 15 skips** ; `act_i8g_group256_device_test` 67 checks, `iqr_device_test` 75 checks (8 cas 256 bit-exacts) ; kbench FN **968/968** et 27B **683/683** dans les deux modes ; 2B IQ8R déclaré (523 ops, 423 poids) puis **servi à NS=0** (KV bf16 : texte cohérent, 40,2 tok/s à 60 tokens) ; kbench ciblé 2B **110/110** (pire rel_l2 4,018e-05, GEMM bit-exact) |
 
 Hors v1 et non planifié : codebook `w4nl` dans `w4a8` seulement. Le MTP et la
 vision sont revenus dans la cible le 2026-11-16 (ADR-7).

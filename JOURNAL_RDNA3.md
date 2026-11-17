@@ -1083,6 +1083,79 @@ référence), 8 `ngram_hint` (pas d'oracle), 20 formes IQR des fixtures non
 servies (refusées à la déclaration), et la rotation froide `R > 1` d'une table
 de pointeurs (revue, non mesurée sur ce conteneur).
 
+## 2026-11-17 — W27 : IQ8R groupe 256, le 2B charge et sert (R9 / D1)
+
+**Cause.** `minicpm5-2b-iq8r.rad` s'arrêtait sur
+`llama_dense_fp8: rad_arch_declare -> invalid argument` (`rad_block_attn_fp8.h:110`,
+`nq_h.declare`) : l'arch demande `group=256` (IQ8R), `libr3d` n'avait que des
+rows à 128 — ni producteur rotated, ni GEMM `i8a8h`, dont l'échelle est un
+**produit** u8 (par row, 256) × bf16 (par ligne). Aucun défaut du fichier.
+
+**Correctif** (deux worktrees, `rdna3-iq8r-gemm` commit `2444126`,
+`rdna3-iq8r-prod` commit `4b1cec6`, merges `ca302df` / `8a3e75e`) :
+- `r3d_iqr_layout.cpp` reconnaît l'encodage IQ8R à `group=256` (affine, 3 plans,
+  `fwht128`, codes i8 tiled, `scale` u8 tiled `[1,256]`, `scale.1` bf16 tiled
+  `[1,0]`) ; les codes gardent l'ordre `kSigned` 8 par unité 16×128 et le plan
+  d'échelle est rangé tile-major `[N/16][K/256][16]` bf16, valeur = produit
+  arrondi une fois, comme `r4d_fp8_layout.cpp`.
+- `r3d_iqr.h` / `r3d_iqr_dec.h` : `ngrp = K/256` pour l'indexation des échelles
+  (`tile_major(r, kb/2, ngrp)`), mot de forme inchangé.
+- `r3d_gemm_iqr_m16.hip` : `GS` (128/256) templatisé sur bande-décodage,
+  résident et WMMA ; deux blocs de 128 s'accumulent dans **un seul** `sub` i32
+  exact, puis un seul fold `(sub × a_scale) × w_scale` — l'ordre de
+  `ref_gemm.h`. Le chemin 128 est bit-identique (tests + kbench inchangés).
+  Split-K refusé à 256 (le hook scratch renvoie 0).
+- Rows `gemm_iqr_nt_m16_w256` / `gemm_iqr_tiled_w256` (`C_EQ group 256`,
+  `K % 256`), mêmes bandes que la paire 128.
+- Producteurs `rmsnorm_had_quant_i8g`, `had_quant_act_i8g`,
+  `gated_had_quant_i8g` : `HG = group/128` (8 colonnes par lane et par moitié),
+  deux FWHT 128 indépendantes par groupe, **un** amax et **une** échelle par
+  256 ; rows `*_256_bf16`. Le facteur 1/128 reste sur le poids.
+
+**Couverture.** Selftest **169 rows / 0 échec / 15 skips** ; kbench Flash-Next
+**968/968** et 27B **683/683** dans les deux modes (pire rel_l2 inchangés) ;
+`iqr_device_test` 75 checks sur 10 cas (8 cas 256 : M 1/4/8/16/64/512, zéros,
+codes −128/127) et `act_i8g_group256_device_test` 67 checks sur 4 cas
+(256 + non-régression 128, silu/sigmoid, `out_bf16`, formes refusées).
+
+Sur l'hôte, le 2B déclare **523 ops / 423 poids** ; les quatre ops IQ8R
+résolvent sur les nouvelles rows (`gemm_iqr_nt_m16_w256` à M ≤ 16, tiled
+au-delà ; `had_quant_act_i8g` a aussi un repli AVX, les deux producteurs
+fusionnés restent device). kbench ciblé **110/110**, pire rel_l2 **4,018e-05**,
+GEMM **bit-exact**. Les deux producteurs fusionnés affichent « Not covered »
+(pas d'oracle libref) et sont couverts par le test device.
+
+**Service.** `radiance --tp 1 --max-model-len 4096 --max-num-seqs 1
+--num-speculative-tokens 0 --kv-cache-dtype bf16` : `/health` 200, complétion
+greedy cohérente (« The capital of France is » → « Paris. » ; planètes dans
+l'ordre), **40,2 tok/s** sur 60 tokens, 69,0 tok/s sur 16, préfill
+184–367 tok/s sur ces prompts courts. Le KV **i8** est refusé par cet arch à
+`head_dim=128` (`attn_paged`/`kv_store` : bf16/f16/fp8 seulement) : le service
+du 2B utilise bf16.
+
+## 2026-11-17 — W24 : `qsa_score` à M=512, cause mesurée (pas d'optimisation gardée)
+
+Mesure à froid sur `w27-merge`, `--op qsa_score --bench` : médianes device
+**79,0 / 82,7 / 83,3 ms** sur trois passes (2 842–2 852 MHz, aucun throttler,
+258,5 MiB d'opérandes), soit 103 GFLOP/s = 2 % du pic ; la row hôte AVX fait
+**9,0 ms** sur 32 threads (9× moins).
+
+**Cause.** Un thread traite un (row, bloc) ; une warp de 32 lanes lit donc
+**32 pages distinctes au même offset**, et chaque lane n'utilise que 2 octets
+d'un secteur de 32 (amplification ×16). La row est bornée par L2, pas par le
+calcul ni par le lien.
+
+**Essai écarté.** Quatre blocs par thread, quatre chaînes f32 indépendantes,
+arithmétique par (row, bloc) inchangée (test device 72 checks, 12 cas, exact) :
+**163,5 / 163,0 / 163,0 ms**, 2× plus lent — davantage de pages distinctes par
+instruction. Retiré de l'arbre. La suite est une réécriture coalescée/tuilée
+(pages et lignes de `q` en LDS, un thread par (row, bloc) conservé), à mesurer
+sur ce même protocole.
+
+**Doc.** `RAPPORT_RDNA3.md` entre dans le dépôt (décision prise) et ses
+§7.6/§10.4–10.5 sont révisés ; `docs/OPS.md` et `libr3d/README.md` étaient déjà
+à jour.
+
 
 
 

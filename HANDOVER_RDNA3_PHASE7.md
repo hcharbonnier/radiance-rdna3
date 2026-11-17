@@ -1,18 +1,19 @@
-# Handover final — RDNA3, phase 7 (R21, R22, R23, R25 et R26 livrés)
+# Handover final — RDNA3, phase 7 (R21, R22, R23, R25, R26 et W27 livrés)
 
-2026-11-16. Branche `rdna3-iqr`, état code `de81ffe` (W20 : contrat
-capacité/étendue ; R21 : tier KV hôte ; R22 : snapshots courts ; R23 : tables
-MoE dans kbench ; R25 : MTP servi ; R26 : vision servie). **Périmètre révisé le
-2026-11-16** : la vision et le MTP de Flash-Next entrent dans la cible (ADR-7,
-qui supersède l'ADR-6) et sont **livrés**. Ce document remplace
+2026-11-17. Branche `rdna3-iqr`, état code `de81ffe` plus W27 (IQ8R groupe
+256 : `8a3e75e`). Rappel des livraisons : W20 (contrat capacité/étendue), R21
+(tier KV hôte), R22 (snapshots courts), R23 (tables MoE dans kbench), R25 (MTP
+servi), R26 (vision servie), W27 (MiniCPM5-2B IQ8R servi à `NS=0`). **Périmètre
+révisé le 2026-11-16** : la vision et le MTP de Flash-Next entrent dans la cible
+(ADR-7, qui supersède l'ADR-6) et sont **livrés**. Ce document remplace
 `HANDOVER_RDNA3_PHASE6.md` pour l'état courant ; §8 donne la reprise immédiate.
 
 ## 1. État vérifié
 
 | Vérification | Résultat |
 |---|---|
-| `r3d_selftest` complet | **164 rows, 0 échec, 15 skips** |
-| Tests device | `iqr_device_test`, `logits_bf16_device_test`, 4 tests QSA, `moe_iqr_test`, `moe_iqr_device_test`, `moe_w4nl`, `kv_store_b4`, `gather_rows_u8`, `mtp_enter_e4m3`, `logit_rerank_iqr`, `rope` h128, router, `gemm_nt` N=1, vision, GDN had : **tous verts** |
+| `r3d_selftest` complet | **169 rows, 0 échec, 15 skips** |
+| Tests device | `iqr_device_test`, `logits_bf16_device_test`, 4 tests QSA, `moe_iqr_test`, `moe_iqr_device_test`, `moe_w4nl`, `kv_store_b4`, `gather_rows_u8`, `mtp_enter_e4m3`, `logit_rerank_iqr`, `rope` h128, router, `gemm_nt` N=1, vision, GDN had, `act_i8g_group256` : **tous verts** |
 | kbench Flash-Next (`--kernels libr3d:libref`) | **968/968, 0 échec, 0 divergence**, pire rel_l2 1,206e-2 ; **968/968 aussi en `--band-capacity`** (R23 + W25) |
 | kbench 27B | **683/683, 0 échec** dans les deux modes (R23 ; 605 avant), pire rel_l2 3,619e-3 |
 | Contrat capacité (W20) | `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` : rouge sur `a772d70`, vert sur `fae6c44` |
@@ -21,6 +22,7 @@ qui supersède l'ADR-6) et sont **livrés**. Ce document remplace
 | R23 MoE kbench (W23) | tables MoE posées (5 plans, échelle IQR ligne×bloc, table de pointeurs) ; kbench 952 → **968/968** après W25 ; η MoE : IQR 70,5 % à M=32, w4nl 51 % à M=16 ; M=1 borné par le treillis (10–12 %) |
 | R26 vision (W26) | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3, ffmpeg 8.0) ; tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16 384 patches ; `capabilities.image=true` ; 512² : 256 tokens image (281 avec le texte), TTFT 8,19 s ; 1024² : 1 024 tokens, TTFT 28,73 s ; 2048² : 4 096 tokens, TTFT 121,5 s ; 3000² redimensionnée ; 18 cas de robustesse (2 images, alpha/JPEG, 4 × 400) sans fuite ; 480/480 cas vision et 968/968 kbench, 0 divergence |
 | R22 snapshots (W22b) | ancre de queue sous le premier intervalle ; rejeu 9 tours : tokens servis 24 % → **52,6 %**, préfill recalculé −37 %, `no_snapshot` 6 → 2, checkpoints 1 → 7 ; `sched_test` 548 782 checks, `engine_e2e_test` et tests device verts |
+| R9 IQ8R groupe 256 (W27) | rows `gemm_iqr_nt_m16_w256`/`gemm_iqr_tiled_w256` et `*_256_bf16` des trois producteurs ; selftest **169/0/15** ; `act_i8g_group256_device_test` 67 checks, `iqr_device_test` 75 checks (8 cas 256 bit-exacts) ; kbench FN 968/968 et 27B 683/683 dans les deux modes ; **MiniCPM5-2B IQ8R chargé (523 ops, 423 poids) et servi à `NS=0`** : texte cohérent, 40,2 tok/s à 60 tokens (KV bf16), kbench ciblé **110/110**, pire rel_l2 4,018e-05 |
 | Périmètre v1 (2026-11-16) | vision **livrée** (W26) et MTP Flash-Next **livré** (W25 : NS=3, 1,82×) ; le 27B reste à `NS=0` |
 | Mesures à froid W18 (HC/PLE/QSA par row) | 182 + 147 cas, 0 échec ; `hc_read` **1,77 ms à M=1** (η 0,6 %), η lien **1,7 %** ; MoE par row mesuré en W23 (η 70,5 % à M=32, 51 % w4nl à M=16, 10–12 % à M=1) |
 | Démo serveur M6 / W19 | préfill 38,7–41,9 tok/s, décodage 4,41 (1 séq.) / 15,5 (4) / 22,1 (6) tok/s ; cache ×12 sur prompt identique ; **R22 résolu** : rejeu 9 tours 24 % → 52,6 % de tokens servis, `no_snapshot` 6 → 2 ; 4 décodeurs ×7,0 à côté d'un préfill |
@@ -30,7 +32,7 @@ qui supersède l'ADR-6) et sont **livrés**. Ce document remplace
 | Flash-Next texte | préfill 42 tok/s (2 290 et 4 570 tok), décodage 4,0–4,6 tok/s, 4 séquences concurrentes OK |
 | Robustesse Flash-Next | prompt 12 001 tok → HTTP 400 clair, serveur vivant ; redémarrages propres |
 
-## 2. Ce que W14–W20 et R21–R26 ont livré
+## 2. Ce que W14–W27 et R21–R26 ont livré
 
 - **QSA complet** : `qsa_work`, `qsa_block_key`, `qsa_score`, `qsa_select`
   (plus `tail_store`), tests libref ; formes alignées sur libref (`nsel`
@@ -96,6 +98,14 @@ qui supersède l'ADR-6) et sont **livrés**. Ce document remplace
   tours image 512²/1024² sont acceptés et répondus (le texte est correct :
   couleurs et positions, dégradé). Aucun changement de code : le build et la
   configuration ont suffi.
+- **W27 (R9 / D1)** : IQ8R groupe 256. Le layout accepte l'encodage IQ8R et
+  range l'échelle en bf16 par (row, 256), produit u8×bf16 ; le GEMM `i8a8h`
+  templatise le groupe (deux blocs 128 dans un `sub` i32 exact, un seul fold,
+  split-K refusé) ; les trois producteurs rotated font deux FWHT 128 par groupe
+  avec un amax/une échelle sur 256. Le 2B (523 ops, 423 poids) charge et sert à
+  `NS=0` en KV bf16 : texte cohérent, 40,2 tok/s à 60 tokens, kbench ciblé
+  110/110 (GEMM bit-exact), selftest 169/0/15, kbench FN/27B inchangés dans les
+  deux modes.
 
 ## 3. Flash-Next — configuration v1
 
@@ -209,7 +219,15 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
 2. **Optimisations différées** : `hc_read` (ci-dessus) d'abord ; WMMA préfill
    (éteinte, 25–32 % plus lente),
    occupation du gated fusionné (1,4 bloc/CU), `attn_dense` à M=16384,
-   `attn_paged` h256 isolé, `qsa_score` à M=512 (83,4 ms, 2 % du pic).
+   `attn_paged` h256 isolé. **`qsa_score` à M=512 : cause mesurée (W24)** —
+   79,0/82,7/83,3 ms à froid selon trois passes (103 GFLOP/s, 258,5 MiB
+   d'opérandes, aucun throttler), contre **9,0 ms pour la row hôte AVX** sur
+   32 threads. Un thread traite un bloc, donc une warp lit **32 pages
+   distinctes** au même offset : 16× d'amplification de secteur et une row
+   bornée par L2, pas par le calcul. Un déroulage 4 blocs/thread (chaînes
+   indépendantes) a donné **163 ms, 2× plus lent** et a été retiré. La suite est
+   une réécriture coalescée/tuilée (pages et lignes de q en LDS), à faire avec
+   un A/B sur ce protocole.
 3. **Robustesse étendue — faite (W19)** : 12 002 tokens → 400 en 0,00 s avec le
    nombre de tokens à couper ; `max_tokens` hors contexte **plafonné** à 8 191
    (pas de 400) et `finish=abort` à la déconnexion, slot rendu ; abandon à 3 s
@@ -224,13 +242,20 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
    7 checkpoints écrits.
    Contention (`fnconc`) : 4 décodeurs 12,6 s seuls → 87,6 s à côté d'un préfill
    de 3 000 tokens (+590 %), préfill 35 tok/s (vs 42 seul).
-4. **R9 — artefact non-IQR présent, chargement à finir** : `minicpm5-2b-iq8r.rad`
-   (2B, IQ8R rotated i8, groupe 256) est sur l'hôte. Il **ne charge pas**
-   encore : `rad_arch_declare` → INVAL sur `nq_h.declare`, car le producteur
-   rotated et le GEMM `i8a8h` de `libr3d` n'acceptent que **groupe 128**
-   alors que le conteneur est en 256. Cause et liste des rows à écrire :
-   `RAPPORT_RDNA3.md` §10.4–10.5, checklist **§D / D1** (IQ8R). Aucun défaut
-   du fichier : il sert de cas de test du gap.
+4. **R9 — résolu (W27)** : `minicpm5-2b-iq8r.rad` (2B, IQ8R rotated i8,
+   groupe 256) **charge et sert** à `NS=0`. La cause était bien la largeur de
+   groupe : `libr3d` n'avait ni producteur rotated ni GEMM `i8a8h` à 256.
+   Livré : producteurs groupe 256 (`rmsnorm_had_quant_i8g`, `had_quant_act_i8g`,
+   `gated_had_quant_i8g` ; deux rotations de 128, un amax et une échelle par
+   256), GEMM groupe 256 (`gemm_iqr_nt_m16_w256`, `gemm_iqr_tiled_w256` ;
+   encodage IQ8R au layout avec l'échelle bf16 = produit u8×bf16 par (row,256),
+   un seul `sub` i32 par 256, split-K refusé). Service en **KV bf16** : les rows
+   `attn_paged`/`kv_store` de cet arch ne prennent pas i8 à `head_dim=128`.
+   Chiffres : 523 ops / 423 poids déclarés, texte cohérent, 40,2 tok/s à
+   60 tokens, kbench ciblé 110/110 (pire 4,018e-05, GEMM bit-exact). Restent
+   pour un usage complet : variantes `ar_*`/non fusionnées (tp > 1), fold
+   `gemm_nt_q_gated` 256 (non déclaré pour un poids i8), puis DSpark pour
+   `NS > 0` (checklist D2).
 4bis. **R24 — corrigé (W20)** : le paramètre rangé est une **capacité de bande**,
    pas le nombre de lignes du pas. `logits_gemm_vocab_iqr` lit l'étendue sur `x`
    (comme `libr4d`), et l'audit `rad-kbench --band-capacity` a trouvé la même
@@ -271,9 +296,10 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
 
 ## 7. Non ajouté volontairement
 
-`API_DISTANTE.md`, `HANDOVER_RDNA3.md`, `PLAN_IMPLEMENTATION_RDNA3.md`,
-`RAPPORT_RDNA3.md` et `external-docs/` restent hors dépôt (déjà untracked ;
-PDF ISA AMD sous copyright).
+`API_DISTANTE.md`, `HANDOVER_RDNA3.md`, `PLAN_IMPLEMENTATION_RDNA3.md` et
+`external-docs/` restent hors dépôt (déjà untracked ; PDF ISA AMD sous
+copyright). `RAPPORT_RDNA3.md` **est entré dans le dépôt le 2026-11-17**
+(décision prise en W24).
 
 ## 8. Pour l'agent suivant
 
@@ -284,31 +310,33 @@ protocole kbench et les consignes de travail.
 
 **Où en est le programme.** Flash-Next texte et vision sont servis, le 27B
 aussi, kbench 968/968 et 683/683 dans les deux modes, le tier KV hôte fonctionne
-(R21), un tour image passe (R26) et le MTP de Flash-Next est servi (R25,
-1,82× le décodage). Le périmètre v1 a été **élargi le 2026-11-16** (ADR-7) :
+(R21), un tour image passe (R26), le MTP de Flash-Next est servi (R25, 1,82× le
+décodage) et **MiniCPM5-2B (IQ8R, groupe 256) charge et sert à `NS=0`** (W27).
+Selftest **169 rows**. Le périmètre v1 a été **élargi le 2026-11-16** (ADR-7) :
 la vision et le MTP sont **livrés**. Ne pas rouvrir les contrats clos
 (R17–R19, R24) sans une mesure qui les contredit.
 
-**Ordre de travail recommandé.** L'optimisation noyau est en pause faute de feu
-vert ; W21 reprend la première place dès que le feu vert est donné.
+**Ordre de travail recommandé.** L'optimisation noyau reste en pause faute de
+feu vert ; W21 reprend la première place dès que le feu vert est donné.
 
-1. **W21 `hc_read` (R20)** — le plus gros levier de performance dès que le feu
-   vert est donné : 1,77 ms à M=1 (η 0,6 %) et 0,23 ms/ligne, ~40 % du décodage
-   et 47 % du préfill. Commencer par `--profile-ops true` (temps device par op)
-   sur Flash-Next ; la forme deux-grilles et la température sont déjà écartées.
-2. **W24 QSA et doc** — `qsa_score` à M=512 (optimisation, en pause) ; la doc
-   OPS/README est faite, reste la décision d'ajout de `RAPPORT_RDNA3.md` au
-   dépôt.
-3. **Écart RDNA4 → RDNA3** — **238 rows / 179 ops** absents de `libr3d` (toutes
-   architectures ; la cible v1 n'en manque aucun sur ses chemins exercés).
-   Feuille de route checklist **§D**, liste complète RAPPORT §10. P0 : IQ8R
-   groupe 256 (MiniCPM5-2B), puis DSpark si `NS>0` ; P1 : `tp>1` ; le reste
+1. **W21 `hc_read` (R20)** — le plus gros levier de performance : 1,77 ms à
+   M=1 (η 0,6 %) et 0,23 ms/ligne, ~40 % du décodage et 47 % du préfill.
+   Commencer par `--profile-ops true` (temps device par op) sur Flash-Next ; la
+   forme deux-grilles et la température sont déjà écartées.
+2. **W24 — fait** : `qsa_score` à M=512 mesuré (79,0/82,7/83,3 ms), cause
+   écrite (warp = 32 pages à offset constant, 16× d'amplification de secteur ;
+   la row hôte AVX fait 9,0 ms), essai ILP 4 blocs retiré (2× plus lent).
+   `RAPPORT_RDNA3.md` est au dépôt. Reste une réécriture coalescée/tuilée.
+3. **Écart RDNA4 → RDNA3** — **233 rows / 176 ops** absents de `libr3d` (les
+   rows IQ8R du tronc sont livrées en W27 ; il reste les `ar_*`, le fold gated
+   256 et DSpark sur le chemin IQ8R). Feuille de route checklist **§D**, liste
+   complète RAPPORT §10. P0 restant : DSpark si `NS>0` ; P1 : `tp>1` ; le reste
    est conditionné à la décision de périmètre (D0).
 
 **Décisions qui appartiennent à l'utilisateur** : (1) feu vert pour
-l'optimisation noyau (W21) ; (2) ajout de `RAPPORT_RDNA3.md` au dépôt. La
-vision et le MTP sont tranchés (ADR-7, 2026-11-16 : inclus) et tous deux sont
-livrés.
+l'optimisation noyau (W21). La vision et le MTP sont tranchés (ADR-7,
+2026-11-16 : inclus) et livrés ; l'ajout du RAPPORT au dépôt est tranché
+(2026-11-17 : inclus).
 
 **Discipline de mesure.** Un chiffre sans commande, sans horloge et sans état de
 la carte ne compte pas. Carte froide, `flock`, un seul processus, build neuf pour

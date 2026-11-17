@@ -386,15 +386,20 @@ Mesure à l'état `de81ffe` : `libr4d/r4d_rows.cpp` (**457 rows, 274 ops**) cont
 - [ ] **D0 — décider le périmètre** : toutes les architectures `arch/` (238
       rows) ou seulement la cible v1 + l'artefact IQ8R ? Sans cette décision,
       D5–D9 restent hors engagement.
-- [ ] **D1 — IQ8R groupe 256 (MiniCPM5-2B, non-IQR)** : `rmsnorm_had_quant_iq8r`,
-      `ar_rmsnorm_had_quant_iq8r`, `gate_had_quant_iq8r`, `had_quant_act_iq8r`,
-      `gated_had_quant_iq8r`, le producteur non groupé `rmsnorm_had_quant_i8`,
-      `rmsnorm_quant_i8g`, et les variantes **groupe 256** de
-      `gemm_nt_q`/`gemm_nt_q_gated` en `i8a8h` (`gemm_iq8r_nt_m16`,
-      `gemm_iq8r_tiled` ; les rows actuelles n'acceptent que 128). Test : le
-      2B charge et sert à `NS=0`. Le `rad_arch_declare` échoue aujourd'hui sur
-      `nq_h.declare` (groupe 256 contre 128) — cause exacte dans
-      `RAPPORT_RDNA3.md` §10.4.
+- [x] **D1 — IQ8R groupe 256 (MiniCPM5-2B, non-IQR)** — **livré pour le tronc
+      à un rang (W27)** : producteurs `rmsnorm_had_quant_i8g`,
+      `had_quant_act_i8g`, `gated_had_quant_i8g` en groupe 256 (rows
+      `*_256_bf16` : deux rotations 128 par groupe, un seul amax et une seule
+      échelle par 256), et `gemm_nt_q`/`i8a8h` groupe 256 (rows
+      `gemm_iqr_nt_m16_w256` et `gemm_iqr_tiled_w256` : encodage IQ8R au
+      layout, échelle bf16 = produit u8×bf16 par (row,256), un seul `sub` i32
+      sur deux blocs 128, split-K refusé). Le 2B charge (523 ops, 423 poids) et
+      sert à `NS=0` ; kbench ciblé **110/110**, GEMM bit-exact.
+      Restent hors de ce lot, sans besoin pour ce chemin : les rows nommées
+      comme RDNA4 (`rmsnorm_had_quant_iq8r`, `*_iq8r`), les variantes non
+      fusionnées `rmsnorm_quant_i8g` / `ar_*` (tp > 1), `gate_had_quant_i8g`,
+      et le fold `gemm_nt_q_gated` groupe 256 (non déclaré pour un poids i8) ;
+      puis DSpark (D2) pour `NS > 0`.
 - [ ] **D2 — DSpark (MiniCPM5 à NS > 0)** : `dflash_conv`,
       `dflash_markov_greedy`, `dflash_markov_greedy_f32`, `dflash_tree` ; plus
       `row_topk_merge`, `sample_merge_topk`, `pair_argmax` si le sélecteur les
