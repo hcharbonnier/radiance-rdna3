@@ -253,9 +253,11 @@ en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
   joint `rad.planes` d'une row device peut vivre en VRAM : un shim ne doit pas
   lire son en-tête sur l'hôte (SIGSEGV, corrigé dans `gemm_nt_q_w2a8_m16`),
   et le MT du bras `w2a8` doit avoir un chunk qui divise K (M=1/K=2560 → MT=4).
-  Les tables MTP 48 et le draft head sont couverts par kbench (968/968) ;
-  restent 10 cas `gemm_nt_q_gated` i8a8h sans référence libref et 8
-  `ngram_hint`.
+  Les tables MTP 48 et le draft head sont couverts par kbench (**948/948** au
+  HEAD W28 ; 968 avant que des ops déclarées ne replient des cas
+  élémentaires) ; restent sans oracle libref des cas `gemm_nt_q_gated` i8a8h,
+  `gate_had_quant_i8g`/`gated_had_quant_i8g` (couverts par les tests device) et
+  8 `ngram_hint`.
 - Le paramètre rangé d'une row (`M`) est un **plafond de bande**, jamais le
   nombre de lignes du pas : l'étendue est sur les tenseurs. Une row qui compare
   les deux casse le multi-séquence du moteur (bug R24, corrigé en W20) ;

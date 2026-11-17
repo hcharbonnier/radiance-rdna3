@@ -540,8 +540,10 @@ Total ≈ 17 500 lignes spécifiques, hors MTP et hors portions de `r4d_moe.hip`
 Mesure faite sur l'état `de81ffe` en comparant les tables de rows :
 `libr4d/r4d_rows.cpp` (**457 rows, 274 ops**) et `libr3d/r3d_rows.cpp`
 (**164 rows, 101 ops**). **238 rows / 179 ops** n'ont pas d'équivalent RDNA3.
-Depuis W27, `libr3d` en a **169** (les cinq rows IQ8R du tronc) : l'écart est
-de **233 rows / 176 ops**. Ce chiffre est celui de la couverture *de toutes les
+La même comparaison par nom d'op au HEAD W28 (`libr3d` : **190 rows, 104 ops**)
+redonne ce chiffre de départ et donne l'écart courant : **218 rows / 176 ops**
+(les 5 rows IQ8R du tronc, les 18 collectifs, `gate_had_quant_i8g` et le fold
+gated 256 en sont sortis). Ce chiffre est celui de la couverture *de toutes les
 architectures que `arch/` sait déclarer* ; il ne signifie pas que la cible v1
 est incomplète.
 

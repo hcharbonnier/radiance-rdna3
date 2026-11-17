@@ -19,7 +19,7 @@ pour l'état courant ; §8 donne la reprise immédiate.
 | kbench 2B / 27B | **384/384** (pire 1,810e-3) et **653/653** (pire 3,619e-3), 0 échec — le compte suit les rows résolues |
 | Contrat capacité (W20) | `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` : rouge sur `a772d70`, vert sur `fae6c44` |
 | R21 tier KV (W22a) | rows u8 `gather_rows`/`scatter_rows` ; Flash-Next **2 groupes, 51,38 Kio/entrée**, 27B **1 groupe, 516 Kio** ; rejeu 27B : `to_host` 471, `promoted` 245, 0 échec (hash de vérification actif) |
-| R25 MTP (W25) | rows `mtp_enter_e4m3`, `logit_rerank_iqr`/`_i8` ; selftest 164 ; kbench **968/968** (FN) et 683/683 (27B) dans les deux modes ; NS=3 servi : **4,51 → 8,21 tok/s (1,82×)**, texte identique, acceptation 40,3 % (66/61/37 % aux profondeurs 1–3) |
+| R25 MTP (W25) | rows `mtp_enter_e4m3`, `logit_rerank_iqr`/`_i8` ; selftest 164 à l'époque ; kbench **968/968** (FN) et 683/683 (27B) dans les deux modes à l'époque (948/384/653 au HEAD W28) ; NS=3 servi : **4,51 → 8,21 tok/s (1,82×)**, texte identique, acceptation 40,3 % (66/61/37 % aux profondeurs 1–3) |
 | R23 MoE kbench (W23) | tables MoE posées (5 plans, échelle IQR ligne×bloc, table de pointeurs) ; kbench 952 → **968/968** après W25 ; η MoE : IQR 70,5 % à M=32, w4nl 51 % à M=16 ; M=1 borné par le treillis (10–12 %) |
 | R26 vision (W26) | build `-DRAD_WITH_FFMPEG=ON` (libavformat 62.3, ffmpeg 8.0) ; tour 856,68 Mio en VRAM, 48,27 Mio de staging pour 16 384 patches ; `capabilities.image=true` ; 512² : 256 tokens image (281 avec le texte), TTFT 8,19 s ; 1024² : 1 024 tokens, TTFT 28,73 s ; 2048² : 4 096 tokens, TTFT 121,5 s ; 3000² redimensionnée ; 18 cas de robustesse (2 images, alpha/JPEG, 4 × 400) sans fuite ; 480/480 cas vision et 968/968 kbench, 0 divergence |
 | R22 snapshots (W22b) | ancre de queue sous le premier intervalle ; rejeu 9 tours : tokens servis 24 % → **52,6 %**, préfill recalculé −37 %, `no_snapshot` 6 → 2, checkpoints 1 → 7 ; `sched_test` 548 782 checks, `engine_e2e_test` et tests device verts |
@@ -340,8 +340,8 @@ donné (2026-11-17) ; W21 et W24 sont livrés.
    carte ; les **jonctions `ar_*` fusionnées** restent des stubs : porter leurs
    producteurs (signatures differentes de libr3d) pour qu'un modèle `tp>1` se
    serve.
-3. **Écart RDNA4 → RDNA3** — **233 rows / 176 ops** absents de `libr3d` (les
-   rows IQ8R du tronc, les folds et DSpark sont livrés ; les collectifs aussi).
+3. **Écart RDNA4 → RDNA3** — **218 rows / 176 ops** absents de `libr3d` (les
+   rows IQ8R du tronc, les folds, DSpark et les collectifs sont livrés).
    Feuille de route checklist **§D**, liste complète RAPPORT §10 ; le reste est
    conditionné à la décision de périmètre (D0).
 

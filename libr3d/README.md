@@ -69,7 +69,7 @@ The table groups the rows by family; `r3d_rows.cpp` and `r3d.h` hold the full se
 | `draft` | `dflash_select_bf16`: the drafter's accept step, a walk over the draft block's candidate lattice |
 | `mtp` | `mtp_enter_e4m3` (the MTP head's entry: grouped pre-fc norm of the wide stream, the embedding norm, two E4M3 fc matrices and the `wadd` gate), `logit_rerank_iqr` and `logit_rerank_i8` (exact rescoring of a draft round's `R` candidates against the trunk's lm_head, in the IQR and i8 forms) |
 
-The table holds 169 rows over 101 schemas; `r3d_selftest` checks every schema slot for slot against
+The table holds 190 rows over 104 schemas; `r3d_selftest` checks every schema slot for slot against
 the `libref.so` beside the plugin. Eighteen rows carry tune axes (see
 [Tunable params](#tunable-params)); the rest are single-implementation.
 

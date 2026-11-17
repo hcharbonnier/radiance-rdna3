@@ -1,11 +1,13 @@
 # Checklist de clôture — RDNA3 / Qwen3.8 Flash-Next IQR-V4
 
-État au 2026-11-16, branche `rdna3-iqr`, état code `de81ffe` : **R21** (tier
+État au 2026-11-17, branche `rdna3-iqr`, état code `a8bc412` : **R21** (tier
 KV actif), **R22** (snapshots courts), **R23** (tables MoE dans kbench),
-**R25** (MTP servi) et **R26** (vision servie) livrés. Référence : **164
-rows**, selftest 0 échec, `sched_test` 548 782 checks, `engine_e2e_test` 909
-checks, kbench Flash-Next **968/968** et 27B **683/683** dans les deux modes,
-0 divergence. **Périmètre révisé le 2026-11-16** : la vision et le MTP de
+**R25** (MTP servi), **R26** (vision servie), **W27** (IQ8R groupe 256) et
+**W28** (hc_read 4,5×, qsa_score 36×, DSpark `NS=3`, folds IQ8R, collectifs
+`tp>1`) livrés. Référence : **190 rows**, selftest 0 échec, `sched_test`
+548 782 checks, `engine_e2e_test` 909 checks, kbench Flash-Next **948/948**,
+2B **384/384** et 27B **653/653**, 0 divergence (le compte suit les rows
+résolues). **Périmètre révisé le 2026-11-16** : la vision et le MTP de
 Flash-Next entrent dans la cible (ADR-7, qui supersède l'ADR-6). Sert à suivre
 l'avancement ; cocher au fur et à mesure
 et dater la ligne. Le détail des décisions et mesures est dans
@@ -19,7 +21,8 @@ Légende : `[x]` fait, `[ ]` à faire, `[~]` en cours, `[!]` bloqué.
 Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 (« Prochains lots »), les chiffres dans `TABLEAU_REEL_IDEAL_RDNA3.md`.
 
-**P0 — performance Flash-Next (M2 non tenu : η lien 1,7 % de 2 545 tok/s)**
+**P0 — performance Flash-Next (le η lien de W18, 1,7 %, est à re-mesurer après
+la correction `hc_read` de W28 : décodage 4,48 → 12,73 tok/s)**
 - [x] **R20 `hc_read`** — **noyau corrigé (W28)** : staging LDS coalescé des
       matrices de mélange, sommes f32 ascendantes inchangées ; **M=1 1 941 →
       428 µs (4,5×)**, M=8 6,2×, M=128 7,9×, **M=512 114 → 12,4 ms (9,2×)** ;
@@ -27,11 +30,12 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       1,93 ms/appel, poids en VRAM) reste la trace du diagnostic. Reste un
       écart ~40× au plancher de 10,5 µs (~15 GB/s effectifs) : second passage
       « plusieurs lignes par tranche de poids », pas un bug de contrat.
-- [x] **W24a `qsa_score`** — mesuré à froid (79,0/82,7/83,3 ms à M=512,
-      103 GFLOP/s, 2 % du pic, aucun throttler) ; cause : warp = 32 pages
-      distinctes au même offset (16× d'amplification de secteur, borné par L2) ;
-      l'essai 4 blocs/thread perd 2× et est retiré. Reste une réécriture
-      coalescée/tuilée (W24, non bloquant).
+- [x] **W24a `qsa_score`** — **livré (W28)** : réécriture coalescée/tuilée
+      (tuile 32×64, pages et lignes de q en LDS), **M=512 82,27 → 2,23 ms
+      (36–37×)**, bit-identique à libref ; `qsa_score_device_test` 72 checks
+      exacts, `--bench` 4 946/4 946 dans les deux modes. La mesure et la cause
+      (warp = 32 pages distinctes, 16× d'amplification de secteur) restent au
+      journal.
 
 **P1 — cache multi-tour, périmètre servi, couverture MoE**
 - [x] **R22 snapshots multi-agents** — cause : sous `--prefix-resume exact`
@@ -64,24 +68,27 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       à `NS=3` : décodage **4,51 → 8,21 tok/s (1,82×)**, texte identique,
       acceptation 40,3 % (66/61/37 % aux profondeurs 1–3). Les 14 cas
       `mtp.draft_head` sont couverts et les tables MTP 48 le sont par R23
-      (968/968 au total).
-- [ ] 2.11/2.12 — formes mixtes par couche et rows `mod4` (seulement si `tp=4`).
+      (968/968 à l'époque ; 948/948 au HEAD W28).
+- [~] 2.11/2.12 — experts bf16 protégés (absents de Flash-Next) et rows `mod4`
+      (seulement si `tp=4`).
 
 **P2 — couverture, doc, clôture**
-- [x] 5.5 R9 — **résolu (W27)** : le 2B IQ8R charge et sert à `NS=0` (rows
-      groupe 256 des trois producteurs et du GEMM `i8a8h`).
+- [x] 5.5 R9 — **résolu (W27/W28)** : le 2B IQ8R sert à `NS=0` et à `NS=3`
+      (DSpark, 1,56×) ; rows groupe 256 des trois producteurs, du GEMM `i8a8h`,
+      de `gate_had_quant_i8g` et du fold gated 256.
 - [x] 5.6 — **décidé (2026-11-17)** : `RAPPORT_RDNA3.md` est ajouté au dépôt.
-- [x] 1.5 / 5.7 / 8.6 — `docs/OPS.md` (rows, dont les cinq ops QSA) et
-      `libr3d/README.md` (inventaire 169 rows / 101 schémas, limites connues) ;
+- [x] 1.5 / 5.7 / 8.6 — `docs/OPS.md` (rows, dont les cinq ops QSA et IQ8R) et
+      `libr3d/README.md` (inventaire **190 rows / 104 schémas**, limites
+      connues) ;
       2.9 la row MoE est déjà documentée dans `docs/OPS.md` (§`moe_gemm_q`,
       w4nl) ; 3.9 les cinq ops QSA sont documentées (W24).
 - [ ] `qsa_tail_store` / `qsa_work` — refuser explicitement un index qui n'est
       pas i32 (le shim caste sans vérifier) et ajouter le test de refus ; écart
       relevé pendant W24, sans impact sur le moteur qui alloue i32.
-- [x] 8.7 — handover final de phase (`HANDOVER_RDNA3_PHASE7.md`, état W27).
+- [x] 8.7 — handover final de phase (`HANDOVER_RDNA3_PHASE7.md`, état W28).
 - [ ] 6.1–6.6 — optimisations différées (non bloquantes).
-- [ ] **Écart RDNA4 → RDNA3** — **233 rows / 176 ops** absents de `libr3d`
-      (toutes architectures ; les cinq rows IQ8R du tronc sont livrées en W27) ;
+- [ ] **Écart RDNA4 → RDNA3** — **218 rows / 176 ops** absents de `libr3d`
+      (toutes architectures ; IQ8R, les folds et les collectifs sont livrés) ;
       la cible v1 n'en manque aucun sur ses chemins exercés. Périmètre à
       décider, feuille de route **§D** et liste complète `RAPPORT_RDNA3.md` §10.
 - Hors v1 : codebook `w4nl` dans `w4a8` seulement (MTP et vision sont revenus
@@ -141,7 +148,9 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       IQR à M=32, 51 % w4nl à M=16 ; M=1 borné par le treillis)
 - [x] M5 / M6 — Flash-Next texte 1/4/6 séquences, 8k et 16k, démo,
       robustesse et vision ; R21 et R22 résolus
-- [!] M2 — η lien **1,7 %** contre 80 % : cause mesurée (`hc_read`), lot W21
+- [~] M2 — le η lien de W18 (**1,7 %** contre 80 %) avait `hc_read` pour cause
+      principale ; la correction W28 (4,5× à M=1, décodage 4,48 → 12,73 tok/s)
+      rend le chiffre caduc : **à re-mesurer** de bout en bout (item 2.8/8.3).
 
 ## 1. W1/W2 — formes IQR restantes (prérequis MoE)
 
@@ -154,14 +163,14 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       testés (W14), **`kSigned` 8 livré (W15)**, `w4nl` livré (W15, 2.10).
 - [x] 1.4 Tests device des formes : table/grille, `kSigned` et `w4nl` couverts
       par leurs lots (W14/W15).
-- [ ] 1.5 Mettre à jour `docs/OPS.md`, `libr3d/README.md` et le tableau des
-      tailles de plans pour les formes ajoutées.
+- [x] 1.5 `docs/OPS.md`, `libr3d/README.md` et `AGENTS.md` portent les formes
+      ajoutées (IQ8R comprise, W27/W28).
 - [x] 1.6 **`kSigned` 8** : `RAD_I8 → kSigned, B=8`, `X(kSigned,8,0,0,0,kBf16)`
       dans `R3D_IQR_FORMS`, acceptation dans les trois familles, décodage i8
       direct, bandes mixtes `kSigned`+`kTrellisMad`. Agent W15 dédié.
-- [!] 1.7 Vérifier l'agrégation par bande : une row qui accepte les deux formes
-      couvre `N=512 K=2560` et `N=2560 K=6144` (MTP 48). **Requis depuis
-      l'ADR-7** : MTP 48 est servi, donc la bande existe dans le run.
+- [x] 1.7 Agrégation par bande : une row qui accepte les deux formes couvre
+      `N=512 K=2560` et `N=2560 K=6144` (MTP 48) ; **MTP 48 servi** et ses
+      tables couvertes par kbench depuis R23 (W25).
 
 ## 2. W5 — MoE IQR / jalon M2 (~4 semaines, chemin critique)
 
@@ -173,25 +182,29 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [x] 2.3 Run map : tri des lignes, portée par expert, bande ≤ 16 lignes et
       préfill (`moe_iqr_device_test` 15/15 vert).
 - [x] 2.4 Noyau par expert, tuile de 16 lignes, résidence en préfill.
-- [~] 2.5 Mélange de formes : treillis et **`w4nl` livrés (W15)** ; restent les
-      formes mixtes dans une même couche (2.11) et la couverture des experts
-      bf16 protégés.
+- [x] 2.5 Mélange de formes : treillis et **`w4nl` livrés (W15)** ; la couche
+      réelle du conteneur (treillis `gate_up` + `w4nl` `down`) est couverte par
+      R23/W23 (kbench 948/948). Les experts bf16 protégés ne sont pas exercés
+      par Flash-Next (voir 2.11).
 - [x] 2.6 Échelles par expert/ligne/bloc, lignes abandonnées, experts à zéro
       ligne, top-k variable (couvert par `moe_iqr_device_test`).
-- [~] 2.7 Tests : synthétiques et référence hôte **réconciliés (W14/W15)** ;
-      la couche réelle du conteneur reste à faire, bloquée par le layout des
-      tables MoE dans kbench (R23).
+- [x] 2.7 Tests : synthétiques et référence hôte **réconciliés (W14/W15)** ; la
+      couche réelle est couverte depuis R23 (tables des 5 plans posées dans
+      kbench, 948/948, 0 divergence).
 - [~] 2.8 Mesure M2 : décodage 1 et 4 séquences, préfill 2048/4096, **η lien
-      ≥ 80 %**. Fait à froid le 2026-11-16 : η lien = **1,7 %** (42 tok/s), le
+      ≥ 80 %**. Mesuré à froid le 2026-11-16 : η lien = **1,7 %** (42 tok/s), le
       plafond étant `hc_read` (89 tok/s à lui seul), pas le MoE ; le temps par
-      row MoE n'est **pas mesurable** sur ce conteneur (`kbench` refuse le format
-      des tables, 110 cas sautés) — voir `TABLEAU_REEL_IDEAL_RDNA3.md`.
-- [ ] 2.9 Doc de la row MoE et des limites connues.
+      row MoE est mesuré depuis R23 (IQR 70,5 % à M=32, w4nl 51 % à M=16).
+      **À re-mesurer** : W28 a corrigé `hc_read` (décodage 4,48 → 12,73 tok/s).
+- [x] 2.9 Doc de la row MoE et des limites connues (`docs/OPS.md`,
+      `libr3d/README.md`, `AGENTS.md`).
 - [x] 2.10 **`moe_gemm_w4nl`** : forme `kW4NL` (table f32[16], E4M3/64 + f32,
       `group=64`), row device, `a_order` token/sorted, N=1280/2560,
       K=2560/640, MTP 48. **Requis pour Flash-Next** (25 590 poids `down`).
-- [ ] 2.11 MoE : formes mixtes dans une couche (treillis gate_up + w4nl down)
-      et experts bf16 protégés via `moe_gemm_bf16`.
+- [~] 2.11 MoE : les formes mixtes dans une couche (treillis `gate_up` + `w4nl`
+      `down`) sont couvertes (R23) ; restent les experts bf16 protégés via
+      `moe_gemm_bf16`, absents de Flash-Next (à couvrir si un conteneur les
+      porte).
 - [ ] 2.12 `moe_gemm_iqr_mod4`/`moe_gemm_w4nl_mod4` seulement si `tp=4`.
 
 ## 3. W7 — QSA / jalon M3 (livré en W14, tests verts)
@@ -203,8 +216,10 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [x] 3.5 `qsa_select` (14 cas, 781 checks)
 - [x] 3.6 Sélection identique à la référence, égalité dense sous le seuil
 - [x] 3.7 Cas : plusieurs séquences, blocs incomplets, topk large, signed
-- [ ] 3.8 Mesure : temps de l'indexeur par pas et surcoût de lancement
-- [ ] 3.9 Doc des cinq ops QSA et de leurs refus
+- [x] 3.8 Mesure : temps par row à froid (W18, `qsa_work`/`qsa_block_key`/
+      `qsa_score`/`qsa_select`) et `qsa_score` à M=512 livré à 2,23 ms
+      (**36×**, W28) ; le surcoût de lancement est au plancher (`floor`).
+- [x] 3.9 Doc des cinq ops QSA et de leurs refus (`docs/OPS.md`).
 
 ## 4. Rows et formes découvertes par l'audit (W15)
 
@@ -236,9 +251,12 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       rel_l2 0,53 → 1,7e-3) et trois formes QSA alignées. Les 78 cas non
       couverts étaient les tables MTP 48 et `ngram_hint` : **MTP 48 est
       exigible depuis l'ADR-7** (R25), `ngram_hint` reste sans oracle et n'est
-      pas une régression. Depuis R23/W25, le total est **968/968**
-      (Flash-Next) et **683/683** (27B), 0 échec, 0 divergence ; restent 10
-      `gemm_nt_q_gated` i8a8h sans référence libref et 8 `ngram_hint`.
+      pas une régression. Depuis R23/W25, le total était **968/968**
+      (Flash-Next) et **683/683** (27B) ; au HEAD W28 il est **948/948**,
+      **384/384** (2B) et **653/653** (27B), 0 échec, 0 divergence — la baisse
+      du compte vient des ops déclarées qui replient des cas élémentaires, pas
+      d'une perte de couverture (voir `AGENTS.md`). Restent les 16 schemas sans
+      oracle libref, dont `gate_had_quant_i8g` (couvert par un test device).
 - [x] 4bis.3 Configuration v1 : `placement: expert_tiered`, `host-pool-mib:
       43000`, KV i8, **`max_mixed_tok ≤ 2048`** (le plan `score` fait 512 MiB
       à 2048 lignes, 1 Gio à 4096 et le plugin refuse), `max-model-len: 8192`.
@@ -280,15 +298,16 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 ## 5. Mesures et rapport final (M4/M7)
 
 - [x] 5.1 HC : coût de `hc_read`/`hc_write`/`hc_enter`/`hc_project` mesuré à
-      froid : `hc_read` 1,77 ms à M=1, 470 ms à M=2 048 ;
+      froid : `hc_read` 1,77 ms à M=1, 470 ms à M=2 048 (W18) ; **corrigé en
+      W28** : 428 µs à M=1 (4,5×), 12,4 ms à M=512 (9,2×) ;
       `hc_enter`/`hc_write` au plancher ; `hc_project` sans bande dans ce
       conteneur).
 - [x] 5.2 PLE : `ple_gate` 23,1 µs à M=1 / 69 TFLOP/s à M=2 048 ; `ple_conv`
       5,8 µs à M=1 / 160 GB/s à M=2 048 ; `ngram_hint` reste sans oracle.
 - [x] 5.3 Lignes MoE, QSA, HC, PLE, Flash-Next remplies à froid. Le MoE par row
-      reste bloqué par le format des tables du conteneur (110 cas sautés par
-      kbench, « container format error ») et η lien est calculé de bout en bout
-      (1,7 %).
+      est mesuré depuis R23 (IQR 70,5 % à M=32, w4nl 51 % à M=16 ; M=1 borné par
+      le treillis) ; le η lien de bout en bout (1,7 %) date de W18, **avant** la
+      correction `hc_read` de W28 (décodage 4,48 → 12,73 tok/s) : à re-mesurer.
 - [x] 5.4 R3 — mesurer le temps de relayout/chargement du 27B : **15,87 GiB en
       2,7 s** (6,2 GB/s, 1,7 s de disque), prêt en 3,3 s ; pas de vectorisation
       nécessaire. Rejeu : préfill 318,8 tok/s à 844, décodage 23,2/29,4 tok/s.
@@ -301,15 +320,14 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
       `.so`, vert sur la nouvelle), kbench 27B 605/605 et Flash-Next 856/856 dans
       les deux modes (par défaut et `--band-capacity`), 27B `SEQS=4` à 67,3 tok/s
       agrégés.
-- [~] 5.5 R9 — valider E4M3/rotated sur un modèle non-IQR : **inexécutable sur
-      l'hôte** (inventaire vérifié : seuls le 27B IQR et Flash-Next IQR).
-      Dérogation documentée dans `SUIVI_LOTS_RDNA3.md` §R9 ; à reprendre dès
-      qu'un conteneur non-IQR 2B/4B est présent.
-- [~] 5.6 `RAPPORT_RDNA3.md` **mis à jour** (encadré, §7.3 corrigée, §7.5
-      mesures réelles, §9 révisée) ; reste la **décision d'ajout au dépôt**, qui
-      appartient à l'utilisateur.
-- [ ] 5.7 Mettre à jour `docs/OPS.md`, `libr3d/README.md` et les limites connues
-      (dont le contrat capacité/étendue, aujourd'hui dans `AGENTS.md`).
+- [x] 5.5 R9 — **résolu (W27)** : un conteneur non-IQR est sur l'hôte
+      (MiniCPM5-2B IQ8R) ; il sert à `NS=0` puis `NS=3` (W28), kbench
+      **384/384** sur le conteneur entier, cas device IQ8R (103 checks).
+- [x] 5.6 `RAPPORT_RDNA3.md` **est au dépôt** (décision du 2026-11-17) et à
+      jour (W27/W28).
+- [x] 5.7 `docs/OPS.md` (dont la vue 3D de `gate_had_quant_i8g`),
+      `libr3d/README.md` (inventaire 190 rows) et `AGENTS.md` (contrat
+      capacité/étendue, mutation du graphe par op déclarée) sont à jour.
 
 ## 6. Optimisations différées (non bloquantes pour M5/M6)
 
@@ -319,7 +337,8 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [ ] 6.3 `attn_dense` hd72 : mesurer M=16384 (kbench s'arrête à 512).
 - [ ] 6.4 `attn_paged` h256 : mesure isolée ; split du préfill interdit par
       l'ordre exact exigé.
-- [ ] 6.5 Déduplication `dot4_i8`/`i8_codes4`/`wave_max_f` (risque de dérive).
+- [x] 6.5 Déduplication `dot4_i8`/`i8_codes4` (partagés dans `r3d_common.h`,
+      W25 branche `rdna3-cleanup-helpers`) ; `wave_max_f` reste par noyau.
 - [ ] 6.6 Vérifier la reproductibilité des builds (builds neufs pour tout A/B).
 
 ## 7. Périmètre v1 — points tranchés par les ADR
@@ -333,26 +352,30 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 
 ## 8. Critères de clôture du projet
 
-- [x] 8.1 `r3d_selftest` **164/0/15**, `iqr_device_test`, `logits_bf16_device_test`,
+- [x] 8.1 `r3d_selftest` **190/0/16**, `iqr_device_test`, `logits_bf16_device_test`,
       `moe_iqr_test`, `moe_w4nl`, `gather_rows_u8`, `mtp_enter_e4m3`,
-      `logit_rerank_iqr` et les quatre tests QSA verts ; kbench Flash-Next
-      **968/968** et 27B **683/683**, 0 échec, 0 divergence.
+      `logit_rerank_iqr`, les quatre tests QSA, `ple_hc`, `act_i8g_group256` et
+      `tp2_collectives` verts ; kbench Flash-Next **948/948**, 2B **384/384** et
+      27B **653/653**, 0 échec, 0 divergence.
 - [x] 8.2 Flash-Next démarre et génère (texte, 1 et 4 séquences, préfills
       2048/4096) sans fallback ni avertissement nouveau.
 - [~] 8.3 MoE conforme (treillis + `w4nl` + bf16 protégé, écart borné documenté)
-      ; le **η lien ≥ 80 %** est mesuré et **non tenu** (1,7 % global) — cause
-      identifiée (`hc_read`, 47 % du préfill), pas le MoE ; le temps par row
-      MoE est mesuré par R23 (η 70,5 % IQR à M=32, 51 % w4nl à M=16 ; M=1
-      borné par le décodage treillis, 10–12 %).
+      ; le **η lien ≥ 80 %** mesuré à W18 (**1,7 % global**) n'est pas tenu ;
+      sa cause principale (`hc_read`, 47 % du préfill) a été corrigée en W28
+      (**4,5× à M=1, décodage 4,48 → 12,73 tok/s**), donc **le η est à
+      re-mesurer** avant de conclure. Le temps par row MoE est mesuré par R23
+      (η 70,5 % IQR à M=32, 51 % w4nl à M=16 ; M=1 borné par le décodage
+      treillis, 10–12 %).
 - [x] 8.4 QSA identique à la référence et égal au dense sous le seuil (781/819
       checks, kbench 0 divergence).
 - [x] 8.5 Tableau réel/idéal complet, écarts expliqués, RAPPORT à jour :
-      Flash-Next, kbench, HC/PLE, QSA, MoE par row et MiniCPM5-2B mesurés ; η
-      lien calculé ; `qsa_score` à M=512 mesuré avec sa cause (W24) ;
-      `RAPPORT_RDNA3.md` est au dépôt (5.6).
+      Flash-Next, kbench, HC/PLE, QSA, MoE par row et MiniCPM5-2B mesurés ; le
+      η lien de W18 reste à re-mesurer après W28 (cf. 8.3) ; `qsa_score` à
+      M=512 livré (36×, W28) ; `RAPPORT_RDNA3.md` est au dépôt (5.6).
 - [x] 8.6 Documentation des rows, architectures, limites et perf à jour
-      (`docs/OPS.md` : cinq ops QSA, `gather_rows_u8` ; `libr3d/README.md` :
-      inventaire 169 rows / 101 schémas (W27), familles, limites connues).
+      (`docs/OPS.md` : cinq ops QSA, `gather_rows_u8`, IQ8R groupe 256 et la vue
+      3D de `gate_had_quant_i8g` ; `libr3d/README.md` : inventaire
+      **190 rows / 104 schémas** (W28), familles, limites connues).
 - [x] 8.7 Handover final écrit (`HANDOVER_RDNA3_PHASE7.md`) et journal tenu à
       la date de clôture ; §8 donne la reprise immédiate.
 - [x] 8.8 **Vision servie (ADR-7)** : build `RAD_WITH_FFMPEG=ON`,
@@ -362,7 +385,8 @@ Ordre recommandé. Les fiches de lot sont dans `SUIVI_LOTS_RDNA3.md`
 - [x] 8.9 **MTP Flash-Next (ADR-7)** : `mtp_enter` et `logit_rerank` en device,
       run à `NS=3` et gain mesuré (4,51 → 8,21 tok/s, 1,82×, texte identique,
       40,3 % d'acceptation) ; les 14 cas `mtp.draft_head` et les tables MTP 48
-      sont couverts par kbench (968/968, 0 échec, 0 divergence).
+      sont couverts par kbench (968/968 à l'époque, 948/948 au HEAD W28, 0 échec,
+      0 divergence).
 
 ## 9. Ordre de marche suggéré (parallélisable)
 
@@ -383,14 +407,15 @@ le reste concerne Flash-Next.
 
 Mesure à l'état `de81ffe` : `libr4d/r4d_rows.cpp` (**457 rows, 274 ops**) contre
 `libr3d/r3d_rows.cpp` (**164 rows, 101 ops**), soit **238 rows / 179 ops** sans
-équivalent RDNA3. Depuis W27 (IQ8R), `libr3d` en a **169** : l'écart courant est
-de **233 rows / 176 ops**. La liste complète (op par op, famille par famille) est
-dans `RAPPORT_RDNA3.md` §10 ; cette section est la feuille de route.
+équivalent RDNA3. La même comparaison par nom d'op au HEAD (190 rows / 104 ops,
+W28) redonne ce chiffre de départ et donne l'écart courant : **218 rows /
+176 ops**. La liste complète (op par op, famille par famille) est dans
+`RAPPORT_RDNA3.md` §10 ; cette section est la feuille de route.
 
 - **La cible v1 actuelle n'a aucun op manquant** sur ses chemins exercés
-  (kbench 968/968, 683/683 ; selftest 169/0/15). Les lignes ci-dessous sont
-  conditionnées par le périmètre multi-architectures.
-- [ ] **D0 — décider le périmètre** : toutes les architectures `arch/` (233
+  (kbench 948/948, 384/384 et 653/653 ; selftest 190/0/16). Les lignes
+  ci-dessous sont conditionnées par le périmètre multi-architectures.
+- [ ] **D0 — décider le périmètre** : toutes les architectures `arch/` (218
       rows restants) ou seulement la cible v1 + l'artefact IQ8R ? Sans cette
       décision, D5–D9 restent hors engagement.
 - [x] **D1 — IQ8R groupe 256 (MiniCPM5-2B, non-IQR)** — **livré pour le tronc

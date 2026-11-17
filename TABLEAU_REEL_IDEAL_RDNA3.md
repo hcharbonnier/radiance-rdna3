@@ -459,7 +459,7 @@ cas M=1/K=2560). Serveur Flash-Next, même prompt, greedy, `max_tokens 256`,
 
 **1,82×** le décodage à texte identique, sans toucher au préfill. Les 14 cas
 `mtp.draft_head` et les tables MTP 48 sont couverts par kbench (R23 + W25,
-968/968).
+968/968 à l'époque ; 948/948 au HEAD W28).
 
 ### Ce que M6 ne démontre pas
 
@@ -469,7 +469,7 @@ cas M=1/K=2560). Serveur Flash-Next, même prompt, greedy, `max_tokens 256`,
 - L'image/vision : **levé en W26** (voir § Vision) ; la vidéo et l'audio ne sont pas
   testés.
 - Le MTP de Flash-Next : **levé en W25** (voir § MTP) ; la couverture kbench
-  des tables MTP 48 est faite en R23 (968/968).
+  des tables MTP 48 est faite en R23 (968/968 à l'époque ; 948/948 au HEAD W28).
 
 ## MiniCPM5-2B IQ8R (W27, 2026-11-17)
 
