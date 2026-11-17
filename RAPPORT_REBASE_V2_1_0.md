@@ -463,9 +463,10 @@ La branche reste volontairement très au-dessus de `main` : **142 fichiers,
    Reste la décision push/merge et la soumission amont.
 8. **Attention** : `attn_paged_device_test` couvre désormais les rows h256 i8
    (gqa6 bs16, gqa12 bs4, décodage/préfill, court + split) à **8/8**, avec un
-   accord à **1 bf16 ULP** de libref — **pas bit-exact**. Trancher le contrat
-   (tolérance vs ordre) avant les multi-rangées/GQA/hoisting ; kbench ne
-   chronomètre toujours pas l'attention.
+   accord à **1 bf16 ULP** de libref — écart **documenté** (polynôme `exp` à
+   1 f32 ulp, parenthèses du split-KV), pas bit-exact. Les multi-rangées/GQA/
+   hoisting doivent **préserver l'ordre par rangée** ; kbench ne chronomètre
+   toujours pas l'attention.
 
 ---
 

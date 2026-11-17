@@ -221,8 +221,9 @@ MiniCPM **1 802/1 802**, 0 échec (pires rel_l2 3,619e-03 / 1,520e-02 /
 Flash-Next long contexte 3 252 tokens **234,8 tok/s** ; cache de tune livré
 dans `build-clean/radiance_home/tune` (bf16 `impl=3`, **5,9×** sur les rows
 tiled) ; `attn_paged_device_test` **8/8** (h256 i8 decode/préfill, gqa6 bs16
-et gqa12 bs4, court + split) à **1 bf16 ULP** de libref — pas bit-exact, la
-décision de contrat reste ouverte avant les multi-rangées. `final-all` est
+et gqa12 bs4, court + split) à **1 bf16 ULP** de libref — écart documenté
+(polynôme `exp` à 1 f32 ulp, parenthèses du split-KV) ; les multi-rangées
+doivent préserver l'ordre par rangée. `final-all` est
 l'arbre **W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ;
 détails dans `RAPPORT_REBASE_V2_1_0.md`.
 

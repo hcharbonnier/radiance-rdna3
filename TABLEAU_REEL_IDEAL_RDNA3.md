@@ -641,8 +641,9 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
   (3,95× sur N=256 M=1792). Caches 27B + Flash-Next fusionnés dans
   `build-clean/radiance_home/tune` (artefact machine, non versionné).
 - **Attention** : `attn_paged_device_test` **8/8** (h256 i8 gqa6/gqa12,
-  décodage/préfill, court + split) à **1 bf16 ULP** de libref, pas bit-exact ;
-  kbench ne la chronomètre pas ; contrat à trancher avant multi-rangées.
+  décodage/préfill, court + split) à **1 bf16 ULP** de libref, écart
+  documenté (polynôme `exp`, split-KV) ; les multi-rangées doivent préserver
+  l'ordre par rangée ; kbench ne la chronomètre pas.
 - **Validation** : kbench 27B **3 181/3 181**, Flash-Next **4 786/4 786**,
   MiniCPM **1 802/1 802**, 0 échec ; détail dans
   `RAPPORT_REBASE_V2_1_0.md`.

@@ -1294,8 +1294,9 @@ GEMV par rangée, pas un défaut de parallélisme ; l'hypothèse 2–4× est ret
 **Attention couverte.** `attn_paged_device_test` (nouveau) compare les rows
 h256 i8 gqa6 bs16 et gqa12 bs4, décodage et préfill, court et split, à
 libref : **8/8** à **1 bf16 ULP**, pas bit-exact. La row revendique le
-bit-exact ; décision de contrat (tolérance vs ordre) à prendre avant les
-multi-rangées. kbench ne chronomètre toujours pas l'attention.
+bit-exact ; écart documenté (polynôme `exp` à 1 f32 ulp, parenthèses du
+split-KV) ; les multi-rangées doivent préserver l'ordre par rangée. kbench ne
+chronomètre toujours pas l'attention.
 
 **Amont.** `down_w5_fp8` et `ngram_ids_i32` sont deux régressions de `main`
 2.1.0 (compilation et service RDNA3) ; correctifs locaux `5e98eb9` et
