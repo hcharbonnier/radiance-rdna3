@@ -220,9 +220,12 @@ MiniCPM **1 802/1 802**, 0 échec (pires rel_l2 3,619e-03 / 1,520e-02 /
 3,485e-03) ; préfill 27B **288 tok/s** (spécialisation `GS=1`, `faa89fd`),
 Flash-Next long contexte 3 252 tokens **234,8 tok/s** ; cache de tune livré
 dans `build-clean/radiance_home/tune` (bf16 `impl=3`, **5,9×** sur les rows
-tiled) ; `attn_paged_device_test` **8/8** (h256 i8 decode/préfill, gqa6 bs16
-et gqa12 bs4, court + split) à **1 bf16 ULP** de libref — écart documenté
-(polynôme `exp` à 1 f32 ulp, parenthèses du split-KV) ; les multi-rangées
+tiled) ; `attn_paged_device_test` **8 checks/9 cas** (h256 i8 decode/préfill,
+gqa6 bs16 et gqa12 bs4, court + split ; le 9e est le mode temps
+`RAD_ATTN_BENCH=1`) à **1 bf16 ULP** de libref — écart documenté (polynôme
+`exp` à 1 f32 ulp, parenthèses du split-KV) ; le mode temps, **scratch/split-KV
+alloué**, donne **4,06 ms** (gqa6) / **2,37 ms** (gqa12) à 32K q=1 (sans
+scratch, repli `splits=1` non servi : 29,1 / 33,3 ms) ; les multi-rangées
 doivent préserver l'ordre par rangée. `final-all` est
 l'arbre **W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ;
 détails dans `RAPPORT_REBASE_V2_1_0.md`.

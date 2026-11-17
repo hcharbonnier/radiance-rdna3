@@ -219,10 +219,13 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   token ; profiler le graphe servi avant toute refonte.
 - **R34** — *couvert (W29)* : `attn_paged_device_test`
   couvre les rows h256 i8 (gqa6 bs16, gqa12 bs4) en décodage/préfill, court et
-  split : **8/8**, accord à **1 bf16 ULP** de libref, **pas bit-exact** mais
-  écart **documenté** (polynôme `exp` à 1 f32 ulp, parenthèses du split-KV).
-  Les multi-rangées doivent préserver l'ordre par rangée ; kbench ne
-  chronomètre toujours pas l'attention.
+  split : **8 checks/9 cas** (le 9e est le mode temps), accord à **1 bf16 ULP**
+  de libref, **pas bit-exact** mais écart **documenté** (polynôme `exp` à
+  1 f32 ulp, parenthèses du split-KV). `RAD_ATTN_BENCH=1`, **scratch/split-KV
+  alloué**, donne **4,06 ms** (gqa6) / **2,37 ms** (gqa12) à 32K q=1 (sans
+  scratch, repli `splits=1` non servi : 29,1/33,3 ms) ; prochaine
+  optimisation : préfill q=17 (splits=1) et multi-rangées verify M=4, en
+  préservant l'ordre par rangée.
 
 ## W29 — rebase `main` 2.1.0 + GS=1 (2026-11-17)
 

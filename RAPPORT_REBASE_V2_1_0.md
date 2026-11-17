@@ -238,7 +238,7 @@ gfx1151), comme attendu. Aucun doublon de row ou de schéma après le rebase
 | `act_i8g_group256_device_test` | 103 checks, 6 cas | — |
 | `ple_hc_device_test` | 48 checks, 8 cas | — |
 | `tp2_collectives_device_test` | 12 checks, 2 cas | — |
-| `attn_paged_device_test` | 8 checks, 8 cas (1 bf16 ULP, pas bit-exact) | — |
+| `attn_paged_device_test` | 8 checks, 9 cas (dont le mode bench ; 1 bf16 ULP) | — |
 | `moe_iqr_device_test` / `moe_w4nl_device_test` | exact (bf16) | — |
 | `qsa_*_device_test` | block_key 640 valeurs ; score 72 checks ; select 781 checks ; work 819 checks | — |
 | `router_fused_device_test` | 38 checks, 8 cas | — |
@@ -360,6 +360,16 @@ d'un GEMV par rangée — pas de chantier 2–4×) ; `logit_rerank` 32,9 µs. La
 géométrie `qsa_score` des fixtures a changé (n=128, heads=4, blocks=65 536,
 seqs=8 : 85,3 / 400,0 µs) et n'est pas comparable aux chiffres W26.
 
+**Attention (`RAD_ATTN_BENCH=1`, h256 i8, médiane de 3×20, scratch alloué —
+le chemin servi avec split-KV)** : gqa6/bs16 décodage q=1 **58,9 / 235,6 /
+976,5 / 4 059,4 µs** à ctx 512/2 048/8 192/32 768 ; gqa12/bs4 **39,9 / 560,9 /
+2 365,8 µs** ; préfill q=17 **3 166,4** (2 048) / **12 052,4 µs** (8 192).
+Le repli sans scratch (`splits=1`) donnait 29 133 / 33 285 µs à 32K : c'était
+le chemin non servi, pas le baseline. Coût ~0,12 µs/token, ~8 GB/s de KV
+effectif (encore loin de la borne) ; le levier restant est le **préfill q=17**
+(`splits=1`) et le **multi-rangées verify M=4** ; la GQA est déjà partagée par
+tuile.
+
 Le rebase est donc validé en **correction et en performance**, et la dette de
 préfill W27 est soldée.
 
@@ -462,11 +472,14 @@ La branche reste volontairement très au-dessus de `main` : **142 fichiers,
    et `SUIVI_LOTS_RDNA3.md` sont à jour (195 rows, `main` 2.1.0, GS=1, W29).
    Reste la décision push/merge et la soumission amont.
 8. **Attention** : `attn_paged_device_test` couvre désormais les rows h256 i8
-   (gqa6 bs16, gqa12 bs4, décodage/préfill, court + split) à **8/8**, avec un
-   accord à **1 bf16 ULP** de libref — écart **documenté** (polynôme `exp` à
-   1 f32 ulp, parenthèses du split-KV), pas bit-exact. Les multi-rangées/GQA/
-   hoisting doivent **préserver l'ordre par rangée** ; kbench ne chronomètre
-   toujours pas l'attention.
+   (gqa6 bs16, gqa12 bs4, décodage/préfill, court + split) à **8 checks/9
+   cas**, avec un accord à **1 bf16 ULP** de libref — écart **documenté**
+   (polynôme `exp` à 1 f32 ulp, parenthèses du split-KV), pas bit-exact. Le
+   mode **`RAD_ATTN_BENCH=1`** mesure **4,06 ms** (gqa6) / **2,37 ms**
+   (gqa12) à 32K q=1 **avec le scratch/split-KV** (sans scratch : 29,1/33,3 ms,
+   chemin non servi). Prochaine optimisation : **préfill q=17** (splits=1) et
+   **multi-rangées verify M=4**, en préservant l'ordre par rangée ; la GQA est
+   déjà partagée par tuile.
 
 ---
 

@@ -1295,8 +1295,14 @@ GEMV par rangée, pas un défaut de parallélisme ; l'hypothèse 2–4× est ret
 h256 i8 gqa6 bs16 et gqa12 bs4, décodage et préfill, court et split, à
 libref : **8/8** à **1 bf16 ULP**, pas bit-exact. La row revendique le
 bit-exact ; écart documenté (polynôme `exp` à 1 f32 ulp, parenthèses du
-split-KV) ; les multi-rangées doivent préserver l'ordre par rangée. kbench ne
-chronomètre toujours pas l'attention.
+split-KV). `RAD_ATTN_BENCH=1`, **scratch/split-KV alloué** : gqa6/bs16 q=1
+**58,9 / 235,6 / 976,5 / 4 059,4 µs** à ctx 512/2048/8192/32768 ; gqa12/bs4
+**39,9 / 560,9 / 2 365,8 µs** ; préfill q=17 **3 166,4 / 12 052,4 µs**.
+Sans scratch (repli `splits=1`, non servi) les décodages donnent
+437,7 / 1 973,8 / 7 313,6 / 29 133 µs et 499,4 / 8 505,2 / 33 285 µs — à ne
+pas utiliser comme baseline. Coût ~0,12 µs/token, ~8 GB/s de KV effectif ;
+levier restant : préfill q=17 (splits=1) + multi-rangées verify (M=4), en
+préservant l'ordre par rangée. kbench ne chronomètre toujours pas l'attention.
 
 **Amont.** `down_w5_fp8` et `ngram_ids_i32` sont deux régressions de `main`
 2.1.0 (compilation et service RDNA3) ; correctifs locaux `5e98eb9` et
