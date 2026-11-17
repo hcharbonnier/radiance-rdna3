@@ -406,7 +406,9 @@ producteurs fusionnés n'ont pas d'oracle `libref` (« Not covered ») et sont
 couverts par `act_i8g_group256_device_test` (67 checks sur 4 cas). Service en
 **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch n'acceptent pas i8 à
 `head_dim=128`) : réponses cohérentes, **40,2 tok/s** sur 60 tokens générés
-(69,0 tok/s sur 16), préfill 184–367 tok/s sur ces prompts courts.
+(69,0 tok/s sur 16), préfill 184–367 tok/s sur ces prompts courts. Le conteneur
+2B **n'a pas été rejoué en entier** : les autres ops ne sont pas modifiées, et
+leur non-régression est établie sur Flash-Next et le 27B.
 
 ## 8. Étape d'optimisation (après validation)
 
