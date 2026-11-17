@@ -752,7 +752,10 @@ and is wrong, so these are separate ops.
 attention's gate is a column slice of the `[q|gate]` projection) with `had_quant_act_i8g`'s
 quantiser on its pass, for a gated attention's rotated out projection (`i8a8h`); `out_bf16` is the
 unrotated product. `n` is a multiple of 128; `group` is 128, or 256 for an IQ8R out projection (one
-scale per 256 columns of a (token, head) row).
+scale per 256 columns of a (token, head) row). The op is issued on the whole projection, so `x`,
+`q` and `out_bf16` are `[T, heads*head_dim]` while `n` names the head width, and `gate` is a
+`[T, heads, head_dim]` view whose head stride is wider than `head_dim`; a rotation block stays
+inside one head (W28).
 
 `rmsnorm_quant_i8` is `rmsnorm` with `quant_act_i8`'s quantiser on its pass: step-order int8 codes
 and one f32 scale per row, what `gemm_nt_q` reads at `dtype=w4a8` and `w8a8`. With `residual` the
