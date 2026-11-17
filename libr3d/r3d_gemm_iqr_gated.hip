@@ -16,7 +16,10 @@
  * the launch none. `out_bf16`, when bound, receives the gated product the codes were taken over, as
  * the pair writes it.
  *
- * The rotator's width and the quantiser's group are both 128, as the ffn fold declares them.
+ * The rotator's width is 128. The quantiser's group is 128 (the ffn fold) or 256 (IQ8R's gated
+ * feed-forward): at 256 the two 128-column halves are rotated independently under one amax and
+ * one scale, and the K loop folds one exact i32 sub-sum over the group's two 128-K blocks, the
+ * same order gemm_iqr_m16 uses at that width.
  */
 #include "r3d.h"
 #include "r3d_args.h"
@@ -55,24 +58,26 @@ __device__ __forceinline__ float wave_max_f(float v) {
 
 /* MT is the token tile mt_for(M) selects, as r3d_gemm_iqr_m16 uses it: M = 1 is the GEMV's
  * lane-partial fold, above it each lane owns whole (token, row) pairs of the unit. `act` is 0 for
- * silu and 1 for sigmoid, the two the pair's gated quantiser serves. */
-template <class F, int MT>
+ * silu and 1 for sigmoid, the two the pair's gated quantiser serves. GS is the number of 128-K
+ * blocks one scale covers, 1 or 2 (IQ8R). */
+template <class F, int MT, int GS>
 __global__ __launch_bounds__(kUnits * kWave) R3D_WAVES(4)
 void gemm_iqr_gated_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
                            const uint8_t* __restrict__ b, const uint8_t* __restrict__ bs,
                            uint8_t* __restrict__ q, float* __restrict__ s,
                            uint16_t* __restrict__ yo, int M, int N, int K, int a_ld,
                            uint32_t y_ld, int act, uint32_t run_tiles) {
+    static_assert(GS == 1 || GS == 2, "a 256 group is two 128-wide rotations");
     const uint32_t lane = threadIdx.x & (kWave - 1);
     const uint32_t u = threadIdx.x / kWave;
     const uint32_t kg = blockIdx.x;
     const uint32_t n = (uint32_t)N / 2u;
     const uint32_t nkb = (uint32_t)K / 128u;
-    const uint32_t ng = n / 128u;
+    const uint32_t ngrpp = nkb / (uint32_t)GS;   /* K groups the scale plane holds */
+    const uint32_t ng = n / (uint32_t)(GS * kGroup);
+    constexpr uint32_t kQuant = (uint32_t)(GS * kGroup);
     /* Waves 0..7 are the group's gate tiles, 8..15 its up tiles. */
     const uint32_t half = u / kHalfUnits, tile = u % kHalfUnits;
-    const uint32_t rt = kg * kHalfUnits + tile + half * (n / 16u);
-    const uint32_t row0 = rt * 16u;
 
     Ctx c;
     c.W = b;
@@ -81,107 +86,144 @@ void gemm_iqr_gated_kernel(const int8_t* __restrict__ a, const float* __restrict
     c.nkb = nkb;
     c.run_tiles = run_tiles;
     c.tab = nullptr;   /* the W0 forms compute their values; the table forms stage LDS with W5 */
+    c.ngrp = ngrpp;
+    c.gs = (uint32_t)GS;
 
     /* One unit's staging, and the token tile's bf16 gate and up values (gate columns 0..127, up
-     * 128..255). MT == 1 uses the staging as the GEMV's partials. */
+     * 128..255 per 128-wide half). MT == 1 uses the staging as the GEMV's partials. */
     __shared__ __align__(16) uint8_t s_stage[(size_t)kUnits * kPartBytes];
-    __shared__ uint16_t s_val[MT][2 * kGroup];
+    __shared__ uint16_t s_val[MT][2 * GS * kGroup];
 
-    if constexpr (MT == 1) {
-        int* const sP = (int*)(s_stage + (size_t)u * kPartBytes);
-        float acc = 0.0f;
-        for (uint32_t kb = 0; kb < nkb; ++kb) {
-            const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
-            uint32_t w[16];
-            Dec<F>::rows(r, c, 1.0f, w);
-            Dec<F>::unzero(c, rt, kb, w);
-            const uint32_t a4 = *(const uint32_t*)(a + kb * 128u + 4u * lane);
 #pragma unroll
-            for (int qi = 0; qi < 16; ++qi) sP[qi * 33 + lane] = dot4_i8(a4, w[qi], 0);
-            __syncwarp();
-            if (lane < 16) {
+    for (int sg = 0; sg < GS; ++sg) {
+        const uint32_t gk = kg * (uint32_t)GS + (uint32_t)sg;
+        const uint32_t rt = gk * kHalfUnits + tile + half * (n / 16u);
+        const uint32_t row0 = rt * 16u;
+
+        if constexpr (MT == 1) {
+            int* const sP = (int*)(s_stage + (size_t)u * kPartBytes);
+            float acc = 0.0f;
+            for (uint32_t g = 0; g < ngrpp; ++g) {
                 int sub = 0;
+                for (int j = 0; j < GS; ++j) {
+                    const uint32_t kb = g * (uint32_t)GS + (uint32_t)j;
+                    const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
+                    uint32_t w[16];
+                    Dec<F>::rows(r, c, 1.0f, w);
+                    Dec<F>::unzero(c, rt, kb, w);
+                    const uint32_t a4 = *(const uint32_t*)(a + kb * 128u + 4u * lane);
 #pragma unroll
-                for (int l = 0; l < 32; ++l) sub += sP[lane * 33 + l];
-                const float sa = as[kb];   /* M = 1: every weight row shares the token's scale */
-                const float sb = fold_f32<F>(c, row0 + lane, kb);
-                acc += (float)sub * sa * sb;
+                    for (int qi = 0; qi < 16; ++qi) sP[qi * 33 + lane] = dot4_i8(a4, w[qi], 0);
+                    __syncwarp();
+                    if (lane < 16) {
+#pragma unroll
+                        for (int l = 0; l < 32; ++l) sub += sP[lane * 33 + l];
+                    }
+                    __syncwarp();
+                }
+                if (lane < 16) {
+                    const float sa = as[g];   /* M = 1: every weight row shares the token's scale */
+                    const float sb = fold_f32<F>(c, row0 + lane, g * (uint32_t)GS);
+                    acc += (float)sub * sa * sb;
+                }
             }
-            __syncwarp();
-        }
-        if (lane < 16) {
-            const float v = acc * row_scale<F>(c, row0 + lane);
-            s_val[0][half * kGroup + tile * 16u + lane] = f32_to_bf16(v);
-        }
-    } else {
-        uint32_t* const sW = (uint32_t*)(s_stage + (size_t)u * kPartBytes);
-        constexpr int NP = (MT * 16 + kWave - 1) / kWave;   /* (token, row) pairs a lane */
-        float acc[NP];
+            if (lane < 16) {
+                const float v = acc * row_scale<F>(c, row0 + lane);
+                s_val[0][(uint32_t)half * kQuant + (uint32_t)sg * kGroup + tile * 16u + lane] =
+                    f32_to_bf16(v);
+            }
+        } else {
+            uint32_t* const sW = (uint32_t*)(s_stage + (size_t)u * kPartBytes);
+            constexpr int NP = (MT * 16 + kWave - 1) / kWave;   /* (token, row) pairs a lane */
+            float acc[NP];
 #pragma unroll
-        for (int i = 0; i < NP; ++i) acc[i] = 0.0f;
+            for (int i = 0; i < NP; ++i) acc[i] = 0.0f;
 
-        for (uint32_t kb = 0; kb < nkb; ++kb) {
-            const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
-            uint32_t w[16];
-            Dec<F>::rows(r, c, 1.0f, w);
-            Dec<F>::unzero(c, rt, kb, w);
+            for (uint32_t g = 0; g < ngrpp; ++g) {
+                int sub[NP];
 #pragma unroll
-            for (int qi = 0; qi < 16; ++qi) sW[qi * 33 + lane] = w[qi];
-            __syncwarp();
+                for (int i = 0; i < NP; ++i) sub[i] = 0;
+                for (int j = 0; j < GS; ++j) {
+                    const uint32_t kb = g * (uint32_t)GS + (uint32_t)j;
+                    const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
+                    uint32_t w[16];
+                    Dec<F>::rows(r, c, 1.0f, w);
+                    Dec<F>::unzero(c, rt, kb, w);
+#pragma unroll
+                    for (int qi = 0; qi < 16; ++qi) sW[qi * 33 + lane] = w[qi];
+                    __syncwarp();
+
+#pragma unroll
+                    for (int i = 0; i < NP; ++i) {
+                        const int p = (int)lane + kWave * i;
+                        const int m = p / 16, qi = p % 16;
+                        if (m >= M) continue;
+                        const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
+                        const uint32_t* wp = sW + qi * 33;
+#pragma unroll
+                        for (int c4 = 0; c4 < 32; ++c4)
+                            sub[i] = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub[i]);
+                    }
+                    __syncwarp();
+                }
+
+#pragma unroll
+                for (int i = 0; i < NP; ++i) {
+                    const int p = (int)lane + kWave * i;
+                    const int m = p / 16, qi = p % 16;
+                    if (m >= M) continue;
+                    const float sa = as[m * (int)ngrpp + (int)g];
+                    const float sb = fold_f32<F>(c, row0 + qi, g * (uint32_t)GS);
+                    acc[i] += (float)sub[i] * sa * sb;
+                }
+            }
 
 #pragma unroll
             for (int i = 0; i < NP; ++i) {
                 const int p = (int)lane + kWave * i;
                 const int m = p / 16, qi = p % 16;
                 if (m >= M) continue;
-                int sub = 0;
-                const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
-                const uint32_t* wp = sW + qi * 33;
-#pragma unroll
-                for (int c4 = 0; c4 < 32; ++c4)
-                    sub = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub);
-                const float sa = as[m * (int)nkb + (int)kb];
-                const float sb = fold_f32<F>(c, row0 + qi, kb);
-                acc[i] += (float)sub * sa * sb;
+                s_val[m][(uint32_t)half * kQuant + (uint32_t)sg * kGroup + tile * 16u + qi] =
+                    f32_to_bf16(acc[i] * row_scale<F>(c, row0 + qi));
             }
-            __syncwarp();
-        }
-
-#pragma unroll
-        for (int i = 0; i < NP; ++i) {
-            const int p = (int)lane + kWave * i;
-            const int m = p / 16, qi = p % 16;
-            if (m >= M) continue;
-            s_val[m][half * kGroup + tile * 16u + qi] =
-                f32_to_bf16(acc[i] * row_scale<F>(c, row0 + qi));
         }
     }
     __syncthreads();
 
     /* gated_had_quant_i8g's pass, a wave a token: the pair reads the same bf16 gate and up values
-     * back from the [M, 2n] tensor this kernel never materialises. */
+     * back from the [M, 2n] tensor this kernel never materialises. At group 256 the two halves are
+     * rotated on their own and the amax and scale are taken over the pair. */
     if (u < (uint32_t)M) {
         const uint32_t tok = u;
         const uint32_t base = lane * 4u;
-        float v[4];
+        float v[GS][4];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float xg = bf16_to_f32(s_val[tok][base + (uint32_t)j]);
-            const float sg = 1.0f / (1.0f + expf(-xg));
-            const uint16_t h = f32_to_bf16(
-                (act ? sg : xg * sg) * bf16_to_f32(s_val[tok][kGroup + base + (uint32_t)j]));
-            if (yo) yo[(size_t)tok * y_ld + (size_t)kg * kGroup + base + (uint32_t)j] = h;
-            v[j] = bf16_to_f32(h);
+        for (int h = 0; h < GS; ++h) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t ci = (uint32_t)h * kGroup + base + (uint32_t)j;
+                const float xg = bf16_to_f32(s_val[tok][ci]);
+                const float sg = 1.0f / (1.0f + expf(-xg));
+                const uint16_t hb =
+                    f32_to_bf16((act ? sg : xg * sg) * bf16_to_f32(s_val[tok][kQuant + ci]));
+                if (yo) yo[(size_t)tok * y_ld + (size_t)kg * kQuant + ci] = hb;
+                v[h][j] = bf16_to_f32(hb);
+            }
+            r3d_fwht_wave<kGroup>(v[h], (int)lane);
         }
-        r3d_fwht_wave<kGroup>(v, (int)lane);
         float m = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) m = fmaxf(m, fabsf(v[j]));
+        for (int h = 0; h < GS; ++h)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) m = fmaxf(m, fabsf(v[h][j]));
         m = wave_max_f(m);
         const float sc = m > 0.0f ? m / kTopI8 : 1.0f;
         const float inv = 1.0f / sc;
         if (lane == 0) s[(size_t)tok * ng + kg] = sc;
-        *(uint32_t*)(q + (size_t)tok * n + (size_t)kg * kGroup + base) = i8_codes4(v, inv);
+#pragma unroll
+        for (int h = 0; h < GS; ++h)
+            *(uint32_t*)(q + (size_t)tok * n + (size_t)kg * kQuant +
+                         (size_t)h * kGroup + base) = i8_codes4(v[h], inv);
     }
 }
 
@@ -205,13 +247,13 @@ bool form_supported(const Form& f) {
 }
 
 /* The launcher, on addresses, so the templates stay in this unit. */
-template <class F, int MT>
+template <class F, int MT, int GS>
 static int launch_fused(const int8_t* a, const float* as, const uint8_t* b, const uint8_t* bs,
                         uint8_t* q, float* s, uint16_t* yo, int M, int N, int K, int a_ld,
                         uint32_t y_ld, int act, uint32_t run_tiles, long stream) {
-    const dim3 grid((unsigned)((N / 2) / kGroup)), block(kUnits * kWave);
-    R3D_KLAUNCH(R3D_KNAME((gemm_iqr_gated_kernel<F, MT>)), grid, block, (hipStream_t)stream, a, as,
-                b, bs, q, s, yo, M, N, K, a_ld, y_ld, act, run_tiles);
+    const dim3 grid((unsigned)((N / 2) / (GS * kGroup))), block(kUnits * kWave);
+    R3D_KLAUNCH(R3D_KNAME((gemm_iqr_gated_kernel<F, MT, GS>)), grid, block, (hipStream_t)stream, a,
+                as, b, bs, q, s, yo, M, N, K, a_ld, y_ld, act, run_tiles);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -219,20 +261,20 @@ static int launch_fused(const int8_t* a, const float* as, const uint8_t* b, cons
 
 using namespace r3d_iqr;
 
-#define R3D_IQR_GATED_MT_CASE(KIND, B, SC)                                                        \
+#define R3D_IQR_GATED_MT_CASE(KIND, B, SC, GS)                                                    \
     do {                                                                                          \
         using F = FormT<KIND, B, 0, KIND == kTrellisMad ? 16 : 0, 0, SC>;                         \
         switch (mt) {                                                                             \
-            case 1:  return launch_fused<F, 1>(A_, AS_, B_, S_, Q_, SC_, OB_, M, N, K, ap, y_ld,  \
-                                               act, run_tiles, stream);                            \
-            case 2:  return launch_fused<F, 2>(A_, AS_, B_, S_, Q_, SC_, OB_, M, N, K, ap, y_ld,  \
-                                               act, run_tiles, stream);                            \
-            case 4:  return launch_fused<F, 4>(A_, AS_, B_, S_, Q_, SC_, OB_, M, N, K, ap, y_ld,  \
-                                               act, run_tiles, stream);                            \
-            case 8:  return launch_fused<F, 8>(A_, AS_, B_, S_, Q_, SC_, OB_, M, N, K, ap, y_ld,  \
-                                               act, run_tiles, stream);                            \
-            default: return launch_fused<F, 16>(A_, AS_, B_, S_, Q_, SC_, OB_, M, N, K, ap, y_ld, \
-                                                act, run_tiles, stream);                           \
+            case 1:  return launch_fused<F, 1, GS>(A_, AS_, B_, S_, Q_, SC_, OB_, M, N, K, ap,  \
+                                                   y_ld, act, run_tiles, stream);                 \
+            case 2:  return launch_fused<F, 2, GS>(A_, AS_, B_, S_, Q_, SC_, OB_, M, N, K, ap,  \
+                                                   y_ld, act, run_tiles, stream);                 \
+            case 4:  return launch_fused<F, 4, GS>(A_, AS_, B_, S_, Q_, SC_, OB_, M, N, K, ap,  \
+                                                   y_ld, act, run_tiles, stream);                 \
+            case 8:  return launch_fused<F, 8, GS>(A_, AS_, B_, S_, Q_, SC_, OB_, M, N, K, ap,  \
+                                                   y_ld, act, run_tiles, stream);                 \
+            default: return launch_fused<F, 16, GS>(A_, AS_, B_, S_, Q_, SC_, OB_, M, N, K, ap, \
+                                                    y_ld, act, run_tiles, stream);                \
         }                                                                                         \
     } while (0)
 
@@ -269,12 +311,12 @@ int r3d_rad_gemm_nt_q_iqr_gated(const RadArgs* a, RadStream s) {
     const long long N = r3d_geti_or(a, "N", 0), K = r3d_geti_or(a, "K", 0),
                     group = r3d_geti_or(a, "group", 0);
     if (N < 2 || (N & 1) || K < 128) return R3D_NO(RAD_E_SHAPE);
-    if (group != kGroup) return R3D_NO(RAD_E_UNSUPPORTED);
-    if (K % (long long)kGroup) return R3D_NO(RAD_E_SHAPE);
+    if (group != kGroup && group != 2 * kGroup) return R3D_NO(RAD_E_UNSUPPORTED);
+    if (K % group) return R3D_NO(RAD_E_SHAPE);
     const long long n = N / 2;
-    /* The pair's quantiser and this kernel both cut `n` into 128-column groups; the gated shim
-     * refused an uneven `n`, and its gate_up extent refused a q wider than n. */
-    if (n % kGroup) return R3D_NO(RAD_E_SHAPE);
+    /* The pair's quantiser and this kernel both cut the gated width into `group`-wide groups;
+     * the gated shim refused an uneven `n`, and its gate_up extent refused a q wider than n. */
+    if (n % group) return R3D_NO(RAD_E_SHAPE);
     long long qm = 0, qn = 0;
     if (r3d_rows_of(Q, &qm, &qn) != 0 || qn != n) return R3D_NO(RAD_E_SHAPE);
     /* The band's `M` is the largest step (16); the tensors hold this step's rows, which is what the
@@ -283,19 +325,23 @@ int r3d_rad_gemm_nt_q_iqr_gated(const RadArgs* a, RadStream s) {
     if (M < 1 || M > kMTMax) return R3D_NO(RAD_E_SHAPE);
     if (!r3d_contig(Q)) return R3D_NO(RAD_E_STRIDE);
 
-    /* The same forms, private planes, extents and alignment the m16 row serves. */
+    /* The same forms, private planes, extents and alignment the m16 row serves. At group 256 only
+     * IQ8R's rotated int8 grid has a layout at that width. */
     const Form fw = form(B->dtype);
     if (kernel_word(B->dtype) != kernel_word(BS->dtype)) return R3D_NO(RAD_E_DTYPE);
     if (!form_supported(fw)) return R3D_NO(RAD_E_UNSUPPORTED);
+    if (group == 2 * kGroup &&
+        (fw.kind != kSigned || fw.bits != 8 || fw.scale != kBf16))
+        return R3D_NO(RAD_E_UNSUPPORTED);
     const unsigned lrun = (unsigned)((B->dtype >> 22) & 15u);
     if (is_trellis(fw.kind) && (lrun < 4 || (N % (long long)(1u << lrun))))
         return R3D_NO(RAD_E_SHAPE);
 
     if (r3d_numel(A) < M * K) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(AS) < M * (K / kGroup)) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(AS) < M * (K / group)) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(B) != N * K) return R3D_NO(RAD_E_SHAPE);
     if (r3d_numel(BS) < 1) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(SC) < M * (n / kGroup)) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(SC) < M * (n / group)) return R3D_NO(RAD_E_SHAPE);
     if (r3d_has(OB) && r3d_numel(OB) < M * n) return R3D_NO(RAD_E_SHAPE);
 
     const long long ap = r3d_row_pitch(A);
@@ -320,13 +366,15 @@ int r3d_rad_gemm_nt_q_iqr_gated(const RadArgs* a, RadStream s) {
     uint16_t* OB_ = r3d_has(OB) ? (uint16_t*)r3d_wp(OB) : nullptr;
 
 #define R3D_IQR_GATED_SC_CASE(KIND, B) do {                                                       \
-        if (fw.scale == kRowF32) { R3D_IQR_GATED_MT_CASE(KIND, B, kRowF32); }                     \
-        R3D_IQR_GATED_MT_CASE(KIND, B, kBf16);                                                    \
+        if (fw.scale == kRowF32) { R3D_IQR_GATED_MT_CASE(KIND, B, kRowF32, 1); }                  \
+        R3D_IQR_GATED_MT_CASE(KIND, B, kBf16, 1);                                                 \
     } while (0)
 
+    if (group == 2 * kGroup)
+        R3D_IQR_GATED_MT_CASE(kSigned, 8, kBf16, 2);
     if (fw.kind == kSigned) {
         if (fw.bits != 8) return R3D_NO(RAD_E_UNSUPPORTED);
-        R3D_IQR_GATED_MT_CASE(kSigned, 8, kBf16);
+        R3D_IQR_GATED_MT_CASE(kSigned, 8, kBf16, 1);
     }
     switch (fw.bits) {
         case 2: R3D_IQR_GATED_SC_CASE(kTrellisMad, 2);

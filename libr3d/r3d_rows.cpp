@@ -245,6 +245,12 @@ static const RadOperandSpec oGatedQuant[] = { { "gate_up", RAD_OPD_IN, 0 },
                                               { "q", RAD_OPD_OUT, 0 },
                                               { "scale", RAD_OPD_OUT, 0 },
                                               { "out_bf16", RAD_OPD_OUT, 1 } };
+/* The gate in its own operand, as a gated attention's [q|gate] projection leaves it. */
+static const RadOperandSpec oGateQuant[] = { { "gate", RAD_OPD_IN, 0 },
+                                             { "x", RAD_OPD_IN, 0 },
+                                             { "q", RAD_OPD_OUT, 0 },
+                                             { "scale", RAD_OPD_OUT, 0 },
+                                             { "out_bf16", RAD_OPD_OUT, 1 } };
 static const RadOperandSpec oGeluMulQuantI8[] = { { "gate_up", RAD_OPD_IN, 0 },
                                                   { "q", RAD_OPD_OUT, 0 },
                                                   { "scale", RAD_OPD_OUT, 0 },
@@ -1012,6 +1018,11 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("gated_had_quant_i8g", pGatedQuant, oGatedQuant,
            "A gated product (silu or sigmoid), a 128-wide block Hadamard, then per-group int8: the "
            "rotated int8 down projection, the codes row-major for the i8a8 dot2 GEMM."),
+    SCHEMA("gate_had_quant_i8g", pGatedQuant, oGateQuant,
+           "The same gated product with the gate in its own operand rather than the first half of "
+           "a fused gate_up plane: act(gate) * x, a 128-wide block Hadamard, then per-group int8 "
+           "for an out projection stored rotated (i8a8h). A group of 256 is IQ8R's: two independent "
+           "128-wide rotations under one amax and scale."),
     SCHEMA("rmsnorm_quant_i8", pRmsQuantI8, oRmsQuantI8,
            "The RMS norm and the per-row int8 quantiser in one pass, optionally with the residual "
            "junction in front (a post-norm, the residual add, a scalar): the sandwich-norm chain "
@@ -1825,11 +1836,17 @@ static const RadConstraint cHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group
                                               C_DIV("n", 128) };
 static const RadConstraint cGatedHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
                                                    C_DIV("n", 128) };
+/* The gate in its own operand at the same widths. `act` is optional on the op, so it is not bound:
+ * the shim reads it and defaults to silu, as libref does. */
+static const RadConstraint cGateHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
+                                                  C_DIV("n", 128) };
 /* IQ8R's group: one scale per 256 columns, each 128-wide half rotated on its own. */
 static const RadConstraint cHadQuantI8g256[] = { C_IN("dtype", "bf16"), C_EQ("group", 256),
                                                   C_DIV("n", 256) };
 static const RadConstraint cGatedHadQuantI8g256[] = { C_IN("dtype", "bf16"), C_EQ("group", 256),
                                                        C_DIV("n", 256) };
+static const RadConstraint cGateHadQuantI8g256[] = { C_IN("dtype", "bf16"), C_EQ("group", 256),
+                                                     C_DIV("n", 256) };
 static const RadConstraint cRmsQuantI8[] = { C_IN("dtype", "bf16"), C_DIV("n", 16) };
 /* Not `C_IN("act", "silu sigmoid")`: `act` is optional on the op (a graph may carry libref's
  * integer `mode` instead, and libref defaults to silu), so a band with neither would match no row.
@@ -2187,6 +2204,13 @@ static const RadConstraint cGemmGatedI8[] = { C_IN("dtype", "i8a8h"),
                                               C_IN("act", "silu sigmoid"),
                                               C_EQ("group", 128), C_GE("M", 1),
                                               C_LE("M", 16), C_DIV("K", 256), C_DIV("N", 256) };
+/* IQ8R's gated fold: one i32 sub-sum over two 128-K blocks, one amax and scale over two 128-column
+ * halves. The gated width is N/2, so N is a whole 512 for the 256-wide quantiser group. */
+static const RadConstraint cGemmGatedI8W256[] = { C_IN("dtype", "i8a8h"),
+                                                  C_IN("act", "silu sigmoid"),
+                                                  C_EQ("group", 256), C_GE("M", 1),
+                                                  C_LE("M", 16), C_DIV("K", 256),
+                                                  C_DIV("N", 512) };
 
 /* Every key the walk reads is required and in the band, so all are bound; `top_k <= 256` gives each
  * candidate one lane. `anchor_stride` is deliberately unbound: it is optional, defaults to 1, and
@@ -2757,8 +2781,8 @@ static const RadKernelInfo kKernels[] = {
 
 /* IQ8R's group 256: two independent 128-wide rotations, one amax and scale over the pair. */
 { "gated_had_quant_i8g_256_bf16", "gated_had_quant_i8g", "quant",
-  "gated_had_quant_i8g at IQ8R's group: one int8 scale per 256 columns, each 128-wide half rotated "
-  "on its own",
+  "gated_had_quant_i8g at IQ8R's group: one int8 scale per 256 columns, each 128-wide half "
+  "rotated on its own",
   "n a multiple of 256, group 256 (one wave a (token, 256-group)); the gated product rounded to "
   "bf16, the codes row-major for the i8a8 dot2 GEMM, the scale amax/127 over the pair",
   "bf16 gate_up [M,2n], int8 codes (row-major), f32 scale per (row, 256 columns), optional bf16 "
@@ -2767,6 +2791,28 @@ static const RadKernelInfo kKernels[] = {
   ROW(cGatedHadQuantI8g256), NOTUNE,
   nullptr, nullptr, r3d_rad_gated_had_quant_i8g, nullptr, nullptr, nullptr,
   r3d_shape_gated_had_quant_i8g },
+
+{ "gate_had_quant_i8g_bf16", "gate_had_quant_i8g", "quant",
+  "act(gate) * x with the gate in its own operand, a 128-wide block Hadamard, then per-group int8",
+  "n a multiple of 128, group 128 (one wave a (token, 128-group)); the product rounded to bf16, the "
+  "codes row-major for the i8a8 dot2 GEMM, the scale amax/127",
+  "bf16 gate [M,n] and x [M,n], int8 codes (row-major), f32 scale per group, optional bf16 product",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cGateHadQuantI8g), NOTUNE,
+  nullptr, nullptr, r3d_rad_gate_had_quant_i8g, nullptr, nullptr, nullptr,
+  r3d_shape_gate_had_quant_i8g },
+
+/* IQ8R's group 256: two independent 128-wide rotations, one amax and scale over the pair. */
+{ "gate_had_quant_i8g_256_bf16", "gate_had_quant_i8g", "quant",
+  "gate_had_quant_i8g at IQ8R's group: one int8 scale per 256 columns of a (token, head) row",
+  "n a multiple of 256, group 256 (one wave a (token, 256-group)); the product rounded to bf16, the "
+  "codes row-major for the i8a8 dot2 GEMM, the scale amax/127 over the pair",
+  "bf16 gate [M,n] and x [M,n], int8 codes (row-major), f32 scale per (row, 256 columns), optional "
+  "bf16 product",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cGateHadQuantI8g256), NOTUNE,
+  nullptr, nullptr, r3d_rad_gate_had_quant_i8g, nullptr, nullptr, nullptr,
+  r3d_shape_gate_had_quant_i8g },
 
 { "rmsnorm_quant_i8_bf16", "rmsnorm_quant_i8", "quant",
   "the RMS norm and the per-row int8 quantiser in one pass, optionally with the residual junction",
@@ -4023,6 +4069,22 @@ static const RadKernelInfo kKernels[] = {
   "round trip a value before the gate, as the pair stores it",
   RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_M16,
   ROW(cGemmGatedI8), NOTUNE,
+  nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_gated, r3d_rad_gemm_nt_q_iqr_gated_scratch,
+  r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
+  r3d_shape_gemm_nt_q_gated_i8a8h, r3d_rad_unrelayout_iqr },
+
+/* IQ8R's gated fold: the same one-launch chain at a 256-wide scale group, one i32 sub-sum over
+ * the group's two 128-K blocks and one amax/scale over the two 128-column halves. */
+{ "gemm_iqr_gated_w256_i8a8h", "gemm_nt_q_gated", "gemm",
+  "gemm_iqr_gated_i8a8h at IQ8R's 256-wide scale group: an exact i32 sub-sum over two 128-K "
+  "blocks and one amax over two 128-column halves",
+  "M <= 16, N a multiple of 512 (the gated width's whole 256 groups), K a multiple of 256, group "
+  "256; the same IQR forms and private layout as gemm_iqr_nt_m16_w256",
+  "I8 a row-major with an f32 scale per (row, 256 of K), IQR b/b_scale, I8 q (row-major), f32 "
+  "scale per (row, 256 of n), optional bf16 out_bf16; per group one exact i32 sub-sum and the two "
+  "f32 factors, the quantiser's two rotations under one amax",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_M16,
+  ROW(cGemmGatedI8W256), NOTUNE,
   nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_gated, r3d_rad_gemm_nt_q_iqr_gated_scratch,
   r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
   r3d_shape_gemm_nt_q_gated_i8a8h, r3d_rad_unrelayout_iqr },

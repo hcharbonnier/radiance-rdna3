@@ -130,6 +130,7 @@ set(R3D_UNITS
   "r3d_quant_cols_fp8|"
   "r3d_had_quant_act_i8g|"
   "r3d_gated_had_quant_i8g|"
+  "r3d_gate_had_quant_i8g|"
   "r3d_rmsnorm_quant_i8|"
   # The int8 trunk's rotated producer: the residual add, the RMS norm, the 128-wide Hadamard and
   # the per-group int8 quantiser in one pass, byte-identical to rmsnorm + had_quant_act_i8g.

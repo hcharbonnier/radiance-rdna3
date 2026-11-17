@@ -670,16 +670,22 @@ bool run_case(const Case& c) {
  * same code bytes and the same f32 scales with no intermediate and no scratch. The weight is the
  * 27B's feed-forward width (n = 17408, so 136 groups of 128) at a shorter K, and M in {1, 5, 16},
  * act in {silu, sigmoid} and out_bf16 present or absent are all run against it. */
-bool run_gated_fold(bool signed_form = false) {
+bool run_gated_fold(bool signed_form = false, int64_t group = 128) {
     /* The 27B's feed-forward width (n = 17408) exercises the many-group grid; the signed form runs
-     * a smaller shape, because its eight-bit codes are twice the trellis's bytes. */
+     * a smaller shape, because its eight-bit codes are twice the trellis's bytes. group 256 is
+     * IQ8R's: the weight carries the u8 level per (row, 256) under a bf16 row level. */
     const int64_t n = signed_form ? 1024 : 17408;
     const int64_t N = 2 * n, K = signed_form ? 512 : 2560;
-    const int64_t nkb = K / 128, ng = n / 128;
+    const int64_t nkb = K / 128, nkg = K / group, ng = n / group;
     const uint32_t B = signed_form ? 8 : 4, L16 = 16;
     W w;
     rad_enc_clear(&w.enc);
-    if (signed_form) {
+    if (signed_form && group == 256) {
+        rad_enc_copy_str(w.enc.scheme, "affine");
+        rad_enc_add_plane(&w.enc, "codes", RAD_I8, 1, 1);
+        rad_enc_add_plane(&w.enc, "scale", RAD_U8, 1, 256);
+        rad_enc_add_plane(&w.enc, "scale.1", RAD_BF16, 1, 0);
+    } else if (signed_form) {
         rad_enc_copy_str(w.enc.scheme, "affine");
         rad_enc_add_plane(&w.enc, "codes", RAD_I8, 1, 1);
         rad_enc_add_plane(&w.enc, "scale", RAD_BF16, 1, 128);
@@ -697,7 +703,12 @@ bool run_gated_fold(bool signed_form = false) {
     w.size(N, K);
 
     for (auto& b : w.data[(size_t)w.find("codes")]) b = (uint8_t)rnd();
-    if (signed_form) {
+    if (group == 256) {
+        uint8_t* s1 = (uint8_t*)w.data[(size_t)w.find("scale")].data();
+        for (int64_t i = 0; i < N * nkg; ++i) s1[i] = (uint8_t)(1 + i % 13);
+        uint16_t* s2 = (uint16_t*)w.data[(size_t)w.find("scale.1")].data();
+        for (int64_t n = 0; n < N; ++n) s2[n] = f32_to_bf16(0.0007f + 0.0001f * (float)(n % 5));
+    } else if (signed_form) {
         uint16_t* sc = (uint16_t*)w.data[(size_t)w.find("scale")].data();
         for (int64_t i = 0; i < N * nkb; ++i)
             sc[i] = f32_to_bf16(0.002f + 0.0001f * (float)(i % 11));
@@ -714,7 +725,7 @@ bool run_gated_fold(bool signed_form = false) {
         for (int64_t kb = 0; kb < nkb; ++kb) cf[kb] = 0.5f + 0.1f * (float)kb;
     }
 
-    const std::vector<RadParam> lp = { pint("N", N), pint("K", K), pint("group", 128),
+    const std::vector<RadParam> lp = { pint("N", N), pint("K", K), pint("group", group),
                                        pstr("dtype", "i8a8h") };
     std::vector<int> selB, selS;
     std::vector<RadTensor> plB, plS;
@@ -755,7 +766,7 @@ bool run_gated_fold(bool signed_form = false) {
 
     const int Mmax = 16;
     std::vector<int8_t> a((size_t)(Mmax * K));
-    std::vector<float> as((size_t)(Mmax * nkb));
+    std::vector<float> as((size_t)(Mmax * nkg));
     for (auto& v : a) v = (int8_t)((int)(rnd() % 255) - 127);
     for (auto& v : as) v = 0.01f + 0.001f * (float)(rnd() % 7);
 
@@ -792,11 +803,11 @@ bool run_gated_fold(bool signed_form = false) {
                 ta.data = dA;  ta.dtype = RAD_I8;  ta.rank = 2;  ta.shape[0] = M; ta.shape[1] = K;
                 rad_tensor_pack(&ta);
                 tas.data = dAS; tas.dtype = RAD_F32; tas.rank = 2; tas.shape[0] = M;
-                tas.shape[1] = nkb; rad_tensor_pack(&tas);
+                tas.shape[1] = nkg; rad_tensor_pack(&tas);
                 tb.data = dB;  tb.dtype = L.dtype;  tb.rank = 2;  tb.shape[0] = N; tb.shape[1] = K;
                 rad_tensor_pack(&tb);
                 tbs.data = dBS; tbs.dtype = LS.dtype; tbs.rank = 2; tbs.shape[0] = N;
-                tbs.shape[1] = nkb; rad_tensor_pack(&tbs);
+                tbs.shape[1] = nkg; rad_tensor_pack(&tbs);
                 tgu.data = dGU; tgu.dtype = RAD_BF16; tgu.rank = 2; tgu.shape[0] = M;
                 tgu.shape[1] = N; rad_tensor_pack(&tgu);
                 tq.data = dQ;  tq.dtype = RAD_I8;  tq.rank = 2;  tq.shape[0] = M; tq.shape[1] = n;
@@ -811,7 +822,7 @@ bool run_gated_fold(bool signed_form = false) {
                 /* The pair: m16 into the [M, 2n] bf16 scratch, then the gated quantiser. */
                 RadTensor pair_ops[5] = { ta, tas, tb, tbs, tgu };
                 const RadParam pair_p[] = { pint("M", M), pint("N", N), pint("K", K),
-                                            pint("group", 128), pstr("dtype", "i8a8h") };
+                                            pint("group", group), pstr("dtype", "i8a8h") };
                 RadArgs pa{};
                 pa.t = pair_ops; pa.n_t = 5; pa.p = pair_p; pa.n_p = 5; pa.kv_used_max_h = -1;
                 int rc = lib().gemm(&pa, (RadStream)0);
@@ -822,7 +833,7 @@ bool run_gated_fold(bool signed_form = false) {
                     continue;
                 }
                 RadTensor gated_ops[4] = { tgu, tq, tsc, ob ? tob : RadTensor{} };
-                const RadParam gated_p[] = { pint("group", 128), pstr("dtype", "bf16"),
+                const RadParam gated_p[] = { pint("group", group), pstr("dtype", "bf16"),
                                              pstr("act", act_s) };
                 RadArgs pg{};
                 pg.t = gated_ops; pg.n_t = 4; pg.p = gated_p; pg.n_p = 3; pg.kv_used_max_h = -1;
@@ -848,7 +859,7 @@ bool run_gated_fold(bool signed_form = false) {
                 /* The fused row: one launch, no scratch. */
                 RadTensor fused_ops[7] = { ta, tas, tb, tbs, tq, tsc, ob ? tob : RadTensor{} };
                 const RadParam fused_p[] = { pint("M", M), pint("N", N), pint("K", K),
-                                             pint("group", 128), pstr("dtype", "i8a8h"),
+                                             pint("group", group), pstr("dtype", "i8a8h"),
                                              pstr("act", act_s) };
                 RadArgs pf{};
                 pf.t = fused_ops; pf.n_t = 7; pf.p = fused_p; pf.n_p = 6; pf.kv_used_max_h = -1;
@@ -1042,6 +1053,22 @@ TEST(iqr_gated_fold_takes_the_signed_form) {
         return;
     }
     CHECK(run_gated_fold(true));
+}
+
+/* IQ8R's gated fold: the same chain at group 256, so the K loop folds one exact i32 sub-sum over
+ * two 128-K blocks and the quantiser takes one amax and scale over two 128-column halves. The
+ * unfused pair is the W27 `gemm_iqr_nt_m16_w256` row followed by gated_had_quant_i8g at 256. */
+TEST(iqr_gated_fold_takes_iq8r_group_256) {
+    if (!lib().ok() || !lib().gated || !lib().fused) {
+        std::fprintf(stderr, "skip: %s or its gated rows not loadable here\n", RAD_R3D_SO);
+        return;
+    }
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) {
+        std::fprintf(stderr, "skip: no card\n");
+        return;
+    }
+    CHECK(run_gated_fold(true, 256));
 }
 
 /* ------------------------------------------------------------------ the vocabulary head

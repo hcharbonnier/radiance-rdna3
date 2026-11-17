@@ -288,6 +288,9 @@ int r3d_rad_had_quant_act_i8g(const RadArgs* a, RadStream s);
 /* --- r3d_gated_had_quant_i8g.hip: a gated product, 128-wide Hadamard, then per-group int8. */
 int r3d_rad_gated_had_quant_i8g(const RadArgs* a, RadStream s);
 
+/* --- r3d_gate_had_quant_i8g.hip: the same with the gate in its own operand. */
+int r3d_rad_gate_had_quant_i8g(const RadArgs* a, RadStream s);
+
 /* --- r3d_rmsnorm_quant_i8.hip: the RMS norm and the per-row int8 quantiser, one pass. */
 int r3d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream s);
 
@@ -330,6 +333,7 @@ int r3d_shape_gated_had_quant_fp8(const RadParam* p, int n_p, int operand, RadOp
 int r3d_shape_quant_cols_fp8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_had_quant_act_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gated_had_quant_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_gate_had_quant_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_rmsnorm_quant_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_quant_act_i8g   (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gated_quant_fp8 (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
