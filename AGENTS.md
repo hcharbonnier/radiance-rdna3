@@ -274,6 +274,9 @@ en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
   joint `rad.planes` d'une row device peut vivre en VRAM : un shim ne doit pas
   lire son en-tête sur l'hôte (SIGSEGV, corrigé dans `gemm_nt_q_w2a8_m16`),
   et le MT du bras `w2a8` doit avoir un chunk qui divise K (M=1/K=2560 → MT=4).
+  `mtp_enter` est déjà parallèle en rangées (grille `(n/8, M)`, un bloc par
+  8 canaux et rangée) : sa linéarité en M est le travail d'un GEMV par rangée,
+  pas un défaut ; ne pas planifier un batch 2–4× sans profiler le graphe.
   Les tables MTP 48 et le draft head sont couverts par kbench (**948/948** au
   HEAD W28 ; 968 avant que des ops déclarées ne replient des cas
   élémentaires) ; restent sans oracle libref des cas `gemm_nt_q_gated` i8a8h,

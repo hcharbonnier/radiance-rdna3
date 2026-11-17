@@ -212,6 +212,11 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   `arch/common/rad_block_moe_fp8.h` (casse `flint`/`bailing_hybrid`) et
   retrait de `ngram_ids_i32` cassant RDNA3 ; correctifs locaux `5e98eb9` et
   `c11c451`, à proposer en amont.
+- **R33** — *décision (W29)* : `mtp_enter` **n'est pas un chantier 2–4×**.
+  La grille est `(n/8 canaux, M rangées)`, un bloc par (8 canaux, rangée) ; la
+  linéarité en M est le travail d'un GEMV par rangée (normalisation + décodage
+  E4M3 + dot), pas un défaut de parallélisme. À M≤4 : 186–512 µs, <0,5 % du
+  token ; profiler le graphe servi avant toute refonte.
 
 ## W29 — rebase `main` 2.1.0 + GS=1 (2026-11-17)
 

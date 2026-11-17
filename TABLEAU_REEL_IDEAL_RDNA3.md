@@ -632,7 +632,10 @@ l'arbre et sont marqués à optimiser, pas à supprimer.
   (16384×2560) ; MoE 231,2 µs (M=1) / 4 009 µs (M=512) ; long contexte
   3 252 tokens **234,8 tok/s** (rows QSA sparse exercées).
 - **HC/MTP** : `hc_read` **355,1 µs / 12 323,5 µs** (W21, 5–9× mieux que W26 :
-  1 772,7 / 113 746) ; `mtp_enter` 186,2 µs / 59 385 µs (linéaire, inchangé).
+  1 772,7 / 113 746) ; `mtp_enter` 186,2 µs / 59 385 µs — grille `(n/8, M)`,
+  un bloc par (8 canaux, rangée) : la linéarité est le travail d'un GEMV par
+  rangée, pas un défaut ; l'hypothèse 2–4× est retirée ; à profiler dans le
+  graphe servi avant toute refonte.
 - **bf16** : défaut `impl=0` 776,8 µs (N=96 K=5120 M=512) contre `impl=3`
   **132,3 µs** avec le cache livré (**5,9×**) ; 65–199 µs selon la forme
   (3,95× sur N=256 M=1792). Caches 27B + Flash-Next fusionnés dans

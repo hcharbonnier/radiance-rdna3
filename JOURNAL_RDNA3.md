@@ -1279,7 +1279,10 @@ spécialisation `GS=1` (`faa89fd`, noyau resident restauré de W26) redonne
 **Autres postes (build patché).** Flash-Next IQR tiled 2 053,8 µs
 (12288×2560 M=512) / 2 675,9 µs (16384×2560) ; MoE 231,2 / 4 009 µs ;
 bf16 défaut 776,8 / 788,4 µs ; `hc_read` **355,1 / 12 323,5 µs** (W21, 5–9×
-mieux que W26) ; `mtp_enter` 186,2 / 59 385 µs (linéaire) ; `logit_rerank`
+mieux que W26) ; `mtp_enter` 186,2 / 59 385 µs (linéaire : grille
+`(n/8, M)`, un bloc par (8 canaux, rangée) — la linéarité est le travail d'un
+GEMV par rangée, pas un défaut de parallélisme ; l'hypothèse 2–4× est retirée,
+à profiler dans le graphe) ; `logit_rerank`
 32,9 µs. `rad-tune` 27B : bf16 tiled `impl=3` 199,5 µs contre 789,0
 (3,95×) ; Flash-Next tiled 65,2/67,2/71,2 µs (N=96/512/640 K=2560 M=512).
 
