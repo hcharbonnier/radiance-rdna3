@@ -394,7 +394,7 @@ Mesure à l'état `de81ffe` : `libr4d/r4d_rows.cpp` (**457 rows, 274 ops**) cont
       `gemm_iq8r_tiled` ; les rows actuelles n'acceptent que 128). Test : le
       2B charge et sert à `NS=0`. Le `rad_arch_declare` échoue aujourd'hui sur
       `nq_h.declare` (groupe 256 contre 128) — cause exacte dans
-      `RAPPORT_RDNA3.md` §10.5.
+      `RAPPORT_RDNA3.md` §10.4.
 - [ ] **D2 — DSpark (MiniCPM5 à NS > 0)** : `dflash_conv`,
       `dflash_markov_greedy`, `dflash_markov_greedy_f32`, `dflash_tree` ; plus
       `row_topk_merge`, `sample_merge_topk`, `pair_argmax` si le sélecteur les
