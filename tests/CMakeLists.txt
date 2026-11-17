@@ -180,6 +180,7 @@ endif()
 if(TARGET libr3d AND RAD_HIP_FOUND)
   set(RAD_TESTS_WITH_R3D_DEVICE iqr_device_test ple_hc_device_test qsa_block_key_device_test
                                 qsa_score_device_test qsa_select_device_test qsa_work_device_test
+                                attn_paged_device_test
                                 moe_iqr_device_test moe_iqr_test moe_w4nl_device_test kv_store_b4_device_test
                                 gather_rows_u8_device_test
                                 r3d_rope_imrope_h128_device_test router_fused_device_test
