@@ -881,7 +881,7 @@ int r3d_shape_rmsnorm_quant_fp8(const RadParam* p, int n_p, int operand, RadOpdD
 }
 
 /* The fused add + norm + rotated int8 quantiser: the same operands as rmsnorm_quant_fp8, with `q`
- * int8 (row-major) and one f32 scale per (row, 128). */
+ * int8 (row-major) and one f32 scale per scale group (128, or 256 for IQ8R). */
 int r3d_shape_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);

@@ -1154,9 +1154,10 @@ static const RadOpSchema kSchemas[] = {
 
     SCHEMA("rmsnorm_had_quant_i8g", pRmsQuantFp8, oRmsQuantFp8,
            "The same fused add and norm with had_quant_act_i8g's quantiser on its pass: a "
-           "128-wide Hadamard between the bf16-rounded norm output and the per-(row, 128) int8 "
-           "absmax. Byte-identical to `rmsnorm` + `had_quant_act_i8g`; `out_bf16` holds the "
-           "unrotated norm output, for a bf16 consumer."),
+           "128-wide Hadamard between the bf16-rounded norm output and the int8 absmax, one "
+           "f32 scale per scale group (128, or 256 for IQ8R, whose two halves rotate "
+           "independently under one amax). Byte-identical to `rmsnorm` + `had_quant_act_i8g`; "
+           "`out_bf16` holds the unrotated norm output, for a bf16 consumer."),
 
     /* ---- the vocabulary and the sampler: schemas first, rows with their kernels ---- */
     SCHEMA("silu_mul", pMnDtype, oGateUp,
@@ -1824,6 +1825,11 @@ static const RadConstraint cHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group
                                               C_DIV("n", 128) };
 static const RadConstraint cGatedHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
                                                    C_DIV("n", 128) };
+/* IQ8R's group: one scale per 256 columns, each 128-wide half rotated on its own. */
+static const RadConstraint cHadQuantI8g256[] = { C_IN("dtype", "bf16"), C_EQ("group", 256),
+                                                  C_DIV("n", 256) };
+static const RadConstraint cGatedHadQuantI8g256[] = { C_IN("dtype", "bf16"), C_EQ("group", 256),
+                                                       C_DIV("n", 256) };
 static const RadConstraint cRmsQuantI8[] = { C_IN("dtype", "bf16"), C_DIV("n", 16) };
 /* Not `C_IN("act", "silu sigmoid")`: `act` is optional on the op (a graph may carry libref's
  * integer `mode` instead, and libref defaults to silu), so a band with neither would match no row.
@@ -2097,6 +2103,9 @@ static const RadConstraint cRmsQuantFp8[] = { C_IN("dtype", "bf16"), C_EQ("group
  * and divides n. */
 static const RadConstraint cRmsQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
                                               C_DIV("n", 128) };
+/* IQ8R's group: one scale per 256 columns, each 128-wide half rotated on its own. */
+static const RadConstraint cRmsQuantI8g256[] = { C_IN("dtype", "bf16"), C_EQ("group", 256),
+                                                 C_DIV("n", 256) };
 
 /* The sampler's pre-filters constrain only `n_vocab`. Their bands carry `n_vocab` and `M` (plus
  * `vocab_off`, and `k` for logprobs) and no `dtype` key, so a dtype constraint would match no band;
@@ -2723,6 +2732,18 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r3d_rad_had_quant_act_i8g, nullptr, nullptr, nullptr,
   r3d_shape_had_quant_act_i8g },
 
+/* IQ8R's group 256: two independent 128-wide rotations, one amax and scale over the pair. */
+{ "had_quant_act_i8g_256_bf16", "had_quant_act_i8g", "quant",
+  "had_quant_act_i8g at IQ8R's group: each 128-wide half of a 256-column group rotated on its "
+  "own, one int8 scale for the pair",
+  "n a multiple of 256, group 256 (one wave a (token, 256-group)); the codes row-major for the "
+  "i8a8 dot2 GEMM, the scale amax/127 over the pair (the rotation's 1/128 is the weight plane's)",
+  "bf16 in, int8 codes (row-major), f32 scale per (row, 256 columns)",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cHadQuantI8g256), NOTUNE,
+  nullptr, nullptr, r3d_rad_had_quant_act_i8g, nullptr, nullptr, nullptr,
+  r3d_shape_had_quant_act_i8g },
+
 { "gated_had_quant_i8g_bf16", "gated_had_quant_i8g", "quant",
   "a gated product (silu or sigmoid), a 128-wide block Hadamard, then per-group int8",
   "n a multiple of 128, group 128 (one wave a (token, 128-group): the FWHT's DPP stages stay out "
@@ -2731,6 +2752,19 @@ static const RadKernelInfo kKernels[] = {
   "bf16 gate_up [M,2n], int8 codes (row-major), f32 scale per group, optional bf16 product",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cGatedHadQuantI8g), NOTUNE,
+  nullptr, nullptr, r3d_rad_gated_had_quant_i8g, nullptr, nullptr, nullptr,
+  r3d_shape_gated_had_quant_i8g },
+
+/* IQ8R's group 256: two independent 128-wide rotations, one amax and scale over the pair. */
+{ "gated_had_quant_i8g_256_bf16", "gated_had_quant_i8g", "quant",
+  "gated_had_quant_i8g at IQ8R's group: one int8 scale per 256 columns, each 128-wide half rotated "
+  "on its own",
+  "n a multiple of 256, group 256 (one wave a (token, 256-group)); the gated product rounded to "
+  "bf16, the codes row-major for the i8a8 dot2 GEMM, the scale amax/127 over the pair",
+  "bf16 gate_up [M,2n], int8 codes (row-major), f32 scale per (row, 256 columns), optional bf16 "
+  "product",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cGatedHadQuantI8g256), NOTUNE,
   nullptr, nullptr, r3d_rad_gated_had_quant_i8g, nullptr, nullptr, nullptr,
   r3d_shape_gated_had_quant_i8g },
 
@@ -3574,6 +3608,20 @@ static const RadKernelInfo kKernels[] = {
       "(the rotation's 1/128 is the weight plane's), fp32 arithmetic",
       RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
       ROW(cRmsQuantI8g), NOTUNE,
+      nullptr, nullptr, r3d_rad_rmsnorm_had_quant_i8g, nullptr, nullptr, nullptr,
+      r3d_shape_rmsnorm_had_quant_i8g },
+
+    /* IQ8R's group 256: two independent 128-wide rotations, one amax and scale over the pair. */
+    { "rmsnorm_had_quant_i8g_256_bf16", "rmsnorm_had_quant_i8g", "quant",
+      "rmsnorm_had_quant_i8g at IQ8R's group: each 128-wide half of a 256-column group rotated on "
+      "its own, one int8 scale for the pair",
+      "group 256 and n a multiple of 256; a workgroup a row, a wave a group after the norm "
+      "reduction; the residual sum is stored before the variance reads it, the codes are taken "
+      "over the bf16 norm output, which out_bf16 receives",
+      "bf16 x, residual, gain and optional out_bf16, int8 codes (row-major), f32 scales amax/127 "
+      "over each 256-column pair (the rotation's 1/128 is the weight plane's), fp32 arithmetic",
+      RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+      ROW(cRmsQuantI8g256), NOTUNE,
       nullptr, nullptr, r3d_rad_rmsnorm_had_quant_i8g, nullptr, nullptr, nullptr,
       r3d_shape_rmsnorm_had_quant_i8g },
 

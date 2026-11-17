@@ -2,16 +2,17 @@
  *
  * The rotated int8 form for the int8 trunk GEMMs (i8a8): the 128-wide Hadamard shrinks the group
  * maximum, and the codes are row-major (the i8a8 dot2 GEMM reads stored order), with one scale per
- * (row, group). This is quant_act_i8g with the rotation; the unrotated form is a separate op.
+ * (row, group). This is quant_act_i8g with the rotation; the unrotated form is a separate op. A
+ * group of 256 (IQ8R) is two independent 128-wide rotations under one amax and scale.
  *
  * A separate op, not a parameter: it writes different numbers and a different code layout than
  * quant_act_i8 (step-ordered) or had_quant_act_i8 (step-ordered), so a swapped graph would run as
  * a different model. The rotation's 1/128 is the weight's (a `w8a8_fwht128`/IQR plane stores it),
  * so the scale is amax / 127 and folds nothing, as libref and libr4d's i8g quantiser do.
  *
- * One wave a (token, 128-column group): the wave runs the group's whole FWHT with no group loop,
- * which is the form gfx1102 needs (a DPP exchange in a loop body miscompiles there) and lets a
- * 5120- or 17408-wide activation run its 40 or 136 groups across the card.
+ * One wave a (token, scale group): the wave runs the group's whole FWHT with no group loop, which
+ * is the form gfx1102 needs (a DPP exchange in a loop body miscompiles there) and lets a 5120- or
+ * 17408-wide activation run its 40 or 136 groups of 128 (20 or 68 of 256) across the card.
  */
 #include "r3d.h"
 #include "r3d_args.h"
@@ -37,29 +38,39 @@ __device__ __forceinline__ float wave_max_f(float v) {
     return v;
 }
 
+/* SUB is the number of 128-wide rotation blocks one scale covers: 1 (group 128), or 2 for IQ8R's
+ * 256-wide group, where each half is rotated on its own and the amax is taken over the pair. */
+template <int SUB>
 __global__ __launch_bounds__(kThreads) void had_quant_act_i8g_kernel(
     const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n) {
     constexpr int HAD = 128, VPL = HAD / 32;
+    static_assert(SUB == 1 || SUB == 2, "a 256 group is two 128-wide rotations");
     static_assert(VPL == 4, "one wave's 32 lanes hold the group's 128 columns as four each");
     const uint32_t row = blockIdx.x, kg = blockIdx.y;
-    const uint32_t nkb = n / 128u;
+    const uint32_t nkb = n / (uint32_t)(SUB * HAD);
     const uint32_t lane = threadIdx.x & 31;
-    const uint16_t* a = x + (size_t)row * n + (size_t)kg * HAD;
-    uint8_t* qr = q + (size_t)row * n + (size_t)kg * HAD;
+    const uint16_t* a = x + (size_t)row * n + (size_t)kg * (uint32_t)(SUB * HAD);
+    uint8_t* qr = q + (size_t)row * n + (size_t)kg * (uint32_t)(SUB * HAD);
 
     const int base = lane * VPL;
-    float v[VPL];
-#pragma unroll
-    for (int j = 0; j < VPL; ++j) v[j] = ld_bf(a, base + j);
-    r3d_fwht_wave<HAD>(v, lane);
+    float v[SUB][VPL];
     float m = 0.0f;
 #pragma unroll
-    for (int j = 0; j < VPL; ++j) m = fmaxf(m, fabsf(v[j]));
+    for (int h = 0; h < SUB; ++h) {
+        const uint16_t* ah = a + h * HAD;
+#pragma unroll
+        for (int j = 0; j < VPL; ++j) v[h][j] = ld_bf(ah, base + j);
+        r3d_fwht_wave<HAD>(v[h], lane);
+#pragma unroll
+        for (int j = 0; j < VPL; ++j) m = fmaxf(m, fabsf(v[h][j]));
+    }
     m = wave_max_f(m);
     const float sc = m > 0.0f ? m / kTopI8 : 1.0f;
     const float inv = 1.0f / sc;
     if (lane == 0) s[(size_t)row * nkb + kg] = sc;
-    *(uint32_t*)(qr + (uint32_t)base) = i8_codes4(v, inv);   // row-major (the i8a8 GEMM's layout)
+#pragma unroll
+    for (int h = 0; h < SUB; ++h)
+        *(uint32_t*)(qr + h * HAD + (uint32_t)base) = i8_codes4(v[h], inv);   // row-major
 }
 
 }  // namespace
@@ -79,12 +90,19 @@ int r3d_rad_had_quant_act_i8g(const RadArgs* a, RadStream s)
     if (r3d_rows_of(x, &M, &K) != 0) return R3D_NO(RAD_E_INVAL);
     if (K <= 0 || K % 128) return R3D_NO(RAD_E_SHAPE);
     const long long grp = r3d_geti_or(a, "group", 128);
-    if (grp != 128) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(q) < M * K || r3d_numel(sc) < M * (K / 128)) return R3D_NO(RAD_E_SHAPE);
+    if (grp != 128 && grp != 256) return R3D_NO(RAD_E_SHAPE);
+    if (K % grp) return R3D_NO(RAD_E_SHAPE);
+    if (r3d_numel(q) < M * K || r3d_numel(sc) < M * (K / grp)) return R3D_NO(RAD_E_SHAPE);
 
-    dim3 grid((unsigned)M, (unsigned)(K / 128)), blk(kThreads);
-    R3D_KLAUNCH(had_quant_act_i8g_kernel, grid, blk, (hipStream_t)s, (const uint16_t*)r3d_p(x),
-                (uint8_t*)r3d_wp(q), (float*)r3d_wp(sc), (uint32_t)K);
+    dim3 grid((unsigned)M, (unsigned)(K / grp)), blk(kThreads);
+    if (grp == 256)
+        R3D_KLAUNCH(R3D_KNAME(had_quant_act_i8g_kernel<2>), grid, blk, (hipStream_t)s,
+                    (const uint16_t*)r3d_p(x), (uint8_t*)r3d_wp(q), (float*)r3d_wp(sc),
+                    (uint32_t)K);
+    else
+        R3D_KLAUNCH(R3D_KNAME(had_quant_act_i8g_kernel<1>), grid, blk, (hipStream_t)s,
+                    (const uint16_t*)r3d_p(x), (uint8_t*)r3d_wp(q), (float*)r3d_wp(sc),
+                    (uint32_t)K);
     return (int)hipGetLastError();
 }
 

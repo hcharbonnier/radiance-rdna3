@@ -12,12 +12,13 @@
  *     a lane, so the codes are its bytes. It runs through the wave's shared-memory slice rather
  *     than the DPP exchange of r3d_fwht_wave, because this kernel calls it inside the group loop
  *     and a DPP exchange in a loop body miscompiles on gfx1102 (see r3d_had_quant_act_i8.hip);
- *   - the scale is the same expression: amax / 127 per (row, 128), the rotation's 1/128 being the
- *     weight's, as had_quant_act_i8g folds nothing. `out_bf16` receives the unrotated bf16 norm
- *     output.
+ *   - the scale is the same expression: amax / 127 per scale group, the rotation's 1/128 being the
+ *     weight's, as had_quant_act_i8g folds nothing. A group of 256 (IQ8R) rotates each 128-wide
+ *     half on its own and takes one amax and scale over the pair. `out_bf16` receives the
+ *     unrotated bf16 norm output.
  *
- * One workgroup a row, a wave a 128-column group after the norm reduction, so a 5120-column row
- * runs its 40 groups across the workgroup's waves.
+ * One workgroup a row, a wave a scale group after the norm reduction, so a 5120-column row runs
+ * its 40 groups of 128 (or 20 of 256) across the workgroup's waves.
  */
 #include "r3d.h"
 #include "r3d_args.h"
@@ -68,9 +69,10 @@ __device__ __forceinline__ void fwht128_lds(float* v, int lane, float* sh) {
     }
 }
 
-/* THR is the row's workgroup; WDT the gain's dtype; RES the fused residual add. The group is
- * always 128 (the rotation's width) and divides n. */
-template <int THR, int WDT, bool RES>
+/* THR is the row's workgroup; WDT the gain's dtype; RES the fused residual add. The rotation is
+ * always 128 wide; GRP (128 or 256) is the scale group, so a 256 group is two independent 128-wide
+ * rotations under one shared amax and scale, as IQ8R's weight scale expects. It divides n. */
+template <int THR, int WDT, bool RES, int GRP>
 __global__ __launch_bounds__(THR) void rmsnorm_had_quant_i8g_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
     uint8_t* __restrict__ q, float* __restrict__ s, uint16_t* __restrict__ ob, uint32_t n,
@@ -104,31 +106,48 @@ __global__ __launch_bounds__(THR) void rmsnorm_had_quant_i8g_kernel(
 
     const uint32_t wave = threadIdx.x / kWave, lane = threadIdx.x & (kWave - 1);
     constexpr uint32_t kHadW = 128, kPerLane = 4;
-    const uint32_t ngrp = n / kHadW;
+    static_assert(GRP == 128 || GRP == 256, "a 256 group is two 128-wide rotations");
+    constexpr uint32_t kSub = (uint32_t)(GRP / 128);
+    const uint32_t ngrp = n / (uint32_t)GRP;
     for (uint32_t g = wave; g < ngrp; g += (uint32_t)(THR / kWave)) {
-        const uint32_t base = g * kHadW + kPerLane * lane;
-        float v[kPerLane];
-        uint16_t hb[kPerLane];
+        uint32_t base[kSub];
+        float v[kSub][kPerLane];
+        uint16_t hb[kSub][kPerLane];
 #pragma unroll
-        for (uint32_t j = 0; j < kPerLane; ++j) {
-            const uint32_t i = base + j;
-            /* The bf16 round trip is the pair's: rmsnorm stores these bytes and
-             * had_quant_act_i8g reads them back. */
-            hb[j] = f32_to_bf16(bf16_to_f32(ld_bf16(nr, i)) * rs * (gain_of(w, i, WDT) + wadd));
-            v[j] = bf16_to_f32(hb[j]);
+        for (uint32_t h = 0; h < kSub; ++h) {
+            base[h] = g * (uint32_t)GRP + h * kHadW + kPerLane * lane;
+#pragma unroll
+            for (uint32_t j = 0; j < kPerLane; ++j) {
+                const uint32_t i = base[h] + j;
+                /* The bf16 round trip is the pair's: rmsnorm stores these bytes and
+                 * had_quant_act_i8g reads them back. */
+                hb[h][j] = f32_to_bf16(bf16_to_f32(ld_bf16(nr, i)) * rs * (gain_of(w, i, WDT) + wadd));
+                v[h][j] = bf16_to_f32(hb[h][j]);
+            }
         }
         if (obr) {
-            *(uint32_t*)(obr + base) = (uint32_t)hb[0] | ((uint32_t)hb[1] << 16);
-            *(uint32_t*)(obr + base + 2) = (uint32_t)hb[2] | ((uint32_t)hb[3] << 16);
+#pragma unroll
+            for (uint32_t h = 0; h < kSub; ++h) {
+                *(uint32_t*)(obr + base[h]) =
+                    (uint32_t)hb[h][0] | ((uint32_t)hb[h][1] << 16);
+                *(uint32_t*)(obr + base[h] + 2) =
+                    (uint32_t)hb[h][2] | ((uint32_t)hb[h][3] << 16);
+            }
         }
-        fwht128_lds(v, (int)lane, fw[wave]);
+#pragma unroll
+        for (uint32_t h = 0; h < kSub; ++h) fwht128_lds(v[h], (int)lane, fw[wave]);
         float m = 0.0f;
 #pragma unroll
-        for (uint32_t j = 0; j < kPerLane; ++j) m = fmaxf(m, fabsf(v[j]));
+        for (uint32_t h = 0; h < kSub; ++h)
+#pragma unroll
+            for (uint32_t j = 0; j < kPerLane; ++j) m = fmaxf(m, fabsf(v[h][j]));
         m = wave_max(m);
         const float sc = m > 0.0f ? m / kTopI8 : 1.0f;
         if (lane == 0) sr[g] = sc;
-        *(uint32_t*)(qr + base) = i8_codes4(v, 1.0f / sc);   /* row-major (the i8a8 GEMM's layout) */
+        const float inv = 1.0f / sc;
+#pragma unroll
+        for (uint32_t h = 0; h < kSub; ++h)
+            *(uint32_t*)(qr + base[h]) = i8_codes4(v[h], inv);   /* row-major (the i8a8 GEMM's layout) */
     }
 }
 
@@ -152,7 +171,7 @@ int r3d_rad_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s) {
     const long long n = r3d_geti_or(a, "n", w->rank ? r3d_dim(w, (int)w->rank - 1) : 0);
     const long long group = r3d_geti_or(a, "group", 0);
     if (n <= 0) return R3D_NO(RAD_E_SHAPE);
-    if (group != 128) return R3D_NO(RAD_E_UNSUPPORTED);
+    if (group != 128 && group != 256) return R3D_NO(RAD_E_UNSUPPORTED);
     if (n % group) return R3D_NO(RAD_E_UNSUPPORTED);
     const float eps = (float)r3d_getf(a, "eps", 1e-6);
     const float wadd = (float)r3d_getf(a, "wadd", 0.0);
@@ -194,23 +213,29 @@ int r3d_rad_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s) {
     float* sp = (float*)r3d_wp(sc);
     uint16_t* op = r3d_has(ob) ? (uint16_t*)r3d_wp(ob) : nullptr;
 
-#define R3D_RHQ(THR, WDT, RES)                                                                   \
-    R3D_KLAUNCH(R3D_KNAME(rmsnorm_had_quant_i8g_kernel<THR, WDT, RES>), dim3((uint32_t)M),       \
+#define R3D_RHQ(THR, WDT, RES, GRP)                                                              \
+    R3D_KLAUNCH(R3D_KNAME(rmsnorm_had_quant_i8g_kernel<THR, WDT, RES, GRP>), dim3((uint32_t)M),  \
                 dim3(THR), (hipStream_t)s, xp, rp, wp, qp, sp, op, (uint32_t)n, eps, wadd,       \
                 (uint32_t)x_ld, (uint32_t)res_ld, (uint32_t)ob_ld, (uint32_t)q_ld,               \
                 (uint32_t)s_ld)
+#define R3D_RHQ_GRP(THR, WDT, RES)                                                               \
+    do {                                                                                         \
+        if (group == 256) R3D_RHQ(THR, WDT, RES, 256);                                           \
+        else              R3D_RHQ(THR, WDT, RES, 128);                                           \
+    } while (0)
 #define R3D_RHQ_W(THR)                                                                           \
     do {                                                                                         \
         if (wdt == R3D_DT_F32) {                                                                 \
-            if (use_res) R3D_RHQ(THR, R3D_DT_F32, true);                                         \
-            else         R3D_RHQ(THR, R3D_DT_F32, false);                                        \
+            if (use_res) R3D_RHQ_GRP(THR, R3D_DT_F32, true);                                     \
+            else         R3D_RHQ_GRP(THR, R3D_DT_F32, false);                                    \
         } else {                                                                                 \
-            if (use_res) R3D_RHQ(THR, R3D_DT_BF16, true);                                        \
-            else         R3D_RHQ(THR, R3D_DT_BF16, false);                                       \
+            if (use_res) R3D_RHQ_GRP(THR, R3D_DT_BF16, true);                                    \
+            else         R3D_RHQ_GRP(THR, R3D_DT_BF16, false);                                   \
         }                                                                                        \
     } while (0)
     if (thr == (int)kNarrow) R3D_RHQ_W(kNarrow); else R3D_RHQ_W(kThreads);
 #undef R3D_RHQ_W
+#undef R3D_RHQ_GRP
 #undef R3D_RHQ
     return (int)hipGetLastError();
 }
