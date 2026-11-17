@@ -30,7 +30,7 @@ qui supersède l'ADR-6) et sont **livrés**. Ce document remplace
 | Flash-Next texte | préfill 42 tok/s (2 290 et 4 570 tok), décodage 4,0–4,6 tok/s, 4 séquences concurrentes OK |
 | Robustesse Flash-Next | prompt 12 001 tok → HTTP 400 clair, serveur vivant ; redémarrages propres |
 
-## 2. Ce que W14–W20 et R21 ont livré
+## 2. Ce que W14–W20 et R21–R26 ont livré
 
 - **QSA complet** : `qsa_work`, `qsa_block_key`, `qsa_score`, `qsa_select`
   (plus `tail_store`), tests libref ; formes alignées sur libref (`nsel`
@@ -109,8 +109,8 @@ scripts/fnserve.sh
 
 - `num-speculative-tokens: 3` : configuration servie depuis W25/R25 (MTP du
   Flash-Next, 1,82× le décodage à texte identique, acceptation 40,3 %).
-  `NS=0` reste le repli de comparaison. Les tables MTP 48 restent à couvrir
-  par kbench via R23.
+  `NS=0` reste le repli de comparaison. Les tables MTP 48 et le draft head sont
+  couverts par kbench (968/968).
 - `max-num-batched-tokens: 2048` : le plan `qsa_score` fait 512 Mio à 2 048
   lignes et 1 Gio à 4 096, que le plugin refuse.
 - `placement: expert_tiered`, `host-pool-mib: 43000`, `kv-cache-dtype: i8`.
@@ -163,8 +163,8 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
   (`1x128`), pas seulement `128x128` ; l'indexation doit venir du bloc encodé,
   pas d'une grille supposée.
 - **kbench « Not covered »** : `ngram_hint` reste sans oracle ; les tables
-  MTP 48 (`moe_gemm_q`) restent à poser via R23. Les rows MTP
-  (`mtp_enter`, `logit_rerank`) sont, elles, couvertes (872 cas).
+  MTP 48 et le draft head sont couverts (968/968) ; restent 10 cas
+  `gemm_nt_q_gated` i8a8h sans référence libref.
 - **Spéculation** : Flash-Next à `NS=3`, acceptation ~40 % (66/61/37 % aux
   profondeurs 1–3), 1,82× le décodage, texte identique. Le 27B reste à
   `NS=0`. Un poids **joint** (`rad.planes`) d'une row device peut vivre en
@@ -203,11 +203,9 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
      2 048. La row annonce 18,7 µs au décodage : écart ×95 à profiler côté
      engine. **C'est la piste n°1** pour le décodage à 4 tok/s.
    - **η lien = 1,7 %** (42 tok/s contre 2 545 tok/s), donc M2 non tenu, et le
-     plafond mesuré est `hc_read`, pas le MoE. Le **temps par row MoE reste non
-     mesurable** : `kbench` refuse le format des tables du conteneur (110 cas
-     sautés, « container format error » sur `trellis:…/fwht128` et « shape this
-     kernel does not serve » sur `affine:…/fwht128`) ; aligner les tags ou
-     passer par une fixture `--record`.
+     plafond mesuré est `hc_read`, pas le MoE. Le **temps par row MoE est
+     mesuré depuis R23** : IQR 70,5 % de la bande à M=32, w4nl 51 % à M=16,
+     10–12 % à M=1 (borné par le décodage treillis) — voir §10 du RAPPORT.
 2. **Optimisations différées** : `hc_read` (ci-dessus) d'abord ; WMMA préfill
    (éteinte, 25–32 % plus lente),
    occupation du gated fusionné (1,4 bloc/CU), `attn_dense` à M=16384,
@@ -226,9 +224,13 @@ rad-kbench -m qwen3.8-next-flash-iqr-v4.rad --home <home> \
    7 checkpoints écrits.
    Contention (`fnconc`) : 4 décodeurs 12,6 s seuls → 87,6 s à côté d'un préfill
    de 3 000 tokens (+590 %), préfill 35 tok/s (vs 42 seul).
-4. **R9** : vérifier E4M3/rotated sur un modèle non-IQR (aucun 2B/4B sur
-   l'hôte). Dérogation documentée dans `SUIVI_LOTS_RDNA3.md` §R9 (inventaire de
-   l'hôte vérifié le 2026-11-16).
+4. **R9 — artefact non-IQR présent, chargement à finir** : `minicpm5-2b-iq8r.rad`
+   (2B, IQ8R rotated i8, groupe 256) est sur l'hôte. Il **ne charge pas**
+   encore : `rad_arch_declare` → INVAL sur `nq_h.declare`, car le producteur
+   rotated et le GEMM `i8a8h` de `libr3d` n'acceptent que **groupe 128**
+   alors que le conteneur est en 256. Cause et liste des rows à écrire :
+   `RAPPORT_RDNA3.md` §10.4–10.5, checklist **§D / D1** (IQ8R). Aucun défaut
+   du fichier : il sert de cas de test du gap.
 4bis. **R24 — corrigé (W20)** : le paramètre rangé est une **capacité de bande**,
    pas le nombre de lignes du pas. `logits_gemm_vocab_iqr` lit l'étendue sur `x`
    (comme `libr4d`), et l'audit `rad-kbench --band-capacity` a trouvé la même
@@ -294,8 +296,14 @@ vert ; W21 reprend la première place dès que le feu vert est donné.
    vert est donné : 1,77 ms à M=1 (η 0,6 %) et 0,23 ms/ligne, ~40 % du décodage
    et 47 % du préfill. Commencer par `--profile-ops true` (temps device par op)
    sur Flash-Next ; la forme deux-grilles et la température sont déjà écartées.
-2. **W24 QSA et doc** — `qsa_score` à M=512, décision sur `RAPPORT_RDNA3.md`,
-   handover final. La doc OPS/README est faite.
+2. **W24 QSA et doc** — `qsa_score` à M=512 (optimisation, en pause) ; la doc
+   OPS/README est faite, reste la décision d'ajout de `RAPPORT_RDNA3.md` au
+   dépôt.
+3. **Écart RDNA4 → RDNA3** — **238 rows / 179 ops** absents de `libr3d` (toutes
+   architectures ; la cible v1 n'en manque aucun sur ses chemins exercés).
+   Feuille de route checklist **§D**, liste complète RAPPORT §10. P0 : IQ8R
+   groupe 256 (MiniCPM5-2B), puis DSpark si `NS>0` ; P1 : `tp>1` ; le reste
+   est conditionné à la décision de périmètre (D0).
 
 **Décisions qui appartiennent à l'utilisateur** : (1) feu vert pour
 l'optimisation noyau (W21) ; (2) ajout de `RAPPORT_RDNA3.md` au dépôt. La
