@@ -190,7 +190,7 @@ flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
   ./build/tests/mtp_enter_e4m3_device_test && ./build/tests/logit_rerank_iqr_device_test && \
   ./build/tests/act_i8g_group256_device_test && ./build/tests/ple_hc_device_test && \
   ./build/tests/tp2_collectives_device_test && \
-  ./build/tests/attn_paged_device_test && \
+  ./build/tests/attn_paged_device_test && ./build/tests/dflash_conv_device_test && \
   ./build/bin/r3d_selftest ./build/radiance_home/kernels/libr3d.so'
 ```
 
@@ -205,6 +205,12 @@ couverture. **Sweep complet rejoué en W38** sur un build neuf (`build-w38`,
 **1 802/1 802**, 0 échec, 0 divergence, mêmes pires `rel_l2` ; replay
 `--strict` des fixtures (`rad-kbench --kernels libref`, forme du ctest
 `kbench_ref`) **1 134/1 134** — `fixture_test` n'a pas d'option `--strict`.
+Sur `build-w39` (W38c), `r3d_selftest` passe à **196 rows, 0 échec, 16 skips**
+(row `dflash_conv` ajoutée) et `dflash_conv_device_test` **37 checks / 3 cas**
+la compare au bit à libref sur huit géométries, les deux moitiés de la
+projection de coefficients comprises ; kbench laisse ses 112 cas du 27B en
+« skipped » (la déclaration porte la plane entière, le site d'issue la tranche
+par `wrow_slice`).
 Test de contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
 `gather_rows_u8_device_test` couvre les rows u8 du tier KV (fragment 4 128 octets,
 octets opaques, pitches larges) ; `mtp_enter_e4m3_device_test` et
@@ -261,9 +267,14 @@ snapshot). À laisser `on` sur un serveur conversationnel. `final-all` est
 l'arbre **W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ;
 détails dans `RAPPORT_REBASE_V2_1_0.md`.
 
-Recette 27B (dense, IQR) : `--kv-cache-dtype i8 --num-speculative-tokens 0`
-(le drafter h128 fenêtré réclame bf16), `--max-num-seqs 4` — le multi-séquence
-est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill ≈ 318 tok/s).
+Recette 27B (dense, IQR) : `--kv-cache-dtype i8`, `--max-num-seqs 4` — le
+multi-séquence est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill
+≈ 318 tok/s). Le drafter sert depuis W38c (`dflash_conv` sur la carte, cache
+du drafter en bf16) : `--num-speculative-tokens 3` donne **1,23×** à 135 tokens
+de contexte (34,2 contre 27,8 tok/s, acceptation 64 %) mais **1,03×** à 2 047
+(15,8 contre 15,4, 70 %) ; texte glouton identique. `NS=2` est refusé par
+l'arch (bloc entraîné = 4). Défaut `NS=0` en contexte long, `NS=3` en contexte
+court (R48).
 
 Recette MiniCPM5-2B (IQ8R, groupe 256) : `--tp 1 --num-speculative-tokens 0`
 en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
@@ -310,8 +321,9 @@ en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
   30 cas `sigmoid`/`mul`/`quant_act_fp8`), d'où un compte kbench qui baisse
   sans échec : comparer les textes servis, pas seulement les compteurs.
 - **MTP** : Flash-Next se sert à `NS=3` (1,82× le décodage, texte identique,
-  acceptation ~40 %) ; le 27B reste à `NS=0` (cache du drafter bf16 livré en
-  W38, placement encore bloquant — voir le point `27B en NS>0`). Un poids
+  acceptation ~40 %) ; le 27B sert `NS=3` depuis W38c, mais n'y gagne que
+  1,23× en contexte court et 1,03× à 2 k (R48) — d'où `NS=0` par défaut au-delà
+  de ~1 k tokens. Un poids
   joint `rad.planes` d'une row device peut vivre en VRAM : un shim ne doit pas
   lire son en-tête sur l'hôte (SIGSEGV, corrigé dans `gemm_nt_q_w2a8_m16`),
   et le MT du bras `w2a8` doit avoir un chunk qui divise K (M=1/K=2560 → MT=4).
@@ -323,12 +335,13 @@ en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
   élémentaires) ; restent sans oracle libref des cas `gemm_nt_q_gated` i8a8h,
   `gate_had_quant_i8g`/`gated_had_quant_i8g` (couverts par les tests device) et
   8 `ngram_hint`.
-- **27B en `NS>0`** : refusé au placement. `dflash_conv` n'a pas de row device,
-  donc le groupe de poids du drafter est épinglé sur le *mapped tier* et ses
-  normes (déclarées f32, stockées bf16) échouent à l'élargissement
-  (« widened at load ») ; `--placement all_vram` ne change rien. Le cache du
-  drafter est en bf16 sous tronc i8 depuis `ee291d2` (prérequis, pas la
-  solution). Le 27B se sert à `NS=0` (**15,4 tok/s** à 2 047 tokens).
+- **27B en `NS>0`** : servi depuis W38c. Le blocage était double, et les deux
+  pièces sont livrées : le drafter h128 prend sa **propre** dtype de cache
+  (bf16 sous tronc i8, `ee291d2`), et `dflash_conv` a une **row device**
+  (`f63dffd`) — sans elle le groupe de poids du drafter restait épinglé sur le
+  *mapped tier* et ses normes élargies échouaient (« widened at load »).
+  `NS=3` rend 1,23× à 135 tokens et 1,03× à 2 047 (R48) ; `NS=2` est refusé par
+  l'arch.
 - Le paramètre rangé d'une row (`M`) est un **plafond de bande**, jamais le
   nombre de lignes du pas : l'étendue est sur les tenseurs. Une row qui compare
   les deux casse le multi-séquence du moteur (bug R24, corrigé en W20) ;
