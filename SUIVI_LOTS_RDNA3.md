@@ -422,3 +422,42 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
 - **Reste** : la proposition chiffrée sur le chunk de queue (99 tokens = 86 %
   des experts), sans toucher à `core/sched/` ; et la marge `hc_read` (1,7× vers
   son plancher).
+
+## W36 — chunk de queue : proposition examinée, non retenue (2026-11-18)
+
+- **Correction du chiffre** : pour 972 tokens les chunks sont **896 + 76** (le
+  704 + 99 est le cas d'un prompt de 803). Le 76 relit **77 % des experts**
+  (760 slots sur 512), soit **14,0 GiB** en place, ~0,65–0,75 s des 2,04 s ;
+  le chunk de 896 stage 18,2 GiB.
+- **Où** : `Scheduler::tail_checkpoint` (`core/sched/scheduler.cpp:1292`,
+  ancre 1297–1305, `kShortTailMin` 256 à `scheduler.h:507`) et
+  `plan_chunk` (`scheduler.cpp:1104`, coupe en 1131/1133). La coupe naît de
+  `--prefix-resume exact` (ancre 896 pour 972), pas du quantum.
+- **Ce qu'une fusion coûterait** : l'état linéaire n'est capturé qu'en **fin**
+  de chunk ; un snapshot à 896 au milieu d'un chunk de 972 demande une
+  capacité moteur nouvelle. L'invariant « les chunks du run froid » tombe pour
+  la queue : un hit `exact` à 896 recalculerait 76 tokens dans une forme jamais
+  exécutée à froid, donc le texte n'est plus garanti identique. Relever
+  `kShortTailMin` par défaut change la politique pour tous les prompts sous le
+  seuil et supprime l'ancre courte. Aucun signal « pas de reprise possible »
+  n'existe (le cache de préfixe VRAM reste actif même à `prefix-cache-mib: 0`).
+- **Mesure qui tranche** : un chunk plus gros **ne paie pas** ici. Budget
+  4096 + `checkpoint-interval` 4096 sur le prompt de 3 252 (un chunk au lieu de
+  2048 + 1204) : **5 453 → 6 486 ms (+19 %)**, texte identique, décodage
+  inchangé. L'arithmétique « un chunk au lieu de deux = une copie d'experts en
+  moins » est donc fausse sur ce modèle : le coût d'arène et de résidence
+  dépasse la copie épargnée, comme le GUIDE §4.5 l'annonce pour les gros
+  contextes.
+- **Décision** : **ne pas toucher à R22**. Le gain projeté de la fusion
+  (~0,65 s sur 972) est du même ordre que ce que la mesure ci-dessus détruit,
+  et il s'achète en cassant l'exactitude de reprise. Si le produit veut un jour
+  le gain *single-shot*, la seule forme acceptable est un **drapeau**
+  (`--tail-anchor off`) qui fait rendre -1 au cas court de `tail_checkpoint`,
+  jamais le défaut, avec trois tests à écrire d'abord (ancre courte linéaire à
+  I=2048 dans `sched_test`, e2e froid/hit/tour appendu à I=2048, fixtures
+  `--strict`).
+- **R44** — *décision (W36)* : le chunk de queue est une **conséquence de
+  l'ancre de reprise**, pas un gaspillage. Ne pas le fusionner par défaut ;
+  toute variante passe par un drapeau et une revue R22. Et vérifier par la
+  mesure, pas par l'arithmétique, qu'un chunk plus gros réduit le TTFT : sur
+  Flash-Next le contraire est mesuré (+19 % à 3 252 tokens en un chunk).

@@ -1744,3 +1744,34 @@ corrigés (`5d67900` + cette entrée).
 À noter pour la lecture des chiffres : le préfill de 3 252 tokens est **neutre**
 ici ; le 8 186 → 5 964 ms observé entre W31 et W35 vient de la **tuile trellis
 IQR** (W33), pas du stager.
+
+**Chunk de queue : proposition examinée, non retenue (W36).** Le découpage de
+972 tokens est **896 + 76** (le 704 + 99 est le cas 803, correction du chiffre
+précédent). Il naît de `--prefix-resume exact` : `tail_checkpoint`
+(`core/sched/scheduler.cpp:1292`, ancre 1297–1305, `kShortTailMin` 256 à
+`scheduler.h:507`) pose une ancre à 896, et `plan_chunk` (1104, coupe 1131/1133)
+s'arrête là. Le 76 relit **77 % des experts** en place, soit 14,0 GiB et
+0,65–0,75 s des 2,04 s.
+
+Fusionner la queue demanderait un snapshot linéaire **dans** le chunk (l'état
+n'est capturé qu'en fin de chunk aujourd'hui), ce qui casse l'invariant « les
+chunks du run froid » : un hit `exact` à 896 recalculerait 76 tokens dans une
+forme jamais exécutée à froid, donc le texte ne serait plus garanti identique.
+Relever `kShortTailMin` change la politique pour tous les prompts sous le seuil
+et supprime l'ancre courte ; aucun signal « pas de reprise possible » n'existe,
+le cache de préfixe VRAM restant actif même à `prefix-cache-mib: 0`.
+
+**La mesure tranche contre l'arithmétique.** Budget 4096 et
+`checkpoint-interval` 4096 sur le prompt de 3 252 (un chunk au lieu de
+2 048 + 1 204) : **5 453 → 6 486 ms (+19 %)**, texte identique, décodage
+inchangé. Un chunk plus gros ne réduit donc pas le TTFT ici : le coût d'arène
+et de résidence dépasse la copie d'experts épargnée, comme le GUIDE §4.5
+l'annonce. Le gain projeté de la fusion (~0,65 s) est du même ordre que ce que
+cette mesure détruit, et il s'achète en cassant R22.
+
+**Décision** : on ne touche pas au planificateur. Si le produit veut un jour le
+gain *single-shot*, la seule forme acceptable est un drapeau
+`--tail-anchor off` (cas court de `tail_checkpoint` rendant -1), jamais le
+défaut, et il faut d'abord écrire trois tests (ancre courte linéaire à I=2048
+dans `sched_test`, e2e froid/hit/tour appendu à I=2048, fixtures `--strict`).
+R44.

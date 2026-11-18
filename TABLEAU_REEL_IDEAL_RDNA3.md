@@ -736,3 +736,12 @@ décodage initial (−5 à −7 %, 16 441 experts résidents au lieu de 16 802) 
 (`set_loan`), et le décodage revient à **19,25 tok/s** à ctx 3 252 et
 **30,13** à 92 tokens, soit ≤ 1,2 % de l'arbre sans stager. Texte identique.
 Le levier passe donc sous la barre R43 (2 %).
+
+**Chunk de queue (W36) : non retenu.** Pour 972 tokens le préfill est coupé
+**896 + 76** par l'ancre de `--prefix-resume exact` ; le 76 relit 77 % des
+experts en place (14,0 GiB, 0,65–0,75 s). Fusionner casserait l'invariant des
+chunks du run froid (texte `exact` non garanti). Et l'arithmétique « un chunk
+plus gros = une copie en moins » est **fausse** ici : budget 4096 avec
+`checkpoint-interval` 4096 sur 3 252 tokens donne **5 453 → 6 486 ms (+19 %)**,
+la résidence coûtant plus que la copie épargnée (R44). Ne pas y toucher sans
+drapeau et revue R22.
