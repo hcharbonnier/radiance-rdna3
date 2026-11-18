@@ -567,3 +567,7 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   tronc est compute-bound, et le drafter ajoute ~45 ms. Le « 1,5× » de W37
   était faux : contexte long → `NS=0`, contexte court → `NS=3` (texte
   glouton inchangé).
+- **Couverture** : kbench laisse les 112 cas `dflash_conv` du 27B en
+  « skipped » (la déclaration porte la plane entière, le site d'issue la
+  tranche par `wrow_slice`), mais le sweep reste 3 181/3 181, 0 échec,
+  0 divergence ; la row est couverte par `dflash_conv_device_test`.

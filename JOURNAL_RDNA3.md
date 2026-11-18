@@ -2026,3 +2026,13 @@ entraîné est 4.
 
 Artefacts : `<work-root>/work/w38-results/{w39-dflashconv.md,ns27b40/,
 ns27b_scan/,ns27b_final/}`.
+
+**Couverture kbench** : le sweep 27B complet reste **3 181/3 181**, 0 échec,
+0 divergence, pire `rel_l2` 3,619e-03, mais les **112 cas `dflash_conv`** y sont
+« skipped » : le graphe déclare `base` avec la plane entière (20 480 éléments,
+les deux moitiés) et le site d'issue la tranche au runtime
+(`wrow_slice(w_acb[i], 0|1, 1, taps*H)`), ce que l'outil ne sait pas
+reconstituer depuis la déclaration — il refuse d'inventer la moitié plutôt que
+de vérifier contre la mauvaise. La row est couverte par
+`dflash_conv_device_test` (les deux moitiés, pas de projection compris), et le
+service la valide par le texte glouton identique à `NS=0`.
