@@ -1974,3 +1974,55 @@ cohérents.
 texte **identique** (313 caractères). Les chiffres de §5.2 d'`AGENTS.md`
 (11,10 / 19,25) sont donc toujours justes ; le coût de préfill du MTP, lui,
 n'était pas chiffré.
+
+## 2026-11-18 — W38c : `dflash_conv` servi sur la carte, 27B en `NS=3`
+
+**Feu vert** pour la row device que R47 exigeait. Livré `f63dffd` :
+
+- `libr3d/r3dh_dflash_conv_body.h` — calcul dans un en-tête sans HIP (revue ISA
+  au clang nu), transcrit de `ref_dflash_conv` : `out[t][h]` = somme des taps
+  `j` avec `j == 0` ou `t % block >= j` de `(base[j][h] + delta[t][j][h/16]) *
+  x[t-j][h]`, **ordre des taps croissant, un arrondi bf16 au store**, ce qui est
+  bit-exact parce que toute la bibliothèque est compilée `-ffp-contract=off`.
+  Un thread = 8 canaux (16 octets en lecture et en écriture) ; le groupe 16 est
+  un multiple de 8, donc l'indice de groupe et les deux gains delta sont
+  uniformes.
+- `libr3d/r3d_dflash_conv.hip` — grille `(H/8/128, T)`, masque de bloc par
+  **modulo** (donc tout `block_size >= 1` est servi, alors que libr4d se limite
+  aux puissances de deux) ; `delta` lu **au pas de la projection** `2*taps*NG`
+  (un pas compacté refusé : il lirait l'autre moitié des coefficients) ; `out`
+  ne peut pas aliéner `x` (le tap 1 lit la ligne `t-1`).
+- Contrat : `taps == 2`, `group_size == 16`, `hidden_size % 128 == 0`, bf16 ;
+  la forme décrit `delta` au rang de la projection `[T, 2, taps, NG]` pour que
+  le pas soit porté. `r3d_selftest` passe à **196 rows, 0 échec, 16 skips** et
+  `tests/dflash_conv_device_test.cpp` (**37 checks, 3 cas**) compare au bit
+  8 géométries : bande 27B (H 5 120, NG 320, bloc 4), les deux moitiés de la
+  projection, `T = 10` avec bloc 4 (rangs 0 et 4 sans tap décalé), bloc 3 (non
+  puissance de deux), bloc 1, bloc 32 sur `T = 8`, `T = 1`, `H = 128` ; plus les
+  deux refus (alias, pas compacté). Suite complète verte sur `build-w39`
+  (sched 548 964, e2e 1 087/3 skips, fixture 109 671, config 2 927, tous les
+  device, selftest 196/0/16).
+
+**27B servi** (`build-w39`, KV i8, prompt 2 047 et 135 tokens, 64 tokens
+générés, deux serveurs indépendants par point) :
+
+| prompt | `NS=0` | `NS=3` | gain | acceptation | texte |
+|---:|---:|---:|---:|---:|---|
+| 2 047 tokens | 15,36 / 15,34 | 15,79 / 15,75 | **1,03×** | 70 % | identique |
+| 135 tokens | 27,89 / 27,69 | 34,42 / 33,97 | **1,23×** | 64 % | identique |
+
+Le préfill paie 1,6–2,3 % au profit du drafter (4,72 → 4,82 s à 2 047). `NS=2`
+est refusé par l'arch lui-même (`rad_arch_declare` → unsupported) : le bloc
+entraîné est 4.
+
+- **R47 clos** : la row `dflash_conv` lève le blocage de placement ; le prérequis
+  KV (`ee291d2`) et celui-ci étaient les deux pièces manquantes.
+- **R48** — *mesure (W38)* : `NS=3` sur le 27B vaut **1,23× à 135 tokens mais
+  1,03× à 2 047**. Le verify à M=4 coûte ~2,3× un pas à une rangée quand le
+  tronc devient compute-bound, et la passe du drafter (~45 ms) s'ajoute : le
+  « 1,5× » estimé en W37 était faux. Servir le 27B à `NS=0` pour un contexte
+  long ; `NS=3` n'a d'intérêt que quand la cible est memory-bound (contexte
+  court), et il ne change pas le texte glouton.
+
+Artefacts : `<work-root>/work/w38-results/{w39-dflashconv.md,ns27b40/,
+ns27b_scan/,ns27b_final/}`.

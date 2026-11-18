@@ -533,7 +533,7 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
 - **R47** — *constat (W38)* : le 27B en `NS=3` n'est pas une recette ; il faut
   une row device `dflash_conv`. Le prérequis KV est livré, le reste est du
   noyau (hors périmètre sans feu vert). Le 27B reste servi à `NS=0`
-  (**15,4 tok/s** à 2 047 tokens).
+  (**15,4 tok/s** à 2 047 tokens). **Clos en W38c** (row livrée).
 - **Contrôles du changement** : texte 27B `NS=0` identique entre `build-w38` et
   `build-w39` ; sweep 27B entier sur `build-w39` **3 181/3 181**, 0 échec,
   0 divergence, même pire `rel_l2` ; ciblé 854/854.
@@ -544,3 +544,26 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   `NS=0` 11,03 tok/s, `NS=3` **19,29 tok/s** (1,75×), texte identique ; le
   préfill paie **+9,7 %** (5 473 → 6 003 ms) pour la passe de contexte du
   drafter.
+
+## W38c — `dflash_conv` sur la carte, 27B en `NS=3` (2026-11-18)
+
+- **Livré** (`f63dffd`) : `libr3d/r3dh_dflash_conv_body.h` (calcul sans HIP,
+  transcrit de `ref_dflash_conv`, taps croissants, un arrondi bf16) et
+  `libr3d/r3d_dflash_conv.hip` (8 canaux par thread, masque de bloc par
+  modulo donc tout `block_size >= 1`, `delta` au pas de la projection
+  `2*taps*NG` sinon refus, alias `x`/`out` refusé). Row `taps 2`,
+  `group_size 16`, `hidden_size % 128`, bf16.
+- **Tests** : `dflash_conv_device_test` **37 checks / 3 cas**, bit-exact sur
+  8 géométries (bande 27B, les deux moitiés de la projection, bloc 4 sur
+  `T = 10`, bloc 3, bloc 1, bloc 32, `T = 1`, `H = 128`) et les deux refus ;
+  selftest **196 rows, 0 échec, 16 skips** ; suite complète verte `build-w39`.
+- **27B servi**, 64 tokens générés, deux serveurs par point : à 2 047 tokens
+  `NS=0` 15,35 / `NS=3` 15,77 (**1,03×**, acceptation 70 %, préfill +1,7 %) ;
+  à 135 tokens 27,8 → 34,2 (**1,23×**, 64 %). Textes identiques (4 paires).
+  `NS=2` refusé par l'arch (bloc entraîné = 4).
+- **R47 clos** : la row lève le blocage de placement.
+- **R48** — *mesure (W38)* : `NS=3` sur le 27B vaut **1,23× à 135 tokens,
+  1,03× à 2 047** ; le verify M=4 coûte ~2,3× un pas à une rangée quand le
+  tronc est compute-bound, et le drafter ajoute ~45 ms. Le « 1,5× » de W37
+  était faux : contexte long → `NS=0`, contexte court → `NS=3` (texte
+  glouton inchangé).
