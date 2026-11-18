@@ -1521,3 +1521,95 @@ qu'avec un changement de contrat (FMA ou softmax en une passe) ; la piste
 « lane = clé » avec scores en LDS viserait ~124 ms au mieux. Préfill
 Flash-Next : `moe_gemm_q` est désormais 46 % d'un préfill de 972 tokens, et
 `hc_read` 33 % ; le 27B reste borné par la tuile IQR.
+
+## 2026-11-18 — W32 : `hc_read` deuxième passe, `attn_dense` clos, MoE rejeté
+
+**`hc_read` — deux rangées par lane, norm et quant parallèles (livré, bit-exact).**
+Causes mesurées au profil (rocprofv3, M=4 096) : `down` et `up` coûtaient **2 LDS
+par MAC** (un pour le poids, un pour l'activation) ; `hc_norm` prenait 8,5 ms
+avec un bloc par rangée et **4 lanes actives sur 256** sur une chaîne `double`
+dépendante ; `quant`+`inj` 9,2 ms, FWHT et amax sérialisés dans la lane 0 sur
+20 blocs par rangée.
+
+Correctif : une lane possède **2 rangées** en `down` et **2 colonnes × 2
+rangées** en `up`, donc un poids stagé sert deux MAC et une activation deux
+colonnes (1,5 puis 1,0 LDS/MAC), les quatre produits d'un groupe étant formés
+avant leurs additions **ascendantes** (aucun FMA, `-ffp-contract=off`) ;
+`hc_norm` couvre 64 rangées par bloc avec huit chargements émis avant la somme ;
+`q`/`rq` font l'amax par réduction de bloc et la rotation étage par étage sur
+128 threads, dans l'ordre d'étages de la référence.
+
+| `hc_read` M | W31 | W32 | gain | vs W30 |
+|---:|---:|---:|---:|---:|
+| 1 | 399,2 | **324,1** | 1,23× | 1,23× |
+| 128 | 1 297,5 | **728,4** | 1,78× | 5,17× |
+| 512 | 5 656,8 | **1 927,3** | 2,94× | 7,73× |
+| 1 024 | 10 787,4 | **4 045,7** | 2,67× | 6,90× |
+| 4 096 | 38 263,7 | **13 702,5** | 2,79× | 7,88× |
+
+`core` (down+up seuls) 28 601 → **13 005 µs** à M=4 096. Cumulé depuis W30, la
+row est **7,7–7,9×** plus rapide au préfill.
+
+Effet servi (`profile-ops`, même protocole, NS=0) :
+
+| cas | W31 | W32 |
+|---|---:|---:|
+| texte 972 tok, TTFT | 3 133 ms | **2 560 ms** (−18 %) |
+| texte 3 252 tok, préfill | 8 186 ms | **6 316 ms** (−23 %) |
+| image 1 024², TTFT | 4 660 ms | **4 049 ms** (−13 %) |
+| `hc_read` dans le préfill 972 tok | 1 197 ms (32,6 %) | **534 ms** (17,6 %) |
+
+Texte servi **identique au bit** (Flash-Next 3 252 tokens, drafts 19/39).
+
+**`attn_dense` hd72 — piste « lane = clé » mesurée et close.** Comptage
+d'instructions du noyau : **437 VALU par clé et par thread** (marche 1 : 145,
+marche 2 : 292), soit exactement la borne bit-exact, plus 182 créneaux
+d'émission non-VALU (54 LDS, 53 `s_waitcnt`, 75 `s_delay_alu`) → 619. Plancher
+VALU pur 115 ms à 2,6 GHz ; à 100 % d'issue 163 ms ; mesuré **233 ms**, donc
+**~70 % d'issue**. Variantes mesurées : lane = clé avec tuile de scores 32 en
+LDS **286,2 ms (+23 %)**, `kStage` 64 **2 315,6 ms** (36 KiB de LDS, occupancy
+détruite), `__launch_bounds__(128,3)` **879,2 ms**, waves/EU 3 **232,9** et 5
+**233,8** (bruit). La carte « lane = clé » est une **transposée**, pas une
+réduction : q passe du registre au LDS, K devient par-lane, 56 instructions de
+plus par clé et 28 spills. **Aucun noyau modifié** ; le plancher réaliste de
+cette row sous contrat est ~5,3 TFLOP/s à 16 384 patches × 16 têtes, et les
+6,5 s de la tour restent. Le seul gain restant exigerait le FMA, un tampon de
+scores de 64 KiB par ligne (changement de schéma) ou une softmax en une passe.
+
+**MoE run map — livré sur kbench, rejeté en service.** Le noyau `moe_iqr` donnait
+à un bloc une tuile fixe de 64 rangées alors qu'un préfill route une ou deux
+rangées par expert ; la variante choisissait la tuile la plus étroite parmi
+16/32/64 (`T ≤ 8·E` → 16, `≤ 24·E` → 32, sinon 64), ce qui divise la LDS par
+deux et supprime un barrage par bloc-K. kbench : **M=128 2 591 → 2 033 µs
+(1,27×)**, M=256 1,19×, M=512 1,10×.
+
+En service, c'est une **régression** (profil, deux runs alternés par arbre) :
+**2 550 / 2 554 µs → 2 768 / 2 766 µs (+8,5 %)**. La géométrie servie est
+`M=1204` (bande M ≤ 2048), soit `T = 12 040` et **~23,5 rangées par expert** :
+la tuile 32 double le nombre de blocs, donc chaque unité de poids 16×128 est
+**décodée deux fois** au lieu d'être réutilisée sur quatre tuiles de 16
+rangées. Le gain ne vaut que pour des runs de 1–2 rangées.
+
+Le commit a en outre cassé le service : le prompt de 3 252 tokens a **arrêté le
+moteur** au premier pas (`kernel moe_gemm_iqr refused op 'moe_gemm_q' at M=1204
+[band M<=2048] … scratch buffer absent or too small`). Cause : le hook de
+déclaration dimensionnait la carte de runs avec la tuile du **M de la bande**
+(T=20 480 → tuile 64 → capacité 833) alors que le pas utilisait M=1204 → tuile
+32 → capacité 890. La capacité `n_expert + ceil(T/tuile)` **croît quand la
+tuile rétrécit** : une déclaration doit se dimensionner pour la tuile la plus
+étroite possible, jamais pour celle d'un pas particulier. Commit retiré de la
+branche (l'historique est aplati : il n'y a pas de commit mort), résultat
+consigné ici ; l'agent reprend le sujet avec la géométrie servie comme porte.
+
+**Validation (`build-w32`, build neuf)** : `sched_test` 548 952,
+`engine_e2e_test` 1 076 (3 skips), `fixture_test` 109 671,
+`ple_hc_device_test` **58 checks/10 cas**, `moe_iqr_device_test` 15/15,
+`vision_rows_device_test` 66/10, `iqr_device_test` 76/11,
+`attn_paged_device_test` 8/9, `r3d_selftest` **195 rows, 0 échec, 16 skips**.
+
+**Reste.** Le préfill Flash-Next est maintenant dominé par `moe_gemm_q`
+(56,5 % à 972 tokens, 1 711 ms inchangés) puis `hc_read` (17,6 %) ; le vrai
+levier MoE est la **continuation de trellis** (0,80 ms des 2,59 ms de plancher
+diagnostiqué) et, au-delà, le chunking du planificateur (9 appels par site
+relisent les 512 experts), qui n'est pas du ressort de la row. `hc_read` garde
+1,7× vers son plancher de matrices. `attn_dense` est clos sous contrat.

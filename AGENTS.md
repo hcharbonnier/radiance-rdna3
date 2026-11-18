@@ -235,7 +235,13 @@ levier (W30 : q=4 ≈ q=1 en gqa6, +23–31 % en gqa12, R36). **W31** : `hc_read
 vision **8,7–11×** (0 ulp) ; servi, Flash-Next texte 3 252 tokens 13,56 →
 **8,19 s**, image 2 048² 39,2 → **19,1 s**, texte identique au bit. `attn_dense`
 n'est **pas** effondré (5,30 TFLOP/s à 16 384 patches × 16 têtes, 53 % de sa
-borne VALU ; le « 19 GFLOP/s » de W30 était un comptage faux, R37). `final-all` est
+borne VALU ; le « 19 GFLOP/s » de W30 était un comptage faux, R37), et **W32**
+porte `hc_read` à **1,23× à M=1, 1,78× à 128, 2,94× à 512** (bit-exact, 7,7–7,9×
+cumulé depuis W30) : servi, Flash-Next texte 972 tok 3,13 → **2,56 s**, 3 252
+tok 8,19 → **6,32 s**, image 1 024² 4,66 → **4,05 s**, texte identique au bit.
+`attn_dense` est **clos sous contrat** (R40 : lane=clé +23 %, kStage 64 ×9,9).
+Le run map MoE à tuile étroite est **rejeté** : kbench 1,27× à M=128 mais
+**+8,5 % en service** à M=1204 (R39). `final-all` est
 l'arbre **W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ;
 détails dans `RAPPORT_REBASE_V2_1_0.md`.
 

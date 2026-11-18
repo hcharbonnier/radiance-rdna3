@@ -312,3 +312,42 @@ sous le même `flock` (aucun bench concurrent).
 - **Reste** : `moe_gemm_q` est devenu le premier poste du préfill Flash-Next
   (46 % à 972 tokens) ; `hc_read` garde 1,7× vers son plancher ; `attn_dense`
   1,3–1,9× sans contrat ; le 27B reste borné par la tuile IQR.
+
+## W32 — `hc_read` 2ᵉ passe, `attn_dense` clos, MoE rejeté (2026-11-18)
+
+Quatre agents en worktrees séparés, un seul run GPU à la fois.
+
+- **Livré `hc_read`** : deux rangées par lane en `down` (1,5 LDS/MAC) et
+  2 colonnes × 2 rangées en `up` (1,0 LDS/MAC), produits formés avant des
+  additions ascendantes ; `hc_norm` 64 rangées par bloc (8,5 → 0,46 ms) ;
+  `q`/`rq` amax par réduction de bloc et rotation étage par étage (9,2 →
+  0,8 ms). **1,23× à M=1**, **1,78× à 128**, **2,94× à 512**, 2,8× à 4 096 ;
+  cumulé depuis W30 : **7,7–7,9×**. Bit-exact, `ple_hc_device_test` 58/10.
+  Servi : texte 972 tok 3 133 → **2 560 ms**, 3 252 tok 8 186 → **6 316 ms**,
+  image 1 024² 4 660 → **4 049 ms**, texte identique au bit.
+- **`attn_dense` : clos sous contrat.** 437 VALU/clé + 182 non-VALU = 619 ;
+  plancher 115 ms, 100 % d'issue 163 ms, mesuré 233 ms (~70 %). lane = clé
+  **+23 %**, kStage 64 ×9,9, launch_bounds(128,3) ×3,8, waves 3/5 bruit.
+  Aucun noyau modifié ; plancher réaliste ~5,3 TFLOP/s à la forme servie.
+- **Rejeté : MoE run map** (tuile 16/32/64). kbench **1,27× à M=128** mais
+  servi **+8,5 %** (2 550 → 2 768 µs) : à M=1204 chaque expert porte ~23
+  rangées, une tuile de 32 double les blocs et **décode deux fois** chaque
+  unité 16×128. Le commit cassait aussi le service (scratch déclaré avec la
+  tuile de la bande, capacité trop petite → `RAD_E_SCRATCH` au premier pas du
+  prompt de 3 252 tokens). Retiré ; l'agent reprend avec la géométrie servie
+  comme porte.
+- **Validation** : `sched_test` 548 952, `engine_e2e_test` 1 076 (3 skips),
+  `fixture_test` 109 671, `ple_hc_device_test` 58/10, `moe_iqr_device_test`
+  15/15, `vision_rows_device_test` 66/10, `iqr_device_test` 76/11,
+  `attn_paged_device_test` 8/9, `r3d_selftest` 195/0/16.
+- **R39** — *décision (W32)* : un gain kbench à M ≤ 512 ne vaut rien pour une
+  row du graphe servi. Toute optimisation de `moe_gemm_q` se juge à
+  **M ≈ 1024–2048** (la géométrie réelle) et, si possible, sur le TTFT servi ;
+  une variante qui perd à cette géométrie ne rentre pas, même si elle gagne
+  ailleurs.
+- **R40** — *clos (W32)* : `attn_dense` hd72 sous contrat bit-exact est à son
+  plancher d'issue (~5,3 TFLOP/s, 53–70 % de l'issue VALU). Ne pas rouvrir un
+  chantier de scheduling ; les seules sorties sont le FMA, un tampon de scores
+  (changement de schéma) ou une softmax en une passe — décisions de contrat.
+- **Reste** : `moe_gemm_q` (56,5 % du préfill 972 tokens) via la continuation
+  de trellis, puis `hc_read` (17,6 %).
