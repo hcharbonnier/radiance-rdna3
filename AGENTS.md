@@ -2,8 +2,7 @@
 
 ## Contexte
 
-- Branche de travail : `rdna3-iqr`. Hôte GPU : `<gpu-user>@<gpu-host>`
-  (W7900 gfx1100, 48 GiB, 32 threads), **une seule carte**.
+- Branche de travail : `rdna3-iqr`.
 - Tout travail GPU (tests, serveur, benchmark) se fait sous
   `flock -w 7200 /tmp/radiance-gpu.lock -c '...'`, un seul processus à la fois.
 - Builds : `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -14,8 +13,6 @@
   **répertoire de build neuf** (un build incrémental après `rsync -a` peut
   garder des objets périmés).
 - Ne pas modifier `core/`, `arch/`, `libr4d/` ni les docs partagés sans besoin.
-- Accès SSH, droits, specs de l'hôte et contraintes d'inférence distante :
-  voir `API_DISTANTE.md` (référence pour tout travail GPU distant).
 
 ## Consignes de travail
 
