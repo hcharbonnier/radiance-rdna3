@@ -17,21 +17,27 @@
  * launches because each phase has a different natural grid:
  *
  *   norm    one block a row, hc threads: the hc double sums and their scales;
- *   down    one block a (row, 16-output tile), plus one a row for `inj`: the block rebuilds N in
- *           LDS as bf16 (the normalisation is cheap beside the weight stream) and each of 16
- *           threads owns one output row, summing i ascending in f32 exactly as ref does. The 16
- *           weight rows are staged into LDS 128 columns at a time by all 256 threads: in the E4M3
- *           form a lane reads one 16-byte vector of codes beside its group's scale, so the slice
- *           is one load a lane instead of 16 lanes fetching 16 different rows at one offset (the
- *           bf16 form keeps the scalar walk). The injection gains have their own workgroup,
- *           staged the same way, because their chain would otherwise run behind a tile's;
- *   up      one block a (row, 64 columns): each thread owns one column and sums c ascending. The
- *           block stages those 64 weight rows into LDS 32 k at a time, again with all 256 threads,
- *           two lanes a row in the E4M3 form;
+ *   down    one block a (8-row tile, 32-output tile), plus one a row tile for `inj`: every thread
+ *           owns one (row, output) pair and accumulates it, so all 256 lanes are busy and the
+ *           staged slice of 32 weight rows serves 8 rows. The block rebuilds N in LDS as bf16 one
+ *           128-column chunk at a time (the normalisation is cheap beside the weight stream) and
+ *           sums i ascending in f32 exactly as ref does. In the E4M3 form a lane reads one
+ *           16-byte vector of codes beside its group's scale, so the slice is one load a lane
+ *           instead of 32 lanes fetching 32 different rows at one offset (the bf16 form keeps the
+ *           scalar walk). The injection gains have their own workgroup, one a row tile, because
+ *           their chain would otherwise run behind a tile's;
+ *   up      one block a (8-row tile, 32-column tile): each thread owns one (row, column) pair,
+ *           sums c ascending, and the block stages those 32 weight rows into LDS 64 k at a time,
+ *           again with all 256 threads, four lanes a row in the E4M3 form;
  *   quant   one block a (row, group): q is a sequential group scan, rq a wave transform in LDS.
  *
+ * A launch narrower than a row tile is decode, where the tile's spare rows would be lanes doing a
+ * dot nothing reads: it keeps the W28 one-row-a-block kernels instead (16 outputs by 256 columns a
+ * slice for down, 64 columns by 32 k for up), so a one-row call is not slower for the tiling that
+ * a prefill chunk needs.
+ *
  * `d` and the per-stream scales travel in the row's scratch: M*(lowrank*2 + hc*4) bytes. The
- * weight stream is read once per tile, coalesced, and the staged slice is decoded once. The
+ * weight stream is read once per row tile, coalesced, and the staged slice is decoded once. The
  * accumulations are ascending and f32 (double for the norm), with no FMA, so the read is
  * bit-identical to the reference, not merely close.
  */
@@ -49,15 +55,24 @@
 namespace {
 
 constexpr int kHcThreads = 256;
-constexpr int kHcDownTile = 16;
-constexpr int kHcDownChunk = 256;   /* weight columns staged per down slice */
-constexpr int kHcUpCols = 64;       /* output columns a up workgroup owns */
-constexpr int kHcUpChunk = 32;      /* k values staged per up slice */
-/* The stage is a row of `chunk` floats plus one of pad: an owner lane walks its own row
- * sequentially (what a vectorised LDS read wants) and its neighbours start on distinct banks. */
-constexpr int kHcDownPitch = kHcDownChunk + 1;
-constexpr int kHcDownStage = kHcDownTile * kHcDownPitch;
-constexpr int kHcUpStage = kHcUpCols * (kHcUpChunk + 1);
+/* A workgroup owns one tile of rows by one tile of outputs; the two multiply to the block's
+ * thread count, so every lane accumulates an output for a row of the tile. The first set is the
+ * prefill shape, where 8 rows share a staged slice. Below one row tile the W28 kernels take over. */
+constexpr int kHcDownTile = 32;     /* output rows a down workgroup owns */
+constexpr int kHcDownRows = 8;      /* stream rows a down workgroup owns */
+constexpr int kHcDownChunk = 128;   /* weight columns staged per down slice: one 128-wide group */
+constexpr int kHcUpCols = 32;       /* output columns a up workgroup owns */
+constexpr int kHcUpRows = 8;        /* stream rows a up workgroup owns */
+constexpr int kHcUpChunk = 64;      /* k values staged per up slice */
+/* A launch narrower than a row tile keeps the W28 kernels, which are one row a block: no row of
+ * the tile is an empty lane, and a one-row call keeps the latency it was measured at. */
+constexpr int kHcW28DownTile = 16;
+constexpr int kHcW28DownChunk = 256;
+constexpr int kHcW28DownPitch = kHcW28DownChunk + 1;
+constexpr int kHcW28DownStage = kHcW28DownTile * kHcW28DownPitch;
+constexpr int kHcW28UpCols = 64;
+constexpr int kHcW28UpChunk = 32;
+constexpr int kHcW28UpStage = kHcW28UpCols * (kHcW28UpChunk + 1);
 constexpr int kHcQuantScratch = 256;   /* the deepest rotated group the quantiser transforms */
 
 /* Scratch layout: d [M, lowrank] bf16, then the stream scales [M, hc] f32, 16-byte aligned. */
@@ -104,25 +119,169 @@ __global__ __launch_bounds__(kHcThreads) void hc_norm_kernel(
 }
 
 /* ---- down: d and inj ----------------------------------------------------------------------- */
-/* LDS: the staged weight slice, a row of kHcDownChunk floats a tile row, each row padded by one
- * float so an owner lane's sequential walk and its neighbours start on distinct banks; then N bf16
- * [hc*n] at the width it was narrowed to. The decode of a staged element is `mix_get`'s, once, so
- * the dot reads what the old per-element read produced. */
-static inline size_t hc_down_lds_bytes(long long HN) {
-    return (size_t)kHcDownStage * sizeof(float) + (size_t)HN * sizeof(uint16_t);
+/* LDS: 32 staged weight rows of kHcDownChunk floats (one float of pad a row, so an owner lane's
+ * sequential walk and its neighbours start on distinct banks), then N bf16 [8][chunk] for the row
+ * tile, pitch-padded so the tile's rows do not collide in a bank. The injection block reuses the
+ * weight stage for its hc rows, since it stages no tile. The decode of a staged element is
+ * `mix_get`'s, once, so the dot reads what the per-element read produced. */
+constexpr size_t hc_down_lds_bytes_impl(int tile, int rows, int chunk) {
+    return (size_t)tile * (chunk + 1) * sizeof(float) +
+           (size_t)rows * (chunk + 8) * sizeof(uint16_t);
 }
+template <int TILE, int ROWS, int CHUNK>
+constexpr size_t hc_down_lds_bytes() {
+    static_assert(TILE * ROWS == kHcThreads, "a down lane owns one (row, output)");
+    return hc_down_lds_bytes_impl(TILE, ROWS, CHUNK);
+}
+constexpr size_t kHcDownBigLds = hc_down_lds_bytes<kHcDownTile, kHcDownRows, kHcDownChunk>();
 
-__global__ __launch_bounds__(kHcThreads) void hc_down_kernel(
-    const uint16_t* __restrict__ h, const float* __restrict__ w, const void* __restrict__ down,
+template <int TILE, int ROWS, int CHUNK>
+__device__ __forceinline__ void hc_down_body(
+    unsigned char* __restrict__ hc_down_smem, const uint16_t* __restrict__ h,
+    const float* __restrict__ w, const void* __restrict__ down,
     const uint16_t* __restrict__ injw, uint16_t* __restrict__ d, const float* __restrict__ sc,
     uint16_t* __restrict__ inj, int M, int n, int hc, int lr, int h_ld, int injw_ld, int inj_ld,
     int f8, int down_ld, int down_stride, int down_G, float wadd) {
+    static_assert(TILE * ROWS == kHcThreads, "a down lane owns one (row, output)");
+    constexpr int kPitch = CHUNK + 1;
+    constexpr int kNPitch = CHUNK + 8;   /* 16-byte pad per N row shifts the bank */
+    constexpr int kStage = TILE * kPitch;
+    const int r0 = (int)blockIdx.x * ROWS;
+    if (r0 >= M) return;
+    const int rv = min(ROWS, M - r0);   /* the tile's rows that exist */
+    const long long HN = (long long)hc * n;
+    float* stage = (float*)hc_down_smem;
+    uint16_t* Nb = (uint16_t*)(stage + kStage);
+    const int t = (int)threadIdx.x;
+    const int o = t % TILE;
+    const int rr = t / TILE;
+    const int ntiles = (lr + TILE - 1) / TILE;
+    const bool inj_block = (int)blockIdx.y == ntiles;
+    const int j0 = (int)blockIdx.y * TILE;
+    const int nr = inj_block ? 0 : min(TILE, lr - j0);
+    MixW dw{down, f8, down_ld, down_stride, (int)HN, down_G};
+    float acc = 0.0f;
+    for (long long i0 = 0; i0 < HN; i0 += CHUNK) {
+        const int cn = (int)min((long long)CHUNK, HN - i0);
+        /* N of the tile's rows, one chunk at a time: the whole-row fill's expression, narrowed
+         * once. Rows past M are held at zero and never stored. */
+        for (int idx = t; idx < rv * cn; idx += kHcThreads) {
+            const int r = idx / cn, ii = idx - r * cn;
+            const int row = r0 + r;
+            float v = 0.0f;
+            if (row < M) {
+                const long long j = i0 + ii;
+                v = bf16_to_f32(h[(long long)row * h_ld + j]) *
+                    sc[(long long)row * hc + (int)(j / n)] * (w[j] + wadd);
+            }
+            Nb[r * kNPitch + ii] = f32_to_bf16(v);
+        }
+        if (inj_block) {
+            /* The injection gains are one dot a stream and their own workgroup: behind a tile's
+             * dot they would serialise two full-length chains and set the launch's time. */
+            for (int idx = t; idx < hc * cn; idx += kHcThreads) {
+                const int r = idx / cn, ii = idx - r * cn;
+                stage[r * kPitch + ii] = bf16_to_f32(injw[(long long)r * injw_ld + i0 + ii]);
+            }
+        } else if (f8 && cn == CHUNK && down_G % 16 == 0) {
+            /* Sixteen codes a lane, a 16-byte vector a load, with the group's scale beside it:
+             * the slice is one coalesced pass instead of TILE lanes on TILE rows at one offset. */
+            const int gpr = CHUNK / 16;
+            for (int c = t; c < nr * gpr; c += kHcThreads) {
+                const int r = c / gpr, g = c - r * gpr;
+                const uint8_t* wr = (const uint8_t*)down + (long long)(j0 + r) * down_stride;
+                const uint4 codes = *(const uint4*)(wr + i0 + g * 16);
+                const float scale = ((const float*)(wr + HN))[(i0 + (long long)g * 16) / down_G];
+                const uint32_t* cw = &codes.x;
+                float* st = stage + r * kPitch + g * 16;
+                #pragma unroll
+                for (int u = 0; u < 4; ++u) {
+                    const uint32_t v = cw[u];
+                    #pragma unroll
+                    for (int b = 0; b < 4; ++b)
+                        st[u * 4 + b] = e4m3_to_f32((uint8_t)(v >> (8 * b))) * scale;
+                }
+            }
+        } else {
+            for (int idx = t; idx < nr * cn; idx += kHcThreads) {
+                const int r = idx / cn, ii = idx - r * cn;
+                stage[r * kPitch + ii] = mix_get(dw, j0 + r, i0 + ii);
+            }
+        }
+        __syncthreads();
+        if (inj_block) {
+            if (t < hc * ROWS) {
+                const int r = t / hc, c = t - r * hc;
+                float a = acc;
+                const uint16_t* nb = Nb + r * kNPitch;
+                const float* st = stage + c * kPitch;
+                if (cn == CHUNK) {
+                    #pragma unroll 16
+                    for (int ii = 0; ii < CHUNK; ++ii) a += bf16_to_f32(nb[ii]) * st[ii];
+                } else {
+                    for (int ii = 0; ii < cn; ++ii) a += bf16_to_f32(nb[ii]) * st[ii];
+                }
+                acc = a;
+            }
+        } else if (o < nr) {
+            float a = acc;
+            const uint16_t* nb = Nb + rr * kNPitch;
+            const float* st = stage + o * kPitch;
+            if (cn == CHUNK) {
+                #pragma unroll 16
+                for (int ii = 0; ii < CHUNK; ++ii) a += bf16_to_f32(nb[ii]) * st[ii];
+            } else {
+                for (int ii = 0; ii < cn; ++ii) a += bf16_to_f32(nb[ii]) * st[ii];
+            }
+            acc = a;
+        }
+        __syncthreads();
+    }
+    if (inj_block) {
+        if (injw && inj && t < hc * ROWS) {
+            const int r = t / hc, c = t - r * hc;
+            const int row = r0 + r;
+            if (row < M)
+                inj[(long long)row * inj_ld + c] =
+                    f32_to_bf16(2.0f * r3d_hcple::sigmoid(acc / (float)hc));
+        }
+        return;
+    }
+    if (o < nr && r0 + rr < M)
+        d[(long long)(r0 + rr) * lr + j0 + o] =
+            f32_to_bf16(r3d_hcple::silu(acc / (float)hc));
+}
+
+/* A template-id cannot sit in R3D_KLAUNCH's first macro argument (its commas split the
+ * arguments), so the tiled body is a device function and hc_down_kernel_big names it. */
+#define R3D_HC_DOWN_ARGS                                                                          \
+    const uint16_t* __restrict__ h, const float* __restrict__ w, const void* __restrict__ down,   \
+        const uint16_t* __restrict__ injw, uint16_t* __restrict__ d,                              \
+        const float* __restrict__ sc, uint16_t* __restrict__ inj, int M, int n, int hc, int lr,   \
+        int h_ld, int injw_ld, int inj_ld, int f8, int down_ld, int down_stride, int down_G,      \
+        float wadd
+#define R3D_HC_DOWN_CALL                                                                          \
+    h, w, down, injw, d, sc, inj, M, n, hc, lr, h_ld, injw_ld, inj_ld, f8, down_ld, down_stride,  \
+        down_G, wadd
+
+__global__ __launch_bounds__(kHcThreads) void hc_down_kernel_big(R3D_HC_DOWN_ARGS) {
+    extern __shared__ __attribute__((aligned(16))) unsigned char smem[];
+    hc_down_body<kHcDownTile, kHcDownRows, kHcDownChunk>(smem, R3D_HC_DOWN_CALL);
+}
+
+/* W28's down, unchanged: one row a block, the whole of N in LDS, 16 rows by 256 columns a slice.
+ * It is the decode shape (M below one row tile). */
+static inline size_t hc_down_w28_lds_bytes(long long HN) {
+    return (size_t)kHcW28DownStage * sizeof(float) + (size_t)HN * sizeof(uint16_t);
+}
+
+__global__ __launch_bounds__(kHcThreads) void hc_down_kernel_w28(R3D_HC_DOWN_ARGS) {
     const int row = (int)blockIdx.x;
     if (row >= M) return;
     const long long HN = (long long)hc * n;
     extern __shared__ __attribute__((aligned(16))) unsigned char hc_down_smem[];
     float* stage = (float*)hc_down_smem;
-    uint16_t* Nb = (uint16_t*)(stage + kHcDownStage);
+    uint16_t* Nb = (uint16_t*)(stage + kHcW28DownStage);
     const float* scr = sc + (long long)row * hc;
     const uint16_t* hr = h + (long long)row * h_ld;
     const int t = (int)threadIdx.x;
@@ -133,24 +292,24 @@ __global__ __launch_bounds__(kHcThreads) void hc_down_kernel(
     __syncthreads();
 
     /* The injection gains are one dot a stream and their own workgroup: behind a tile's dot they
-     * would serialise two full-length chains and set the launch's time. They stage the hc weight
-     * rows the same way, with a fixed pad so the owner lanes' walk is conflict-free. */
-    const int ntiles = (lr + kHcDownTile - 1) / kHcDownTile;
+     * would serialise two full-length chains and set the launch's time. */
+    const int ntiles = (lr + kHcW28DownTile - 1) / kHcW28DownTile;
     if ((int)blockIdx.y == ntiles) {
         float acc = 0.0f;
-        for (long long i0 = 0; i0 < HN; i0 += kHcDownChunk) {
-            const int cn = (int)min((long long)kHcDownChunk, HN - i0);
+        for (long long i0 = 0; i0 < HN; i0 += kHcW28DownChunk) {
+            const int cn = (int)min((long long)kHcW28DownChunk, HN - i0);
             for (int idx = t; idx < cn * hc; idx += kHcThreads) {
                 const int r = idx / cn, ii = idx - r * cn;
-                stage[r * kHcDownPitch + ii] = bf16_to_f32(injw[(long long)r * injw_ld + i0 + ii]);
+                stage[r * kHcW28DownPitch + ii] =
+                    bf16_to_f32(injw[(long long)r * injw_ld + i0 + ii]);
             }
             __syncthreads();
             if (t < hc) {
                 float a = acc;
-                const float* st = stage + t * kHcDownPitch;
-                if (cn == kHcDownChunk) {
+                const float* st = stage + t * kHcW28DownPitch;
+                if (cn == kHcW28DownChunk) {
                     #pragma unroll 16
-                    for (int ii = 0; ii < kHcDownChunk; ++ii)
+                    for (int ii = 0; ii < kHcW28DownChunk; ++ii)
                         a += bf16_to_f32(Nb[i0 + ii]) * st[ii];
                 } else {
                     for (int ii = 0; ii < cn; ++ii) a += bf16_to_f32(Nb[i0 + ii]) * st[ii];
@@ -166,24 +325,21 @@ __global__ __launch_bounds__(kHcThreads) void hc_down_kernel(
         return;
     }
 
-    const int j0 = (int)blockIdx.y * kHcDownTile;
-    const int j1 = min(j0 + kHcDownTile, lr);
-    const int nr = j1 - j0;
+    const int j0 = (int)blockIdx.y * kHcW28DownTile;
+    const int nr = min(j0 + kHcW28DownTile, lr) - j0;
     MixW dw{down, f8, down_ld, down_stride, (int)HN, down_G};
     float acc = 0.0f;
-    for (int i0 = 0; i0 < HN; i0 += kHcDownChunk) {
-        const int cn = (int)min((long long)kHcDownChunk, HN - i0);
-        if (f8 && cn == kHcDownChunk && down_G % 16 == 0) {
-            /* Sixteen codes a lane, a 16-byte vector a load, with the group's scale beside it:
-             * the slice is one coalesced pass instead of 16 lanes on 16 rows at one offset. */
-            const int gpr = kHcDownChunk / 16;
+    for (int i0 = 0; i0 < HN; i0 += kHcW28DownChunk) {
+        const int cn = (int)min((long long)kHcW28DownChunk, HN - i0);
+        if (f8 && cn == kHcW28DownChunk && down_G % 16 == 0) {
+            const int gpr = kHcW28DownChunk / 16;
             for (int c = t; c < nr * gpr; c += kHcThreads) {
                 const int r = c / gpr, g = c - r * gpr;
                 const uint8_t* wr = (const uint8_t*)down + (long long)(j0 + r) * down_stride;
                 const uint4 codes = *(const uint4*)(wr + i0 + g * 16);
                 const float scale = ((const float*)(wr + HN))[(i0 + g * 16) / down_G];
                 const uint32_t* cw = &codes.x;
-                float* st = stage + r * kHcDownPitch + g * 16;
+                float* st = stage + r * kHcW28DownPitch + g * 16;
                 #pragma unroll
                 for (int u = 0; u < 4; ++u) {
                     const uint32_t v = cw[u];
@@ -195,16 +351,16 @@ __global__ __launch_bounds__(kHcThreads) void hc_down_kernel(
         } else {
             for (int idx = t; idx < nr * cn; idx += kHcThreads) {
                 const int r = idx / cn, ii = idx - r * cn;
-                stage[r * kHcDownPitch + ii] = mix_get(dw, j0 + r, i0 + ii);
+                stage[r * kHcW28DownPitch + ii] = mix_get(dw, j0 + r, i0 + ii);
             }
         }
         __syncthreads();
         if (t < nr) {
             float a = acc;
-            const float* st = stage + t * kHcDownPitch;
-            if (cn == kHcDownChunk) {
+            const float* st = stage + t * kHcW28DownPitch;
+            if (cn == kHcW28DownChunk) {
                 #pragma unroll 16
-                for (int ii = 0; ii < kHcDownChunk; ++ii)
+                for (int ii = 0; ii < kHcW28DownChunk; ++ii)
                     a += bf16_to_f32(Nb[i0 + ii]) * st[ii];
             } else {
                 for (int ii = 0; ii < cn; ++ii) a += bf16_to_f32(Nb[i0 + ii]) * st[ii];
@@ -216,20 +372,130 @@ __global__ __launch_bounds__(kHcThreads) void hc_down_kernel(
     if (t < nr)
         d[(long long)row * lr + j0 + t] = f32_to_bf16(r3d_hcple::silu(acc / (float)hc));
 }
+#undef R3D_HC_DOWN_ARGS
+#undef R3D_HC_DOWN_CALL
 
 /* ---- up and x ------------------------------------------------------------------------------ */
-/* LDS: the low-rank vector d f32 [lr], then the staged weight slice [64][chunk] f32 with one float
- * of pad a row. A block owns 64 output columns; all 256 threads stage, so the weight rows are read
- * as consecutive k of one row (a 32-byte sector a row) rather than one lane a row at one k. */
-static inline size_t hc_up_lds_bytes(long long lr) {
-    return (((size_t)lr + 3) / 4) * 4 * sizeof(float) + (size_t)kHcUpStage * sizeof(float);
+/* LDS: COLS staged weight rows of CHUNK floats (one float of pad a row) and d for the tile's
+ * rows, chunk by chunk with the same pad, so a lane's walk is sequential and its neighbours hit
+ * distinct banks. The weight rows are read as consecutive k of one row rather than one lane a row
+ * at one k; the tile's rows share the staged slice. */
+template <int COLS, int ROWS, int CHUNK>
+constexpr size_t hc_up_lds_bytes() {
+    static_assert(COLS * ROWS == kHcThreads, "an up lane owns one (row, column)");
+    return (size_t)COLS * (CHUNK + 1) * sizeof(float) +
+           (size_t)ROWS * (CHUNK + 1) * sizeof(float);
+}
+constexpr size_t kHcUpBigLds = hc_up_lds_bytes<kHcUpCols, kHcUpRows, kHcUpChunk>();
+
+template <int COLS, int ROWS, int CHUNK>
+__device__ __forceinline__ void hc_up_body(
+    unsigned char* __restrict__ hc_up_smem, const uint16_t* __restrict__ h,
+    const float* __restrict__ w, const void* __restrict__ up, const uint16_t* __restrict__ d,
+    const float* __restrict__ sc, void* __restrict__ x, int M, int n, int hc, int lr, int h_ld,
+    int x_ld, int x_dt, int f8, int up_ld, int up_stride, int up_G, float wadd) {
+    static_assert(COLS * ROWS == kHcThreads, "an up lane owns one (row, column)");
+    constexpr int kPitch = CHUNK + 1;
+    constexpr int kStage = COLS * kPitch;
+    const int r0 = (int)blockIdx.x * ROWS;
+    if (r0 >= M) return;
+    const int rv = min(ROWS, M - r0);   /* the tile's rows that exist */
+    const int t = (int)threadIdx.x;
+    const int o = t % COLS;
+    const int rr = t / COLS;
+    float* stage = (float*)hc_up_smem;
+    float* dsh = stage + kStage;
+    /* Every thread of the block reaches every barrier, including the lanes past `n` and the
+     * staging-only lanes: only the per-column work is guarded. */
+    const int i0 = (int)blockIdx.y * COLS;
+    const int ni = min(COLS, n - i0);
+    MixW uw{up, f8, up_ld, up_stride, lr, up_G};
+    float acc = 0.0f;
+    for (int c = 0; c < hc; ++c) {
+        float gv = 0.0f;
+        for (int k0 = 0; k0 < lr; k0 += CHUNK) {
+            const int kn = min(CHUNK, lr - k0);
+            for (int idx = t; idx < rv * kn; idx += kHcThreads) {
+                const int r = idx / kn, kk = idx - r * kn;
+                const int row = r0 + r;
+                dsh[r * kPitch + kk] =
+                    row < M ? bf16_to_f32(d[(long long)row * lr + k0 + kk]) : 0.0f;
+            }
+            if (f8 && kn == CHUNK && up_G > 0 && up_G % 16 == 0) {
+                /* A 16-code vector starts on a 16-byte boundary and the scale group is a
+                 * multiple of 16, so a vector never straddles two groups: one scale a vector, four
+                 * lanes a row, the slice staged in one load each. */
+                const int vpr = CHUNK / 16;
+                for (int idx = t; idx < ni * vpr; idx += kHcThreads) {
+                    const int r = idx / vpr, g = idx - r * vpr;
+                    const uint8_t* wr =
+                        (const uint8_t*)up + (long long)((long long)c * n + i0 + r) * up_stride;
+                    const uint4 codes = *(const uint4*)(wr + k0 + g * 16);
+                    const float scale = ((const float*)(wr + lr))[(k0 + g * 16) / up_G];
+                    const uint32_t* cw = &codes.x;
+                    float* st = stage + r * kPitch + g * 16;
+                    #pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        const uint32_t v = cw[u];
+                        #pragma unroll
+                        for (int b = 0; b < 4; ++b)
+                            st[u * 4 + b] = e4m3_to_f32((uint8_t)(v >> (8 * b))) * scale;
+                    }
+                }
+            } else {
+                for (int idx = t; idx < ni * kn; idx += kHcThreads) {
+                    const int r = idx / kn, kk = idx - r * kn;
+                    stage[r * kPitch + kk] = mix_get(uw, (long long)c * n + i0 + r, k0 + kk);
+                }
+            }
+            __syncthreads();
+            if (o < ni) {
+                float g = gv;
+                const float* st = stage + o * kPitch;
+                const float* dr = dsh + rr * kPitch;
+                if (kn == CHUNK) {
+                    #pragma unroll 8
+                    for (int kk = 0; kk < CHUNK; ++kk) g += dr[kk] * st[kk];
+                } else {
+                    for (int kk = 0; kk < kn; ++kk) g += dr[kk] * st[kk];
+                }
+                gv = g;
+            }
+            __syncthreads();
+        }
+        const int row = r0 + rr;
+        if (o < ni && row < M) {
+            const long long j = (long long)c * n + i0 + o;
+            const float Nj = r3d_hcple::narrow(
+                R3D_DT_BF16,
+                bf16_to_f32(h[(long long)row * h_ld + j]) * sc[(long long)row * hc + c] *
+                    (w[j] + wadd));
+            acc += r3d_hcple::narrow(R3D_DT_BF16, r3d_hcple::sigmoid(gv)) * Nj;
+        }
+    }
+    if (o < ni && r0 + rr < M)
+        r3d_hcple::st_elem(x_dt, x, (long long)(r0 + rr) * x_ld + i0 + o, acc / (float)hc);
 }
 
-__global__ __launch_bounds__(kHcThreads) void hc_up_kernel(
-    const uint16_t* __restrict__ h, const float* __restrict__ w, const void* __restrict__ up,
-    const uint16_t* __restrict__ d, const float* __restrict__ sc, void* __restrict__ x, int M,
-    int n, int hc, int lr, int h_ld, int x_ld, int x_dt, int f8, int up_ld, int up_stride,
-    int up_G, float wadd) {
+#define R3D_HC_UP_ARGS                                                                            \
+    const uint16_t* __restrict__ h, const float* __restrict__ w, const void* __restrict__ up,     \
+        const uint16_t* __restrict__ d, const float* __restrict__ sc, void* __restrict__ x, int M, \
+        int n, int hc, int lr, int h_ld, int x_ld, int x_dt, int f8, int up_ld, int up_stride,    \
+        int up_G, float wadd
+#define R3D_HC_UP_CALL h, w, up, d, sc, x, M, n, hc, lr, h_ld, x_ld, x_dt, f8, up_ld, up_stride,  \
+        up_G, wadd
+
+__global__ __launch_bounds__(kHcThreads) void hc_up_kernel_big(R3D_HC_UP_ARGS) {
+    extern __shared__ __attribute__((aligned(16))) unsigned char smem[];
+    hc_up_body<kHcUpCols, kHcUpRows, kHcUpChunk>(smem, R3D_HC_UP_CALL);
+}
+
+/* W28's up, unchanged: one row a block, d f32 in LDS whole, 64 columns by 32 k a slice. */
+static inline size_t hc_up_w28_lds_bytes(long long lr) {
+    return (((size_t)lr + 3) / 4) * 4 * sizeof(float) + (size_t)kHcW28UpStage * sizeof(float);
+}
+
+__global__ __launch_bounds__(kHcThreads) void hc_up_kernel_w28(R3D_HC_UP_ARGS) {
     const int row = (int)blockIdx.x;
     if (row >= M) return;
     const int t = (int)threadIdx.x;
@@ -242,20 +508,17 @@ __global__ __launch_bounds__(kHcThreads) void hc_up_kernel(
         dsh[k] = bf16_to_f32(d[(long long)row * lr + k]);
     __syncthreads();
 
-    const int i0 = (int)blockIdx.y * kHcUpCols;
-    const int ni = min(kHcUpCols, n - i0);
+    const int i0 = (int)blockIdx.y * kHcW28UpCols;
+    const int ni = min(kHcW28UpCols, n - i0);
     const float* scr = sc + (long long)row * hc;
     const uint16_t* hr = h + (long long)row * h_ld;
     MixW uw{up, f8, up_ld, up_stride, lr, up_G};
     float acc = 0.0f;
     for (int c = 0; c < hc; ++c) {
         float gv = 0.0f;
-        for (int k0 = 0; k0 < lr; k0 += kHcUpChunk) {
-            const int kn = min(kHcUpChunk, lr - k0);
-            if (f8 && kn == kHcUpChunk && up_G > 0 && up_G % 16 == 0) {
-                /* A 16-code vector starts on a 16-byte boundary and the scale group is a
-                 * multiple of 16, so a vector never straddles two groups: one scale a vector, two
-                 * lanes a row, the slice staged in one load each. */
+        for (int k0 = 0; k0 < lr; k0 += kHcW28UpChunk) {
+            const int kn = min(kHcW28UpChunk, lr - k0);
+            if (f8 && kn == kHcW28UpChunk && up_G > 0 && up_G % 16 == 0) {
                 if (t < ni * 2) {
                     const int r = t >> 1, kk0 = (t & 1) * 16;
                     const uint8_t* wr =
@@ -263,7 +526,7 @@ __global__ __launch_bounds__(kHcThreads) void hc_up_kernel(
                     const uint4 codes = *(const uint4*)(wr + k0 + kk0);
                     const float scale = ((const float*)(wr + lr))[(k0 + kk0) / up_G];
                     const uint32_t* cw = &codes.x;
-                    float* st = stage + r * (kHcUpChunk + 1) + kk0;
+                    float* st = stage + r * (kHcW28UpChunk + 1) + kk0;
                     #pragma unroll
                     for (int u = 0; u < 4; ++u) {
                         const uint32_t v = cw[u];
@@ -275,17 +538,17 @@ __global__ __launch_bounds__(kHcThreads) void hc_up_kernel(
             } else {
                 for (int idx = t; idx < ni * kn; idx += kHcThreads) {
                     const int r = idx / kn, kk = idx - r * kn;
-                    stage[r * (kHcUpChunk + 1) + kk] =
+                    stage[r * (kHcW28UpChunk + 1) + kk] =
                         mix_get(uw, (long long)c * n + i0 + r, k0 + kk);
                 }
             }
             __syncthreads();
             if (t < ni) {
                 float g = gv;
-                const float* st = stage + t * (kHcUpChunk + 1);
-                if (kn == kHcUpChunk) {
+                const float* st = stage + t * (kHcW28UpChunk + 1);
+                if (kn == kHcW28UpChunk) {
                     #pragma unroll 8
-                    for (int kk = 0; kk < kHcUpChunk; ++kk) g += dsh[k0 + kk] * st[kk];
+                    for (int kk = 0; kk < kHcW28UpChunk; ++kk) g += dsh[k0 + kk] * st[kk];
                 } else {
                     for (int kk = 0; kk < kn; ++kk) g += dsh[k0 + kk] * st[kk];
                 }
@@ -302,6 +565,8 @@ __global__ __launch_bounds__(kHcThreads) void hc_up_kernel(
     }
     if (t < ni) r3d_hcple::st_elem(x_dt, x, (long long)row * x_ld + i0 + t, acc / (float)hc);
 }
+#undef R3D_HC_UP_ARGS
+#undef R3D_HC_UP_CALL
 
 /* ---- q and rq ------------------------------------------------------------------------------ */
 __global__ __launch_bounds__(kHcThreads) void hc_quant_kernel(
@@ -447,25 +712,50 @@ int r3d_hc_read(long h, long w, long down, long up, long injw, long x, long inj,
     const long long sc_off = hc_sc_off(M, lr);
     uint16_t* d = (uint16_t*)scratch;
     float* sc = (float*)((char*)scratch + sc_off);
-    const long long HN = (long long)hc * n;
 
     const int norm_thr = kHcThreads;
     R3D_KLAUNCH(hc_norm_kernel, dim3((uint32_t)M), dim3(norm_thr), (hipStream_t)stream,
                 (const uint16_t*)h, (const float*)w, sc, M, n, hc, h_ld, eps);
 
-    const int down_blocks = (lr + kHcDownTile - 1) / kHcDownTile;
-    R3D_KLAUNCH_S(hc_down_kernel,
-                  dim3((uint32_t)M, (uint32_t)(down_blocks + ((injw && inj) ? 1 : 0))),
-                  dim3(kHcThreads), hc_down_lds_bytes(HN), (hipStream_t)stream,
-                  (const uint16_t*)h, (const float*)w, (const void*)down,
-                  injw ? (const uint16_t*)injw : nullptr, d, sc, inj ? (uint16_t*)inj : nullptr, M,
-                  n, hc, lr, h_ld, injw ? injw_ld : 0, inj ? inj_ld : 0, mix_e4m3, down_ld,
-                  down_stride, down_G, wadd);
+    /* A launch narrower than a row tile is decode: the tiled kernels' spare rows would be lanes
+     * doing a dot nothing reads, so the W28 one-row-a-block kernels keep that latency. */
+    const long long HN = (long long)hc * n;
+    const int inj_y = (injw && inj) ? 1 : 0;
+    if (M < kHcDownRows) {
+        const int tiles = (lr + kHcW28DownTile - 1) / kHcW28DownTile;
+        R3D_KLAUNCH_S(hc_down_kernel_w28, dim3((uint32_t)M, (uint32_t)(tiles + inj_y)),
+                      dim3(kHcThreads), hc_down_w28_lds_bytes(HN), (hipStream_t)stream,
+                      (const uint16_t*)h, (const float*)w, (const void*)down,
+                      injw ? (const uint16_t*)injw : nullptr, d, sc,
+                      inj ? (uint16_t*)inj : nullptr, M, n, hc, lr, h_ld, injw ? injw_ld : 0,
+                      inj ? inj_ld : 0, mix_e4m3, down_ld, down_stride, down_G, wadd);
+    } else {
+        const int tiles = (lr + kHcDownTile - 1) / kHcDownTile;
+        R3D_KLAUNCH_S(hc_down_kernel_big,
+                      dim3((uint32_t)((M + kHcDownRows - 1) / kHcDownRows),
+                           (uint32_t)(tiles + inj_y)),
+                      dim3(kHcThreads), kHcDownBigLds,
+                      (hipStream_t)stream, (const uint16_t*)h, (const float*)w, (const void*)down,
+                      injw ? (const uint16_t*)injw : nullptr, d, sc,
+                      inj ? (uint16_t*)inj : nullptr, M, n, hc, lr, h_ld, injw ? injw_ld : 0,
+                      inj ? inj_ld : 0, mix_e4m3, down_ld, down_stride, down_G, wadd);
+    }
 
-    R3D_KLAUNCH_S(hc_up_kernel, dim3((uint32_t)M, (uint32_t)((n + kHcUpCols - 1) / kHcUpCols)),
-                  dim3(kHcThreads), hc_up_lds_bytes(lr), (hipStream_t)stream,
-                  (const uint16_t*)h, (const float*)w, (const void*)up, d, sc, (void*)x, M, n, hc,
-                  lr, h_ld, x_ld, x_dt, mix_e4m3, up_ld, up_stride, up_G, wadd);
+    if (M < kHcUpRows) {
+        R3D_KLAUNCH_S(hc_up_kernel_w28,
+                      dim3((uint32_t)M, (uint32_t)((n + kHcW28UpCols - 1) / kHcW28UpCols)),
+                      dim3(kHcThreads), hc_up_w28_lds_bytes(lr), (hipStream_t)stream,
+                      (const uint16_t*)h, (const float*)w, (const void*)up, d, sc, (void*)x, M, n,
+                      hc, lr, h_ld, x_ld, x_dt, mix_e4m3, up_ld, up_stride, up_G, wadd);
+    } else {
+        R3D_KLAUNCH_S(hc_up_kernel_big,
+                      dim3((uint32_t)((M + kHcUpRows - 1) / kHcUpRows),
+                           (uint32_t)((n + kHcUpCols - 1) / kHcUpCols)),
+                      dim3(kHcThreads), kHcUpBigLds,
+                      (hipStream_t)stream, (const uint16_t*)h, (const float*)w, (const void*)up, d,
+                      sc, (void*)x, M, n, hc, lr, h_ld, x_ld, x_dt, mix_e4m3, up_ld, up_stride,
+                      up_G, wadd);
+    }
 
     if (q || rq) {
         const int qg = (group > 0 && group <= n) ? group : n;

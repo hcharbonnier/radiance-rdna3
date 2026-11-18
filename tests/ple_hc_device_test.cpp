@@ -21,12 +21,14 @@
  */
 #include "rad_test.h"
 #include "rad_plugin.h"
+#include "rad_planes.h"
 
 #include "r3d_codecs.h"
 
 #include <dlfcn.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -489,6 +491,322 @@ TEST(hc_read_bf16_matches_libref) {
             CHECK(same_f32(rrs, rs2, "hc_read rq scale"));
         }
     }
+}
+
+/* ================================================================== hc_read, E4M3 mixing rows */
+/* The joined row form (codes with the row's scale group in its tail) is the device row's; libref
+ * reads the same logical planes through a rad.planes header. Both get the same codes and scales,
+ * and the outputs must agree bit for bit, which covers the E4M3 decode and the row-tiled staging
+ * as well as the arithmetic the bf16 case already pins. */
+std::vector<uint8_t> planes_joined(long long rows, long long K, long long G,
+                                   const std::vector<uint8_t>& codes,
+                                   const std::vector<float>& scales) {
+    const long long ng = K / G;
+    RadPlanesHeader h;
+    RadPlanesEntry e[2];
+    std::memset(&h, 0, sizeof h);
+    std::memset(e, 0, sizeof e);
+    h.magic = RAD_PLANES_MAGIC;
+    h.n_planes = 2;
+    std::memcpy(h.transform, "affine", 7);
+    std::strcpy(e[0].role, "codes");
+    e[0].dtype = RAD_F8E4M3;
+    e[0].kind = RAD_PLANE_TILED;
+    e[0].block[0] = 1;
+    e[0].block[1] = 1;
+    e[0].rows = rows;
+    e[0].cols = K;
+    e[0].row_bytes = K;
+    std::strcpy(e[1].role, "scale");
+    e[1].dtype = RAD_F32;
+    e[1].kind = RAD_PLANE_TILED;
+    e[1].block[0] = 1;
+    e[1].block[1] = G;
+    e[1].rows = rows;
+    e[1].cols = ng;
+    e[1].row_bytes = 4 * ng;
+    long long off = rad_planes_round((long long)(sizeof h + 2 * sizeof e[0]));
+    e[0].offset = off;
+    off = rad_planes_round(off + rows * K);
+    e[1].offset = off;
+    off = rad_planes_round(off + rows * 4 * ng);
+    h.bytes = off;
+    std::vector<uint8_t> buf((size_t)off, 0);
+    std::memcpy(buf.data(), &h, sizeof h);
+    std::memcpy(buf.data() + sizeof h, e, sizeof e);
+    std::memcpy(buf.data() + e[0].offset, codes.data(), (size_t)(rows * K));
+    std::memcpy(buf.data() + e[1].offset, scales.data(), (size_t)(rows * ng * 4));
+    return buf;
+}
+
+/* Codes with the scale group in the row's tail, at the stride the row's own layout sets. */
+std::vector<uint8_t> rows_joined(long long rows, long long K, long long G,
+                                 const std::vector<uint8_t>& codes,
+                                 const std::vector<float>& scales) {
+    const long long ng = K / G;
+    const long long stride = (K + 4 * ng + 15) / 16 * 16;
+    std::vector<uint8_t> buf((size_t)(rows * stride), 0);
+    for (long long r = 0; r < rows; ++r) {
+        uint8_t* row = buf.data() + (size_t)(r * stride);
+        std::memcpy(row, codes.data() + (size_t)(r * K), (size_t)K);
+        std::memcpy(row + K, scales.data() + (size_t)(r * ng), (size_t)(4 * ng));
+    }
+    return buf;
+}
+
+TEST(hc_read_e4m3_matches_libref) {
+    if (!ready()) return;
+    const RadKernelInfo* kd = g_r3d.find("hc_read", RAD_DOMAIN_DEVICE, "hc_read_e4m3");
+    const RadKernelInfo* kr = g_ref.find("hc_read", RAD_DOMAIN_HOST, "ref_");
+    CHECK(kd && kr && kd->scratch);
+    if (!(kd && kr && kd->scratch)) return;
+
+    /* 10 rows cross the 8-row tile boundary, so the partial tile is covered too. */
+    const int M = 10, n = 256, hc = 2, hn = hc * n, lr = 64, group = 128;
+    const int ngrp = n / group;
+    auto hh = rand_bf16((size_t)M * hn, 81), ijh = rand_bf16((size_t)hc * hn, 82);
+    auto wh = rand_f32(hn, 83, 0.5f, 1.5f);
+    auto dcodes = rand_e4m3((size_t)lr * hn, 84), ucodes = rand_e4m3((size_t)hn * lr, 85);
+    auto dsc = rand_f32((size_t)lr * (hn / 128), 86, 0.002f, 0.02f);
+    auto usc = rand_f32((size_t)hn * (lr / (lr / 4)), 87, 0.002f, 0.02f);
+    auto drow = rows_joined(lr, hn, 128, dcodes, dsc);
+    auto urow = rows_joined(hn, lr, lr / 4, ucodes, usc);
+    auto dpln = planes_joined(lr, hn, 128, dcodes, dsc);
+    auto upln = planes_joined(hn, lr, lr / 4, ucodes, usc);
+
+    Dev dh((size_t)M * hn * 2), dw((size_t)hn * 4), dijw((size_t)hc * hn * 2);
+    Dev ddown((size_t)drow.size()), dup((size_t)urow.size());
+    Dev rdown((size_t)dpln.size()), rup((size_t)upln.size());
+    up(dh, hh.data(), dh.bytes); up(dw, wh.data(), dw.bytes); up(dijw, ijh.data(), dijw.bytes);
+    up(ddown, drow.data(), ddown.bytes); up(dup, urow.data(), dup.bytes);
+    up(rdown, dpln.data(), rdown.bytes); up(rup, upln.data(), rup.bytes);
+
+    auto p = std::vector<RadParam>{
+        pi("M", M), pi("n", n), pi("hc", hc), pi("lowrank", lr), pf("eps", 1e-6),
+        ps("dtype", "bf16"), pf("wadd", 0.0), pi("inject", 1), pi("group", group),
+        pi("rotate", 1), ps("mix", "e4m3")
+    };
+    Dev x0((size_t)M * n * 2), i0((size_t)M * hc * 2), q0((size_t)M * n),
+        qs0((size_t)M * ngrp * 4), rq0((size_t)M * n), rs0((size_t)M * ngrp * 4);
+    Dev x1((size_t)M * n * 2), i1((size_t)M * hc * 2), q1((size_t)M * n),
+        qs1((size_t)M * ngrp * 4), rq1((size_t)M * n), rs1((size_t)M * ngrp * 4);
+    Dev scratch;
+
+    auto args = [&](Dev& dn, Dev& upv, Dev& x, Dev& inj, Dev& q, Dev& qs, Dev& rq, Dev& rs,
+                    RadArgs* a, std::vector<RadTensor>* t) {
+        *t = { ten(dh.p, RAD_BF16, { M, hn }), ten(dw.p, RAD_F32, { hn }),
+               ten(dn.p, RAD_F8E4M3, { lr, hn }), ten(upv.p, RAD_F8E4M3, { hn, lr }),
+               ten(dijw.p, RAD_BF16, { hc, hn }), ten(x.p, RAD_BF16, { M, n }),
+               ten(inj.p, RAD_BF16, { M, hc }), ten(q.p, RAD_I8, { M, n }),
+               ten(qs.p, RAD_F32, { M, ngrp }), ten(rq.p, RAD_I8, { M, n }),
+               ten(rs.p, RAD_F32, { M, ngrp }) };
+        std::memset(a, 0, sizeof *a);
+        a->t = t->data(); a->n_t = (int)t->size(); a->p = p.data(); a->n_p = (int)p.size();
+        a->world_size = 1;
+    };
+    std::vector<RadTensor> td, tr;
+    RadArgs ad, ar;
+    args(ddown, dup, x0, i0, q0, qs0, rq0, rs0, &ad, &td);
+    args(rdown, rup, x1, i1, q1, qs1, rq1, rs1, &ar, &tr);
+    const int64_t bytes = kd->scratch(&ad);
+    CHECK(bytes > 0);
+    if (bytes <= 0) return;
+    scratch.alloc((size_t)bytes);
+    ad.scratch = scratch.p;
+    ad.scratch_bytes = bytes;
+    CHECK_EQ(kd->launch(&ad, (RadStream)0), 0);
+    CHECK_EQ(kr->launch(&ar, (RadStream)0), 0);
+    (void)hipDeviceSynchronize();
+
+    std::vector<uint16_t> a0((size_t)M * n), a1((size_t)M * n), b0((size_t)M * hc),
+        b1((size_t)M * hc);
+    std::vector<uint8_t> c0((size_t)M * n), c1((size_t)M * n), d0((size_t)M * n),
+        d1((size_t)M * n);
+    std::vector<float> e0((size_t)M * ngrp), e1((size_t)M * ngrp), f0((size_t)M * ngrp),
+        f1((size_t)M * ngrp);
+    down(x0, a0.data(), x0.bytes); down(x1, a1.data(), x1.bytes);
+    down(i0, b0.data(), i0.bytes); down(i1, b1.data(), i1.bytes);
+    down(q0, c0.data(), q0.bytes); down(q1, c1.data(), q1.bytes);
+    down(rq0, d0.data(), rq0.bytes); down(rq1, d1.data(), rq1.bytes);
+    down(qs0, e0.data(), qs0.bytes); down(qs1, e1.data(), qs1.bytes);
+    down(rs0, f0.data(), rs0.bytes); down(rs1, f1.data(), rs1.bytes);
+    CHECK(same_bf16(a0, a1, "hc_read_e4m3 x"));
+    CHECK(same_bf16(b0, b1, "hc_read_e4m3 inj"));
+    CHECK(std::memcmp(c0.data(), c1.data(), c0.size()) == 0);
+    CHECK(std::memcmp(d0.data(), d1.data(), d0.size()) == 0);
+    CHECK(same_f32(e0, e1, "hc_read_e4m3 q scale"));
+    CHECK(same_f32(f0, f1, "hc_read_e4m3 rq scale"));
+}
+
+/* ================================================================== hc_read timing mode */
+/* Device timing for the row at the geometry Flash-Next serves, no oracle: the joined E4M3
+ * mixing rows are built here with the layout hook's stride, the row is called on the same
+ * operands each rep, and the reported figure is the median of the reps. `hot` keeps the 6.8 MB
+ * of mixing rows in L2 between reps; `cold` flushes a buffer wider than the L2 between them,
+ * which is what the engine sees when 97 sites share the cache. RAD_HC_BENCH=1 arms it. */
+struct Joined {
+    std::vector<uint8_t> buf;
+    long long stride = 0;
+};
+
+Joined make_joined(long long rows, long long K, long long G, unsigned seed) {
+    Joined j;
+    const long long ng = K / G;
+    const long long used = K + 4 * ng;
+    j.stride = (used + 15) / 16 * 16;
+    j.buf.assign((size_t)(rows * j.stride), 0);
+    auto codes = rand_e4m3((size_t)(rows * K), seed);
+    auto scales = rand_f32((size_t)(rows * ng), seed + 1, 0.002f, 0.02f);
+    for (long long r = 0; r < rows; ++r) {
+        uint8_t* row = j.buf.data() + (size_t)(r * j.stride);
+        std::memcpy(row, codes.data() + (size_t)(r * K), (size_t)K);
+        std::memcpy(row + K, scales.data() + (size_t)(r * ng), (size_t)(4 * ng));
+    }
+    return j;
+}
+
+double median_of(std::vector<double> v) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+}
+
+/* One timed launch: the event pair brackets the row's four launches, host synchronisation is
+ * outside it. */
+double timed_run(const RadKernelInfo* k, std::vector<RadTensor>& t, std::vector<RadParam>& p,
+                 void* scratch, int64_t scratch_bytes, int reps, bool flush, void* wipe,
+                 size_t wipe_bytes, double* lo) {
+    std::vector<double> v;
+    v.reserve((size_t)reps);
+    for (int i = 0; i < reps; ++i) {
+        if (flush && wipe) (void)hipMemset(wipe, (i & 1) ? 0x5a : 0xa5, wipe_bytes);
+        hipEvent_t a = nullptr, b = nullptr;
+        hipEventCreate(&a);
+        hipEventCreate(&b);
+        hipEventRecord(a, (hipStream_t)0);
+        RadArgs ar;
+        std::memset(&ar, 0, sizeof ar);
+        ar.t = t.data(); ar.n_t = (int)t.size(); ar.p = p.data(); ar.n_p = (int)p.size();
+        ar.scratch = scratch; ar.scratch_bytes = scratch_bytes; ar.world_size = 1;
+        const int rc = k->launch(&ar, (RadStream)0);
+        hipEventRecord(b, (hipStream_t)0);
+        hipEventSynchronize(b);
+        float ms = 0.0f;
+        hipEventElapsedTime(&ms, a, b);
+        hipEventDestroy(a);
+        hipEventDestroy(b);
+        if (rc != 0) return -1.0;
+        v.push_back((double)ms * 1000.0);
+    }
+    if (lo) {
+        *lo = *std::min_element(v.begin(), v.end());
+    }
+    return median_of(v);
+}
+
+void bench_hc_read(int M, int n, int hc, int lr, int group, bool inject, bool quant,
+                   bool rotate, int reps) {
+    const RadKernelInfo* kd = g_r3d.find("hc_read", RAD_DOMAIN_DEVICE, "hc_read_e4m3");
+    if (!kd || !kd->scratch) {
+        std::printf("hc_read bench: no hc_read_e4m3 row\n");
+        return;
+    }
+    const int hn = hc * n;
+    const int ngrp = n / group;
+    const long long down_stride = ((hn + 4 * (hn / 128)) + 15) / 16 * 16;
+    const long long up_G = lr / 4;
+    const long long up_stride = ((lr + 4 * (lr / up_G)) + 15) / 16 * 16;
+
+    auto hh = rand_bf16((size_t)M * hn, 71);
+    auto wh = rand_f32((size_t)hn, 72, 0.5f, 1.5f);
+    auto ijh = inject ? rand_bf16((size_t)hc * hn, 73) : std::vector<uint16_t>();
+    Joined jd = make_joined(lr, hn, 128, 74);
+    Joined ju = make_joined(hn, lr, (int)up_G, 78);
+
+    Dev dh((size_t)M * hn * 2), dw((size_t)hn * 4), ddown((size_t)jd.buf.size()),
+        dup((size_t)ju.buf.size());
+    Dev dijw(inject ? ijh.size() * 2 : 0);
+    up(dh, hh.data(), dh.bytes);
+    up(dw, wh.data(), dw.bytes);
+    up(ddown, jd.buf.data(), ddown.bytes);
+    up(dup, ju.buf.data(), dup.bytes);
+    if (inject) up(dijw, ijh.data(), dijw.bytes);
+
+    Dev x((size_t)M * n * 2), inj(inject ? (size_t)M * hc * 2 : 0),
+        q(quant ? (size_t)M * n : 0), qs(quant ? (size_t)M * ngrp * 4 : 0),
+        rq(rotate ? (size_t)M * n : 0), rs(rotate ? (size_t)M * ngrp * 4 : 0);
+    Dev scratch;
+
+    auto p = std::vector<RadParam>{
+        pi("M", M), pi("n", n), pi("hc", hc), pi("lowrank", lr), pf("eps", 1e-6),
+        ps("dtype", "bf16"), pf("wadd", 0.0), pi("inject", inject ? 1 : 0),
+        pi("group", quant ? group : 0), pi("rotate", rotate ? 1 : 0), ps("mix", "e4m3")
+    };
+    std::vector<RadTensor> t = {
+        ten(dh.p, RAD_BF16, { M, hn }), ten(dw.p, RAD_F32, { hn }),
+        ten(ddown.p, RAD_F8E4M3, { lr, hn }), ten(dup.p, RAD_F8E4M3, { hn, lr }),
+        ten(inject ? dijw.p : nullptr, RAD_BF16, { hc, hn }),
+        ten(x.p, RAD_BF16, { M, n }), ten(inject ? inj.p : nullptr, RAD_BF16, { M, hc }),
+        ten(quant ? q.p : nullptr, RAD_I8, { M, n }),
+        ten(quant ? qs.p : nullptr, RAD_F32, { M, ngrp }),
+        ten(rotate ? rq.p : nullptr, RAD_I8, { M, n }),
+        ten(rotate ? rs.p : nullptr, RAD_F32, { M, ngrp })
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof a);
+    a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size();
+    a.world_size = 1;
+    const int64_t need = kd->scratch(&a);
+    if (need <= 0) {
+        std::printf("hc_read bench M=%d: scratch refused (%lld)\n", M, (long long)need);
+        return;
+    }
+    scratch.alloc((size_t)need);
+
+    /* Warm up the row (first-touch of the operands, module load). */
+    for (int i = 0; i < 3; ++i) run(kd, t, p, scratch.p, need);
+
+    const size_t wipe_bytes = 256u << 20;
+    Dev wipe(wipe_bytes);
+    double lo_hot = 0.0, lo_cold = 0.0;
+    const double hot = timed_run(kd, t, p, scratch.p, need, reps, false, nullptr, 0, &lo_hot);
+    const double cold =
+        timed_run(kd, t, p, scratch.p, need, reps, true, wipe.p, wipe_bytes, &lo_cold);
+    std::printf("| %d | %.1f | %.1f | %.1f | %.2f | %.2f |\n", M, hot, lo_hot, cold, hot / M,
+                cold / M);
+}
+
+TEST(hc_read_bench) {
+    if (!std::getenv("RAD_HC_BENCH")) return;
+    if (!ready()) return;
+    int reps = 7;
+    if (const char* e = std::getenv("RAD_HC_BENCH_REPS")) {
+        const int r = std::atoi(e);
+        if (r > 0) reps = r;
+    }
+    /* RAD_HC_BENCH_M narrows the sweep to one shape (or a comma-separated list). */
+    std::vector<int> ms = { 1, 128, 512, 1024, 4096 };
+    if (const char* e = std::getenv("RAD_HC_BENCH_M")) {
+        ms.clear();
+        for (const char* p = e; *p;) {
+            while (*p == ',' || *p == ' ') ++p;
+            if (!*p) break;
+            ms.push_back(std::atoi(p));
+            while (*p && *p != ',') ++p;
+        }
+    }
+    const bool core_only = std::getenv("RAD_HC_BENCH_CORE_ONLY") != nullptr;
+    if (!core_only) {
+        std::printf("\n### hc_read device timing (n=2560 hc=4 lowrank=320 group=128, E4M3 mix, "
+                    "int8 q/rq, inject on)\n");
+        std::printf("| M | hot med us | hot min us | cold med us | hot us/row | cold us/row |\n");
+        std::printf("|---:|---:|---:|---:|---:|---:|\n");
+        for (int M : ms) bench_hc_read(M, 2560, 4, 320, 128, true, true, true, reps);
+    }
+    std::printf("\n### the same row without inject and without q/rq (down+up core)\n");
+    std::printf("| M | hot med us | hot min us | cold med us | hot us/row | cold us/row |\n");
+    std::printf("|---:|---:|---:|---:|---:|---:|\n");
+    for (int M : ms) bench_hc_read(M, 2560, 4, 320, 128, false, false, false, reps);
 }
 
 /* ================================================================== the one-rank collectives */
