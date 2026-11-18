@@ -56,14 +56,13 @@ namespace {
 
 constexpr int kHcThreads = 256;
 /* A workgroup owns one tile of rows by one tile of outputs; the two multiply to the block's
- * thread count, so every lane accumulates an output for a row of the tile. The first set is the
- * prefill shape, where 8 rows share a staged slice. Below one row tile the W28 kernels take over. */
-constexpr int kHcDownTile = 32;     /* output rows a down workgroup owns */
-constexpr int kHcDownRows = 8;      /* stream rows a down workgroup owns */
-constexpr int kHcDownChunk = 128;   /* weight columns staged per down slice: one 128-wide group */
-constexpr int kHcUpCols = 32;       /* output columns a up workgroup owns */
-constexpr int kHcUpRows = 8;        /* stream rows a up workgroup owns */
-constexpr int kHcUpChunk = 64;      /* k values staged per up slice */
+ * thread count times the pairs a lane owns (`P` outputs and `Q` rows), so a lane accumulates
+ * several (row, output) pairs at once. That is what the staged slice's LDS traffic needs: the
+ * weight read is shared by the lane's Q rows and the N read by its P outputs, so the two LDS
+ * instructions a MAC otherwise costs fall to 1/P + 1/Q. The larger tiles also serve more rows
+ * per staged weight slice. Below one row tile the W28 kernels take over. */
+constexpr int kHcDownRows = 8;      /* stream rows a one-pair down workgroup owns */
+constexpr int kHcUpRows = 8;        /* stream rows a one-pair up workgroup owns */
 /* A launch narrower than a row tile keeps the W28 kernels, which are one row a block: no row of
  * the tile is an empty lane, and a one-row call keeps the latency it was measured at. */
 constexpr int kHcW28DownTile = 16;
@@ -101,16 +100,34 @@ __device__ __forceinline__ float mix_get(const MixW& w, long long row, int i) {
 }
 
 /* ---- the per-stream norm scale ------------------------------------------------------------- */
+/* One workgroup covers as many rows as its threads divide by hc, so every lane is an active
+ * chain: the sum is a dependent double accumulation and exposes its latency, and one row a
+ * workgroup left 252 of 256 lanes idle. Eight loads are issued before their adds, which leaves
+ * the ascending double sum (the reference's) untouched. */
+constexpr int kHcNormBatch = 8;
+
 __global__ __launch_bounds__(kHcThreads) void hc_norm_kernel(
     const uint16_t* __restrict__ h, const float* __restrict__ w, float* __restrict__ sc, int M,
     int n, int hc, int h_ld, float eps) {
-    const int row = (int)blockIdx.x;
+    (void)w;
+    const int t = (int)threadIdx.x;
+    const int rows = kHcThreads / hc;
+    const int c = t - (t / hc) * hc;
+    const int r = t / hc;
+    if (r >= rows) return;
+    const int row = (int)blockIdx.x * rows + r;
     if (row >= M) return;
-    const int c = (int)threadIdx.x;
-    if (c >= hc) return;
     const uint16_t* hp = h + (long long)row * h_ld + (long long)c * n;
     double ss = 0.0;
-    for (int i = 0; i < n; ++i) {
+    int i = 0;
+    for (; i + kHcNormBatch <= n; i += kHcNormBatch) {
+        float v[kHcNormBatch];
+#pragma unroll
+        for (int u = 0; u < kHcNormBatch; ++u) v[u] = bf16_to_f32(hp[i + u]);
+#pragma unroll
+        for (int u = 0; u < kHcNormBatch; ++u) ss += (double)v[u] * (double)v[u];
+    }
+    for (; i < n; ++i) {
         const float v = bf16_to_f32(hp[i]);
         ss += (double)v * (double)v;
     }
@@ -119,30 +136,33 @@ __global__ __launch_bounds__(kHcThreads) void hc_norm_kernel(
 }
 
 /* ---- down: d and inj ----------------------------------------------------------------------- */
-/* LDS: 32 staged weight rows of kHcDownChunk floats (one float of pad a row, so an owner lane's
- * sequential walk and its neighbours start on distinct banks), then N bf16 [8][chunk] for the row
- * tile, pitch-padded so the tile's rows do not collide in a bank. The injection block reuses the
- * weight stage for its hc rows, since it stages no tile. The decode of a staged element is
- * `mix_get`'s, once, so the dot reads what the per-element read produced. */
+/* LDS: TILE staged weight rows of CHUNK floats (one float of pad a row, so an owner lane's
+ * sequential walk and its neighbours start on distinct banks), then N bf16 [ROWS][chunk],
+ * pitch-padded so the tile's rows do not collide in a bank. A lane owns P outputs of one row set
+ * and Q rows: one staged weight value feeds its Q rows and one staged N value its P outputs, so a
+ * MAC costs 1/P + 1/Q LDS instructions instead of two, and the adds stay ascending per (row,
+ * output) in f32 without FMA. The injection block reuses the weight stage for its hc rows, since
+ * it stages no tile. The decode of a staged element is `mix_get`'s, once, so the dot reads what
+ * the per-element read produced. */
 constexpr size_t hc_down_lds_bytes_impl(int tile, int rows, int chunk) {
     return (size_t)tile * (chunk + 1) * sizeof(float) +
            (size_t)rows * (chunk + 8) * sizeof(uint16_t);
 }
-template <int TILE, int ROWS, int CHUNK>
+template <int P, int Q, int CHUNK>
 constexpr size_t hc_down_lds_bytes() {
-    static_assert(TILE * ROWS == kHcThreads, "a down lane owns one (row, output)");
-    return hc_down_lds_bytes_impl(TILE, ROWS, CHUNK);
+    static_assert(32 * P * 8 * Q == kHcThreads * P * Q, "a down lane owns P outputs by Q rows");
+    return hc_down_lds_bytes_impl(32 * P, 8 * Q, CHUNK);
 }
-constexpr size_t kHcDownBigLds = hc_down_lds_bytes<kHcDownTile, kHcDownRows, kHcDownChunk>();
 
-template <int TILE, int ROWS, int CHUNK>
+template <int P, int Q, int CHUNK>
 __device__ __forceinline__ void hc_down_body(
     unsigned char* __restrict__ hc_down_smem, const uint16_t* __restrict__ h,
     const float* __restrict__ w, const void* __restrict__ down,
     const uint16_t* __restrict__ injw, uint16_t* __restrict__ d, const float* __restrict__ sc,
     uint16_t* __restrict__ inj, int M, int n, int hc, int lr, int h_ld, int injw_ld, int inj_ld,
     int f8, int down_ld, int down_stride, int down_G, float wadd) {
-    static_assert(TILE * ROWS == kHcThreads, "a down lane owns one (row, output)");
+    constexpr int TILE = 32 * P, ROWS = 8 * Q;
+    static_assert(TILE * ROWS == kHcThreads * P * Q, "a down lane owns P outputs by Q rows");
     constexpr int kPitch = CHUNK + 1;
     constexpr int kNPitch = CHUNK + 8;   /* 16-byte pad per N row shifts the bank */
     constexpr int kStage = TILE * kPitch;
@@ -153,35 +173,71 @@ __device__ __forceinline__ void hc_down_body(
     float* stage = (float*)hc_down_smem;
     uint16_t* Nb = (uint16_t*)(stage + kStage);
     const int t = (int)threadIdx.x;
-    const int o = t % TILE;
-    const int rr = t / TILE;
+    const int lane = t & 31, wave = t >> 5;
     const int ntiles = (lr + TILE - 1) / TILE;
     const bool inj_block = (int)blockIdx.y == ntiles;
     const int j0 = (int)blockIdx.y * TILE;
     const int nr = inj_block ? 0 : min(TILE, lr - j0);
     MixW dw{down, f8, down_ld, down_stride, (int)HN, down_G};
-    float acc = 0.0f;
+    /* Every chunk is whole when the stream width divides it, which is the served shape; the
+     * fallback keeps the per-element stream lookup for a width that does not. */
+    const bool whole = (n % CHUNK) == 0;
+    float acc[P][Q];
+#pragma unroll
+    for (int p = 0; p < P; ++p)
+#pragma unroll
+        for (int q = 0; q < Q; ++q) acc[p][q] = 0.0f;
+    float iacc = 0.0f;
+    /* The stream a chunk belongs to, advanced once a chunk boundary crosses it: a division by
+     * `n` per chunk instead of one per staged element. */
+    int cstream = 0;
+    long long stream_end = n;
     for (long long i0 = 0; i0 < HN; i0 += CHUNK) {
         const int cn = (int)min((long long)CHUNK, HN - i0);
+        if (whole && i0 >= stream_end) {
+            ++cstream;
+            stream_end += n;
+        }
         /* N of the tile's rows, one chunk at a time: the whole-row fill's expression, narrowed
          * once. Rows past M are held at zero and never stored. */
-        for (int idx = t; idx < rv * cn; idx += kHcThreads) {
-            const int r = idx / cn, ii = idx - r * cn;
-            const int row = r0 + r;
-            float v = 0.0f;
-            if (row < M) {
+        if (whole) {
+            const int c = cstream;
+            for (int idx = t; idx < rv * CHUNK; idx += kHcThreads) {
+                const int r = idx / CHUNK, ii = idx - r * CHUNK;
+                const int row = r0 + r;
                 const long long j = i0 + ii;
-                v = bf16_to_f32(h[(long long)row * h_ld + j]) *
-                    sc[(long long)row * hc + (int)(j / n)] * (w[j] + wadd);
+                float v = 0.0f;
+                if (row < M)
+                    v = bf16_to_f32(h[(long long)row * h_ld + j]) *
+                        sc[(long long)row * hc + c] * (w[j] + wadd);
+                Nb[r * kNPitch + ii] = f32_to_bf16(v);
             }
-            Nb[r * kNPitch + ii] = f32_to_bf16(v);
+        } else {
+            for (int idx = t; idx < rv * cn; idx += kHcThreads) {
+                const int r = idx / cn, ii = idx - r * cn;
+                const int row = r0 + r;
+                float v = 0.0f;
+                if (row < M) {
+                    const long long j = i0 + ii;
+                    v = bf16_to_f32(h[(long long)row * h_ld + j]) *
+                        sc[(long long)row * hc + (int)(j / n)] * (w[j] + wadd);
+                }
+                Nb[r * kNPitch + ii] = f32_to_bf16(v);
+            }
         }
         if (inj_block) {
             /* The injection gains are one dot a stream and their own workgroup: behind a tile's
              * dot they would serialise two full-length chains and set the launch's time. */
-            for (int idx = t; idx < hc * cn; idx += kHcThreads) {
-                const int r = idx / cn, ii = idx - r * cn;
-                stage[r * kPitch + ii] = bf16_to_f32(injw[(long long)r * injw_ld + i0 + ii]);
+            if (whole) {
+                for (int idx = t; idx < hc * CHUNK; idx += kHcThreads) {
+                    const int r = idx / CHUNK, ii = idx - r * CHUNK;
+                    stage[r * kPitch + ii] = bf16_to_f32(injw[(long long)r * injw_ld + i0 + ii]);
+                }
+            } else {
+                for (int idx = t; idx < hc * cn; idx += kHcThreads) {
+                    const int r = idx / cn, ii = idx - r * cn;
+                    stage[r * kPitch + ii] = bf16_to_f32(injw[(long long)r * injw_ld + i0 + ii]);
+                }
             }
         } else if (f8 && cn == CHUNK && down_G % 16 == 0) {
             /* Sixteen codes a lane, a 16-byte vector a load, with the group's scale beside it:
@@ -212,28 +268,53 @@ __device__ __forceinline__ void hc_down_body(
         if (inj_block) {
             if (t < hc * ROWS) {
                 const int r = t / hc, c = t - r * hc;
-                float a = acc;
                 const uint16_t* nb = Nb + r * kNPitch;
                 const float* st = stage + c * kPitch;
+                float a = iacc;
                 if (cn == CHUNK) {
                     #pragma unroll 16
                     for (int ii = 0; ii < CHUNK; ++ii) a += bf16_to_f32(nb[ii]) * st[ii];
                 } else {
                     for (int ii = 0; ii < cn; ++ii) a += bf16_to_f32(nb[ii]) * st[ii];
                 }
-                acc = a;
+                iacc = a;
             }
-        } else if (o < nr) {
-            float a = acc;
-            const uint16_t* nb = Nb + rr * kNPitch;
-            const float* st = stage + o * kPitch;
+        } else {
+            /* A partial output tile still walks every lane's P columns; the rows past `nr` hold
+             * whatever the stage left there and are never stored. */
+            const uint16_t* np[Q];
+            const float* wp[P];
+#pragma unroll
+            for (int q = 0; q < Q; ++q) np[q] = Nb + (wave * Q + q) * kNPitch;
+#pragma unroll
+            for (int p = 0; p < P; ++p) wp[p] = stage + (lane + 32 * p) * kPitch;
             if (cn == CHUNK) {
-                #pragma unroll 16
-                for (int ii = 0; ii < CHUNK; ++ii) a += bf16_to_f32(nb[ii]) * st[ii];
+                /* Four MACs' products are formed first, so the loads of one group overlap the
+                 * dependent adds of the previous one; the adds themselves keep the reference's
+                 * ascending order. */
+                for (int ii = 0; ii < CHUNK; ii += 4) {
+                    float prod[P][Q][4];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+#pragma unroll
+                        for (int p = 0; p < P; ++p)
+#pragma unroll
+                            for (int q = 0; q < Q; ++q)
+                                prod[p][q][e] = bf16_to_f32(np[q][ii + e]) * wp[p][ii + e];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e)
+#pragma unroll
+                        for (int p = 0; p < P; ++p)
+#pragma unroll
+                            for (int q = 0; q < Q; ++q) acc[p][q] += prod[p][q][e];
+                }
             } else {
-                for (int ii = 0; ii < cn; ++ii) a += bf16_to_f32(nb[ii]) * st[ii];
+                for (int ii = 0; ii < cn; ++ii)
+#pragma unroll
+                    for (int p = 0; p < P; ++p)
+#pragma unroll
+                        for (int q = 0; q < Q; ++q) acc[p][q] += bf16_to_f32(np[q][ii]) * wp[p][ii];
             }
-            acc = a;
         }
         __syncthreads();
     }
@@ -243,17 +324,21 @@ __device__ __forceinline__ void hc_down_body(
             const int row = r0 + r;
             if (row < M)
                 inj[(long long)row * inj_ld + c] =
-                    f32_to_bf16(2.0f * r3d_hcple::sigmoid(acc / (float)hc));
+                    f32_to_bf16(2.0f * r3d_hcple::sigmoid(iacc / (float)hc));
         }
         return;
     }
-    if (o < nr && r0 + rr < M)
-        d[(long long)(r0 + rr) * lr + j0 + o] =
-            f32_to_bf16(r3d_hcple::silu(acc / (float)hc));
+#pragma unroll
+    for (int p = 0; p < P; ++p)
+#pragma unroll
+        for (int q = 0; q < Q; ++q)
+            if (lane + 32 * p < nr && r0 + wave * Q + q < M)
+                d[(long long)(r0 + wave * Q + q) * lr + j0 + lane + 32 * p] =
+                    f32_to_bf16(r3d_hcple::silu(acc[p][q] / (float)hc));
 }
 
 /* A template-id cannot sit in R3D_KLAUNCH's first macro argument (its commas split the
- * arguments), so the tiled body is a device function and hc_down_kernel_big names it. */
+ * arguments), so the tiled body is a device function and these kernels name it. */
 #define R3D_HC_DOWN_ARGS                                                                          \
     const uint16_t* __restrict__ h, const float* __restrict__ w, const void* __restrict__ down,   \
         const uint16_t* __restrict__ injw, uint16_t* __restrict__ d,                              \
@@ -263,11 +348,14 @@ __device__ __forceinline__ void hc_down_body(
 #define R3D_HC_DOWN_CALL                                                                          \
     h, w, down, injw, d, sc, inj, M, n, hc, lr, h_ld, injw_ld, inj_ld, f8, down_ld, down_stride,  \
         down_G, wadd
-
-__global__ __launch_bounds__(kHcThreads) void hc_down_kernel_big(R3D_HC_DOWN_ARGS) {
-    extern __shared__ __attribute__((aligned(16))) unsigned char smem[];
-    hc_down_body<kHcDownTile, kHcDownRows, kHcDownChunk>(smem, R3D_HC_DOWN_CALL);
-}
+#define R3D_HC_DOWN_KERNEL(NAME, P_, Q_, CH_)                                                     \
+    __global__ __launch_bounds__(kHcThreads) void NAME(R3D_HC_DOWN_ARGS) {                        \
+        extern __shared__ __attribute__((aligned(16))) unsigned char smem[];                      \
+        hc_down_body<P_, Q_, CH_>(smem, R3D_HC_DOWN_CALL);                                        \
+    }
+R3D_HC_DOWN_KERNEL(hc_down_kernel_p1q2c128, 1, 2, 128)
+#undef R3D_HC_DOWN_KERNEL
+constexpr size_t kHcDownLdsP1Q2C128 = hc_down_lds_bytes<1, 2, 128>();
 
 /* W28's down, unchanged: one row a block, the whole of N in LDS, 16 rows by 256 columns a slice.
  * It is the decode shape (M below one row tile). */
@@ -376,50 +464,68 @@ __global__ __launch_bounds__(kHcThreads) void hc_down_kernel_w28(R3D_HC_DOWN_ARG
 #undef R3D_HC_DOWN_CALL
 
 /* ---- up and x ------------------------------------------------------------------------------ */
-/* LDS: COLS staged weight rows of CHUNK floats (one float of pad a row) and d for the tile's
+/* LDS: TILE staged weight columns of CHUNK floats (one float of pad a row) and d for the tile's
  * rows, chunk by chunk with the same pad, so a lane's walk is sequential and its neighbours hit
- * distinct banks. The weight rows are read as consecutive k of one row rather than one lane a row
- * at one k; the tile's rows share the staged slice. */
-template <int COLS, int ROWS, int CHUNK>
+ * distinct banks. A lane owns P columns and Q rows of the tile: one staged weight value feeds its
+ * Q rows and one staged d value its P columns, so a MAC costs 1/P + 1/Q LDS instructions. The
+ * sums over k and over the streams stay ascending, and the sigmoid's input is the same f32, so
+ * the gate is bit-identical to the reference. */
+template <int P, int Q, int CHUNK>
 constexpr size_t hc_up_lds_bytes() {
-    static_assert(COLS * ROWS == kHcThreads, "an up lane owns one (row, column)");
-    return (size_t)COLS * (CHUNK + 1) * sizeof(float) +
-           (size_t)ROWS * (CHUNK + 1) * sizeof(float);
+    static_assert(32 * P * 8 * Q == kHcThreads * P * Q, "an up lane owns P columns by Q rows");
+    return (size_t)(32 * P) * (CHUNK + 1) * sizeof(float) +
+           (size_t)(8 * Q) * (CHUNK + 1) * sizeof(float);
 }
-constexpr size_t kHcUpBigLds = hc_up_lds_bytes<kHcUpCols, kHcUpRows, kHcUpChunk>();
 
-template <int COLS, int ROWS, int CHUNK>
+template <int P, int Q, int CHUNK>
 __device__ __forceinline__ void hc_up_body(
     unsigned char* __restrict__ hc_up_smem, const uint16_t* __restrict__ h,
     const float* __restrict__ w, const void* __restrict__ up, const uint16_t* __restrict__ d,
     const float* __restrict__ sc, void* __restrict__ x, int M, int n, int hc, int lr, int h_ld,
     int x_ld, int x_dt, int f8, int up_ld, int up_stride, int up_G, float wadd) {
-    static_assert(COLS * ROWS == kHcThreads, "an up lane owns one (row, column)");
+    constexpr int TILE = 32 * P, ROWS = 8 * Q;
+    static_assert(TILE * ROWS == kHcThreads * P * Q, "an up lane owns P columns by Q rows");
     constexpr int kPitch = CHUNK + 1;
-    constexpr int kStage = COLS * kPitch;
+    constexpr int kStage = TILE * kPitch;
     const int r0 = (int)blockIdx.x * ROWS;
     if (r0 >= M) return;
     const int rv = min(ROWS, M - r0);   /* the tile's rows that exist */
     const int t = (int)threadIdx.x;
-    const int o = t % COLS;
-    const int rr = t / COLS;
+    const int lane = t & 31, wave = t >> 5;
     float* stage = (float*)hc_up_smem;
     float* dsh = stage + kStage;
     /* Every thread of the block reaches every barrier, including the lanes past `n` and the
      * staging-only lanes: only the per-column work is guarded. */
-    const int i0 = (int)blockIdx.y * COLS;
-    const int ni = min(COLS, n - i0);
+    const int i0 = (int)blockIdx.y * TILE;
+    const int ni = min(TILE, n - i0);
     MixW uw{up, f8, up_ld, up_stride, lr, up_G};
-    float acc = 0.0f;
+    float acc[P][Q];
+#pragma unroll
+    for (int p = 0; p < P; ++p)
+#pragma unroll
+        for (int q = 0; q < Q; ++q) acc[p][q] = 0.0f;
     for (int c = 0; c < hc; ++c) {
-        float gv = 0.0f;
+        float gv[P][Q];
+#pragma unroll
+        for (int p = 0; p < P; ++p)
+#pragma unroll
+            for (int q = 0; q < Q; ++q) gv[p][q] = 0.0f;
         for (int k0 = 0; k0 < lr; k0 += CHUNK) {
             const int kn = min(CHUNK, lr - k0);
-            for (int idx = t; idx < rv * kn; idx += kHcThreads) {
-                const int r = idx / kn, kk = idx - r * kn;
-                const int row = r0 + r;
-                dsh[r * kPitch + kk] =
-                    row < M ? bf16_to_f32(d[(long long)row * lr + k0 + kk]) : 0.0f;
+            if (kn == CHUNK) {
+                for (int idx = t; idx < rv * CHUNK; idx += kHcThreads) {
+                    const int r = idx / CHUNK, kk = idx - r * CHUNK;
+                    const int row = r0 + r;
+                    dsh[r * kPitch + kk] =
+                        row < M ? bf16_to_f32(d[(long long)row * lr + k0 + kk]) : 0.0f;
+                }
+            } else {
+                for (int idx = t; idx < rv * kn; idx += kHcThreads) {
+                    const int r = idx / kn, kk = idx - r * kn;
+                    const int row = r0 + r;
+                    dsh[r * kPitch + kk] =
+                        row < M ? bf16_to_f32(d[(long long)row * lr + k0 + kk]) : 0.0f;
+                }
             }
             if (f8 && kn == CHUNK && up_G > 0 && up_G % 16 == 0) {
                 /* A 16-code vector starts on a 16-byte boundary and the scale group is a
@@ -449,32 +555,64 @@ __device__ __forceinline__ void hc_up_body(
                 }
             }
             __syncthreads();
-            if (o < ni) {
-                float g = gv;
-                const float* st = stage + o * kPitch;
-                const float* dr = dsh + rr * kPitch;
+            {
+                const float* wp[P];
+                const float* dp[Q];
+#pragma unroll
+                for (int p = 0; p < P; ++p) wp[p] = stage + (lane + 32 * p) * kPitch;
+#pragma unroll
+                for (int q = 0; q < Q; ++q) dp[q] = dsh + (wave * Q + q) * kPitch;
                 if (kn == CHUNK) {
-                    #pragma unroll 8
-                    for (int kk = 0; kk < CHUNK; ++kk) g += dr[kk] * st[kk];
+                    for (int kk = 0; kk < CHUNK; kk += 4) {
+                        float prod[P][Q][4];
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+#pragma unroll
+                            for (int p = 0; p < P; ++p)
+#pragma unroll
+                                for (int q = 0; q < Q; ++q)
+                                    prod[p][q][e] = dp[q][kk + e] * wp[p][kk + e];
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+#pragma unroll
+                            for (int p = 0; p < P; ++p)
+#pragma unroll
+                                for (int q = 0; q < Q; ++q) gv[p][q] += prod[p][q][e];
+                    }
                 } else {
-                    for (int kk = 0; kk < kn; ++kk) g += dr[kk] * st[kk];
+                    for (int kk = 0; kk < kn; ++kk)
+#pragma unroll
+                        for (int p = 0; p < P; ++p)
+#pragma unroll
+                            for (int q = 0; q < Q; ++q) gv[p][q] += dp[q][kk] * wp[p][kk];
                 }
-                gv = g;
             }
             __syncthreads();
         }
-        const int row = r0 + rr;
-        if (o < ni && row < M) {
-            const long long j = (long long)c * n + i0 + o;
-            const float Nj = r3d_hcple::narrow(
-                R3D_DT_BF16,
-                bf16_to_f32(h[(long long)row * h_ld + j]) * sc[(long long)row * hc + c] *
-                    (w[j] + wadd));
-            acc += r3d_hcple::narrow(R3D_DT_BF16, r3d_hcple::sigmoid(gv)) * Nj;
-        }
+#pragma unroll
+        for (int p = 0; p < P; ++p)
+#pragma unroll
+            for (int q = 0; q < Q; ++q) {
+                const int row = r0 + wave * Q + q;
+                if (lane + 32 * p < ni && row < M) {
+                    const long long j = (long long)c * n + i0 + lane + 32 * p;
+                    const float Nj = r3d_hcple::narrow(
+                        R3D_DT_BF16,
+                        bf16_to_f32(h[(long long)row * h_ld + j]) * sc[(long long)row * hc + c] *
+                            (w[j] + wadd));
+                    acc[p][q] +=
+                        r3d_hcple::narrow(R3D_DT_BF16, r3d_hcple::sigmoid(gv[p][q])) * Nj;
+                }
+            }
     }
-    if (o < ni && r0 + rr < M)
-        r3d_hcple::st_elem(x_dt, x, (long long)(r0 + rr) * x_ld + i0 + o, acc / (float)hc);
+#pragma unroll
+    for (int p = 0; p < P; ++p)
+#pragma unroll
+        for (int q = 0; q < Q; ++q)
+            if (lane + 32 * p < ni && r0 + wave * Q + q < M)
+                r3d_hcple::st_elem(x_dt, x,
+                                   (long long)(r0 + wave * Q + q) * x_ld + i0 + lane + 32 * p,
+                                   acc[p][q] / (float)hc);
 }
 
 #define R3D_HC_UP_ARGS                                                                            \
@@ -484,11 +622,14 @@ __device__ __forceinline__ void hc_up_body(
         int up_G, float wadd
 #define R3D_HC_UP_CALL h, w, up, d, sc, x, M, n, hc, lr, h_ld, x_ld, x_dt, f8, up_ld, up_stride,  \
         up_G, wadd
-
-__global__ __launch_bounds__(kHcThreads) void hc_up_kernel_big(R3D_HC_UP_ARGS) {
-    extern __shared__ __attribute__((aligned(16))) unsigned char smem[];
-    hc_up_body<kHcUpCols, kHcUpRows, kHcUpChunk>(smem, R3D_HC_UP_CALL);
-}
+#define R3D_HC_UP_KERNEL(NAME, P_, Q_, CH_)                                                       \
+    __global__ __launch_bounds__(kHcThreads) void NAME(R3D_HC_UP_ARGS) {                          \
+        extern __shared__ __attribute__((aligned(16))) unsigned char smem[];                      \
+        hc_up_body<P_, Q_, CH_>(smem, R3D_HC_UP_CALL);                                            \
+    }
+R3D_HC_UP_KERNEL(hc_up_kernel_p2q2c64, 2, 2, 64)
+#undef R3D_HC_UP_KERNEL
+constexpr size_t kHcUpLdsP2Q2C64 = hc_up_lds_bytes<2, 2, 64>();
 
 /* W28's up, unchanged: one row a block, d f32 in LDS whole, 64 columns by 32 k a slice. */
 static inline size_t hc_up_w28_lds_bytes(long long lr) {
@@ -569,7 +710,13 @@ __global__ __launch_bounds__(kHcThreads) void hc_up_kernel_w28(R3D_HC_UP_ARGS) {
 #undef R3D_HC_UP_CALL
 
 /* ---- q and rq ------------------------------------------------------------------------------ */
-__global__ __launch_bounds__(kHcThreads) void hc_quant_kernel(
+/* One workgroup a (row, group) pair, one thread a value: the amax is a block reduction and the
+ * rotation's butterflies are spread over the block stage by stage. The stage order and every
+ * butterfly are the reference's, so the codes and the scale are bit-identical; only the order in
+ * which independent butterflies run changes. */
+constexpr int kHcQuantThreads = 128;
+
+__global__ __launch_bounds__(kHcQuantThreads) void hc_quant_kernel(
     const void* __restrict__ x, int x_dt, int M, int n, int x_ld, int qg, int ngrp, void* __restrict__ q,
     float* __restrict__ qs, int q_dt, int q_ld, int qs_ld, int rg, int rgrp, void* __restrict__ rq,
     float* __restrict__ rs, int rq_dt, int rq_ld, int rs_ld) {
@@ -577,60 +724,67 @@ __global__ __launch_bounds__(kHcThreads) void hc_quant_kernel(
     const int gi = (int)blockIdx.y;
     if (row >= M) return;
     __shared__ float s[kHcQuantScratch];
+    __shared__ float red[kHcQuantThreads];
     const int t = (int)threadIdx.x;
 
     if (gi < ngrp) {
-        if (t == 0) {
-            const long long k0 = (long long)gi * qg;
-            const int kn = (int)min((long long)qg, (long long)n - k0);
-            float amax = 0.0f;
-            for (int i = 0; i < kn; ++i) {
-                const float v = r3d_hcple::ld_elem(x_dt, x, (long long)row * x_ld + k0 + i);
-                amax = fmaxf(amax, fabsf(v));
-            }
-            const float top = q_dt == R3D_DT_I8 ? 127.0f : 448.0f;
-            const float scale = amax > 0.0f ? amax * (1.0f / top) : 1.0f;
-            const float inv = 1.0f / scale;
-            for (int i = 0; i < kn; ++i) {
-                const float v = r3d_hcple::ld_elem(x_dt, x, (long long)row * x_ld + k0 + i) * inv;
-                const float c = fminf(fmaxf(v, -top), top);
-                r3d_hcple::st_elem(q_dt, q, (long long)row * q_ld + k0 + i, c);
-            }
-            qs[(long long)row * qs_ld + gi] = scale;
+        const long long k0 = (long long)gi * qg;
+        const int kn = (int)min((long long)qg, (long long)n - k0);
+        const long long base = (long long)row * x_ld + k0;
+        float amax = 0.0f;
+        for (int i = t; i < kn; i += kHcQuantThreads)
+            amax = fmaxf(amax, fabsf(r3d_hcple::ld_elem(x_dt, x, base + i)));
+        red[t] = amax;
+        __syncthreads();
+        for (int stp = kHcQuantThreads / 2; stp > 0; stp >>= 1) {
+            if (t < stp) red[t] = fmaxf(red[t], red[t + stp]);
+            __syncthreads();
         }
+        const float top = q_dt == R3D_DT_I8 ? 127.0f : 448.0f;
+        const float scale = red[0] > 0.0f ? red[0] * (1.0f / top) : 1.0f;
+        const float inv = 1.0f / scale;
+        for (int i = t; i < kn; i += kHcQuantThreads) {
+            const float v = r3d_hcple::ld_elem(x_dt, x, base + i) * inv;
+            const float c = fminf(fmaxf(v, -top), top);
+            r3d_hcple::st_elem(q_dt, q, (long long)row * q_ld + k0 + i, c);
+        }
+        if (t == 0) qs[(long long)row * qs_ld + gi] = scale;
+        __syncthreads();
     }
 
     if (gi < rgrp) {
-        if (t < 32) {
-            const uint32_t lane = (uint32_t)t;
-            const long long k0 = (long long)gi * rg;
-            for (int i = t; i < rg; i += 32)
-                s[i] = r3d_hcple::ld_elem(x_dt, x, (long long)row * x_ld + k0 + i);
-            __syncwarp();
-            if (lane == 0) {
-                for (uint32_t h = 1; h < (uint32_t)rg; h <<= 1) {
-                    for (uint32_t b = 0; b < (uint32_t)rg; b += h << 1) {
-                        for (uint32_t j = 0; j < h; ++j) {
-                            const float a = s[b + j], c = s[b + j + h];
-                            s[b + j] = a + c;
-                            s[b + j + h] = a - c;
-                        }
-                    }
-                }
+        const long long k0 = (long long)gi * rg;
+        const long long base = (long long)row * x_ld + k0;
+        for (int i = t; i < rg; i += kHcQuantThreads)
+            s[i] = r3d_hcple::ld_elem(x_dt, x, base + i);
+        __syncthreads();
+        const int half = rg >> 1;
+        for (int h = 1; h < rg; h <<= 1) {
+            for (int bi = t; bi < half; bi += kHcQuantThreads) {
+                const int b = (bi / h) * (h << 1);
+                const int j = b + (bi - (bi / h) * h);
+                const float a = s[j], c = s[j + h];
+                s[j] = a + c;
+                s[j + h] = a - c;
             }
-            __syncwarp();
-            float amax = 0.0f;
-            for (int i = t; i < rg; i += 32) amax = fmaxf(amax, fabsf(s[i]));
-            amax = r3d_xor_max<32>(amax);
-            const float top = rq_dt == R3D_DT_I8 ? 127.0f : 448.0f;
-            const float scale = amax > 0.0f ? amax * (1.0f / top) : 1.0f;
-            const float inv = 1.0f / scale;
-            for (int i = t; i < rg; i += 32) {
-                const float v = fminf(fmaxf(s[i] * inv, -top), top);
-                r3d_hcple::st_elem(rq_dt, rq, (long long)row * rq_ld + k0 + i, v);
-            }
-            if (lane == 0) rs[(long long)row * rs_ld + gi] = scale;
+            __syncthreads();
         }
+        float amax = 0.0f;
+        for (int i = t; i < rg; i += kHcQuantThreads) amax = fmaxf(amax, fabsf(s[i]));
+        red[t] = amax;
+        __syncthreads();
+        for (int stp = kHcQuantThreads / 2; stp > 0; stp >>= 1) {
+            if (t < stp) red[t] = fmaxf(red[t], red[t + stp]);
+            __syncthreads();
+        }
+        const float top = rq_dt == R3D_DT_I8 ? 127.0f : 448.0f;
+        const float scale = red[0] > 0.0f ? red[0] * (1.0f / top) : 1.0f;
+        const float inv = 1.0f / scale;
+        for (int i = t; i < rg; i += kHcQuantThreads) {
+            const float v = fminf(fmaxf(s[i] * inv, -top), top);
+            r3d_hcple::st_elem(rq_dt, rq, (long long)row * rq_ld + k0 + i, v);
+        }
+        if (t == 0) rs[(long long)row * rs_ld + gi] = scale;
     }
 }
 
@@ -707,15 +861,17 @@ int r3d_hc_read(long h, long w, long down, long up, long injw, long x, long inj,
                 int up_G, long stream) {
     if (!h || !w || !down || !up || !x || !scratch) return -1;
     if (M <= 0 || n <= 0 || hc <= 0 || lr <= 0 || h_ld < hc * n || x_ld < n) return -2;
+    if (hc > kHcThreads) return -2;
     if (scratch_bytes < hc_scratch_bytes(M, lr, hc)) return -2;
 
     const long long sc_off = hc_sc_off(M, lr);
     uint16_t* d = (uint16_t*)scratch;
     float* sc = (float*)((char*)scratch + sc_off);
 
-    const int norm_thr = kHcThreads;
-    R3D_KLAUNCH(hc_norm_kernel, dim3((uint32_t)M), dim3(norm_thr), (hipStream_t)stream,
-                (const uint16_t*)h, (const float*)w, sc, M, n, hc, h_ld, eps);
+    const int norm_rows = kHcThreads / hc;
+    R3D_KLAUNCH(hc_norm_kernel, dim3((uint32_t)((M + norm_rows - 1) / norm_rows)),
+                dim3(kHcThreads), (hipStream_t)stream, (const uint16_t*)h, (const float*)w, sc, M,
+                n, hc, h_ld, eps);
 
     /* A launch narrower than a row tile is decode: the tiled kernels' spare rows would be lanes
      * doing a dot nothing reads, so the W28 one-row-a-block kernels keep that latency. */
@@ -730,12 +886,14 @@ int r3d_hc_read(long h, long w, long down, long up, long injw, long x, long inj,
                       inj ? (uint16_t*)inj : nullptr, M, n, hc, lr, h_ld, injw ? injw_ld : 0,
                       inj ? inj_ld : 0, mix_e4m3, down_ld, down_stride, down_G, wadd);
     } else {
-        const int tiles = (lr + kHcDownTile - 1) / kHcDownTile;
-        R3D_KLAUNCH_S(hc_down_kernel_big,
-                      dim3((uint32_t)((M + kHcDownRows - 1) / kHcDownRows),
-                           (uint32_t)(tiles + inj_y)),
-                      dim3(kHcThreads), kHcDownBigLds,
-                      (hipStream_t)stream, (const uint16_t*)h, (const float*)w, (const void*)down,
+        /* Two rows a lane: the staged weight slice feeds both, and one 32-output tile with 16
+         * rows still fills the grid at 128 rows (8 tiles x 11 workgroups). A 128-output tile
+         * was measured no faster: three tiles leave the last 64 columns on a half ladder. */
+        const int tiles = (lr + 31) / 32;
+        R3D_KLAUNCH_S(hc_down_kernel_p1q2c128,
+                      dim3((uint32_t)((M + 15) / 16), (uint32_t)(tiles + inj_y)),
+                      dim3(kHcThreads), kHcDownLdsP1Q2C128, (hipStream_t)stream,
+                      (const uint16_t*)h, (const float*)w, (const void*)down,
                       injw ? (const uint16_t*)injw : nullptr, d, sc,
                       inj ? (uint16_t*)inj : nullptr, M, n, hc, lr, h_ld, injw ? injw_ld : 0,
                       inj ? inj_ld : 0, mix_e4m3, down_ld, down_stride, down_G, wadd);
@@ -748,13 +906,11 @@ int r3d_hc_read(long h, long w, long down, long up, long injw, long x, long inj,
                       (const uint16_t*)h, (const float*)w, (const void*)up, d, sc, (void*)x, M, n,
                       hc, lr, h_ld, x_ld, x_dt, mix_e4m3, up_ld, up_stride, up_G, wadd);
     } else {
-        R3D_KLAUNCH_S(hc_up_kernel_big,
-                      dim3((uint32_t)((M + kHcUpRows - 1) / kHcUpRows),
-                           (uint32_t)((n + kHcUpCols - 1) / kHcUpCols)),
-                      dim3(kHcThreads), kHcUpBigLds,
-                      (hipStream_t)stream, (const uint16_t*)h, (const float*)w, (const void*)up, d,
-                      sc, (void*)x, M, n, hc, lr, h_ld, x_ld, x_dt, mix_e4m3, up_ld, up_stride,
-                      up_G, wadd);
+        const int cols = (n + 63) / 64;
+        R3D_KLAUNCH_S(hc_up_kernel_p2q2c64, dim3((uint32_t)((M + 15) / 16), (uint32_t)cols),
+                      dim3(kHcThreads), kHcUpLdsP2Q2C64, (hipStream_t)stream,
+                      (const uint16_t*)h, (const float*)w, (const void*)up, d, sc, (void*)x, M, n,
+                      hc, lr, h_ld, x_ld, x_dt, mix_e4m3, up_ld, up_stride, up_G, wadd);
     }
 
     if (q || rq) {
@@ -763,7 +919,8 @@ int r3d_hc_read(long h, long w, long down, long up, long injw, long x, long inj,
         const int rgrp = rq ? n / (group > 0 ? group : n) : 0;
         const int gx = ngrp > rgrp ? ngrp : rgrp;
         if (gx > 0)
-            R3D_KLAUNCH(hc_quant_kernel, dim3((uint32_t)M, (uint32_t)gx), dim3(kHcThreads),
+            R3D_KLAUNCH(hc_quant_kernel, dim3((uint32_t)M, (uint32_t)gx),
+                        dim3(kHcQuantThreads),
                         (hipStream_t)stream, (const void*)x, x_dt, M, n, x_ld, qg, ngrp,
                         (void*)q, (float*)qs, q_dt, q_ld, qs_ld, rq ? (group > 0 ? group : n) : 0,
                         rgrp, (void*)rq, (float*)rs, rq_dt, rq_ld, rs_ld);
