@@ -1699,6 +1699,13 @@ TEST(iqr_gemm_bench_on_the_27b_shapes_when_asked) {    if (!std::getenv("RAD_IQR
     bench_one(12288, 2560, 4096, 5, 8, true);
     bench_one(5120, 17408, 512, 4, 20, true);
     bench_one(5120, 17408, 4096, 4, 8, true);
+    /* The 27B's served ffn_gate_up band (u5, computed trellis, one f32 scale a row), at the
+     * prefill heights the engine issues: 512, 1024 and 2048 tokens, plus the 1626-row chunk of a
+     * 3 252-token prompt. The decode's share is read from these before any tiling change. */
+    bench_one(34816, 5120, 512, 5, 8, true);
+    bench_one(34816, 5120, 1024, 5, 4, true);
+    bench_one(34816, 5120, 1626, 5, 3, true);
+    bench_one(34816, 5120, 2048, 5, 2, true);
 }
 
 RAD_TEST_MAIN()
