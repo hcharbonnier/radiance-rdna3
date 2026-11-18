@@ -313,7 +313,8 @@ en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
   30 cas `sigmoid`/`mul`/`quant_act_fp8`), d'où un compte kbench qui baisse
   sans échec : comparer les textes servis, pas seulement les compteurs.
 - **MTP** : Flash-Next se sert à `NS=3` (1,82× le décodage, texte identique,
-  acceptation ~40 %) ; le 27B reste à `NS=0` (drafter h128 bf16). Un poids
+  acceptation ~40 %) ; le 27B reste à `NS=0` (cache du drafter bf16 livré en
+  W38, placement encore bloquant — voir le point `27B en NS>0`). Un poids
   joint `rad.planes` d'une row device peut vivre en VRAM : un shim ne doit pas
   lire son en-tête sur l'hôte (SIGSEGV, corrigé dans `gemm_nt_q_w2a8_m16`),
   et le MT du bras `w2a8` doit avoir un chunk qui divise K (M=1/K=2560 → MT=4).
@@ -325,6 +326,12 @@ en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
   élémentaires) ; restent sans oracle libref des cas `gemm_nt_q_gated` i8a8h,
   `gate_had_quant_i8g`/`gated_had_quant_i8g` (couverts par les tests device) et
   8 `ngram_hint`.
+- **27B en `NS>0`** : refusé au placement. `dflash_conv` n'a pas de row device,
+  donc le groupe de poids du drafter est épinglé sur le *mapped tier* et ses
+  normes (déclarées f32, stockées bf16) échouent à l'élargissement
+  (« widened at load ») ; `--placement all_vram` ne change rien. Le cache du
+  drafter est en bf16 sous tronc i8 depuis `ee291d2` (prérequis, pas la
+  solution). Le 27B se sert à `NS=0` (**15,4 tok/s** à 2 047 tokens).
 - Le paramètre rangé d'une row (`M`) est un **plafond de bande**, jamais le
   nombre de lignes du pas : l'étendue est sur les tenseurs. Une row qui compare
   les deux casse le multi-séquence du moteur (bug R24, corrigé en W20) ;
