@@ -218,6 +218,8 @@ octets opaques, pitches larges) ; `mtp_enter_e4m3_device_test` et
 **1 076** (3 skips) ; kbench **27B 3 181/3 181**, **Flash-Next 4 786/4 786**,
 MiniCPM **1 802/1 802**, 0 échec (pires rel_l2 3,619e-03 / 1,520e-02 /
 3,485e-03) ; préfill 27B **288 tok/s** (spécialisation `GS=1`, `faa89fd`),
+**450 tok/s depuis W33** (tuile registre 2×4 sur la forme trellis, TTFT
+3 252 tokens 11,2 → **7,2 s**, décodage inchangé, texte identique),
 Flash-Next long contexte 3 252 tokens **234,8 tok/s** ; cache de tune livré
 dans `build-clean/radiance_home/tune` (bf16 `impl=3`, **5,9×** sur les rows
 tiled) ; `attn_paged_device_test` **8 checks/9 cas** (h256 i8 decode/préfill,

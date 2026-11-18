@@ -1631,3 +1631,59 @@ levier MoE est la **continuation de trellis** (0,80 ms des 2,59 ms de plancher
 diagnostiqué) et, au-delà, le chunking du planificateur (9 appels par site
 relisent les 512 experts), qui n'est pas du ressort de la row. `hc_read` garde
 1,7× vers son plancher de matrices. `attn_dense` est clos sous contrat.
+
+## 2026-11-18 — W33 : `gemm_nt_q` trellis en tuile registre 2×4 (livré)
+
+**Cause mesurée.** Le décodage de l'unité 16×128 sur la vague 0 n'est **pas**
+le limiteur : en le distribuant sur les quatre vagues (une colonne par voie),
+on obtient **1,04×** à M=1626 et **0,997×** à M=512 — il est déjà recouvert par
+les quatre blocs par CU, et un double buffer ne viserait que ≤ 4 %. Le
+limiteur est le **flux d'activation et la chaîne `dot4`** : l'ancienne tuile
+donnait à chaque voie une ligne de poids et huit tokens, soit deux chargements
+par `dot4` et chaque dword d'activation consommé par une seule ligne.
+
+**Correctif** (`libr3d/r3d_gemm_iqr_m16.hip`, `r3d_iqr_dec.h`). Une voie
+possède **2 tokens × 4 lignes** (8 sorties) : un pas `c4` alimente 8 `dot4`
+avec 2 dwords d'activation et 4 de poids, **0,75 chargement par `dot4`**, et le
+dword d'activation est consommé par quatre lignes en registres. L'unité est
+décodée par les quatre vagues en parallèle (`state1` dans le décodeur, ajout
+purement additif : extraction d'état, hash masqué et somme d'octets identiques
+à `rows()`, chacun écrit à sa place). 226 VGPR, aucun spill, 2 blocs/CU.
+L'arithmétique par (token, ligne) est inchangée — codes entiers exacts, groupes
+ascendants, deux facteurs f32 de gauche à droite, épilogue `row_scale` — donc
+**sortie bit-identique**. Réservé à `kTrellisMad` avec `LRB = 0` et `M >= 128` ;
+le décodage M=1 (`m16`) et la voie IQ8R groupe 256 ne sont pas touchés.
+
+| 34816×5120 trellis | avant | après | gain | TFLOP/s |
+|---|---:|---:|---:|---:|
+| M=512 | 10 557 | **6 098** | 1,73× | 17,3 → 29,9 |
+| M=1 024 | 21 355 | **11 969** | 1,78× | 17,1 → 30,5 |
+| M=1 626 | 36 901 | **21 744** | 1,70× | 15,7 → 26,7 |
+| M=2 048 | 46 667 | **28 549** | 1,63× | 15,6 → 25,6 |
+
+**Servi** (27B, KV i8, NS=0, `profile-ops`, build neuf) : prompt de 3 252
+tokens **TTFT 11 225 → 7 222 ms (1,55×)**, `gemm_nt_q` **10 048 → 5 954 ms
+(1,69×)** sur 1 248 appels (préfill 288 → **450 tok/s**) ; prompt de 372 tokens
+1 326 → **986 ms** ; décodage **28,84 → 28,93 tok/s** (inchangé) ; texte
+**identique au bit**. `attn_paged` devient le deuxième poste (12,8 %) du
+préfill 27B.
+
+**Validation** : `iqr_device_test` 76/11, `sched_test` 548 952,
+`engine_e2e_test` 1 076 (3 skips), `fixture_test` 109 671,
+`ple_hc_device_test` 58/10, `moe_iqr_device_test` 15/15,
+`vision_rows_device_test` 66/10, `attn_paged_device_test` 8/9,
+`r3d_selftest` **195 rows, 0 échec, 16 skips** ; kbench ciblé `--op gemm_nt_q`
+194/194, `rel_l2` **2,911e-03** inchangé.
+
+**`hc_read`, N une fois par rangée : mesuré, non livré.** N est reconstruit
+**12× par rangée et par appel** (11× en `down` — dix tuiles de sortie plus le
+bloc d'injection — et 1× dans l'épilogue `up`). Le supprimer du `down` rend
+**10,8–12,6 %** du core (M=4 096 : 12 825 → 11 446 µs), mais un scratch
+`M × 10 240` bf16 coûte l'écriture (84 Mo), la relecture de `h` et une
+reconstruction restante : **~8 % net, ≈1,09× à 4 096 et ≈1,11× à 1 024**, sous
+la barre de 1,15×. Aucun code livré.
+
+**Reste.** La tuile est à 30,5 TFLOP/s, soit 37 % du plafond f16 WMMA (81,9) et
+au-dessus de notre tuile bf16 (23,5) ; au-delà, il faudrait une tuile 4×4
+(spill de 88 VGPR mesuré), une autre arithmétique, ou un double buffer si
+l'occupation baisse.

@@ -364,3 +364,31 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   gardée par `kSigned` ne peut pas gagner sur le 27B, le Flash-Next ou
   MiniCPM. Une variante device-only se refuse même si elle est plus rapide et
   exacte.
+
+## W33 — `gemm_nt_q` trellis en tuile registre 2×4 (2026-11-18)
+
+- **Cause mesurée** : le décodage trellis sur la vague 0 n'est pas le limiteur
+  (parallélisé : 1,04× à M=1626, 0,997× à M=512, déjà recouvert par 4 blocs/CU).
+  Le limiteur est le **flux d'activation et la chaîne `dot4`** : l'ancienne
+  tuile faisait deux chargements par `dot4` et consommait chaque dword
+  d'activation une seule fois.
+- **Livré** : 2 tokens × 4 lignes par voie (0,75 chargement/`dot4`, 8 sorties),
+  décodage de l'unité par les quatre vagues en parallèle (`state1`, additif),
+  226 VGPR, 2 blocs/CU, **bit-identique**, réservé à `kTrellisMad`/`LRB=0` et
+  `M >= 128`.
+- **Device** : M=512 10 557 → **6 098 µs**, 1 024 21 355 → **11 969**,
+  1 626 36 901 → **21 744**, 2 048 46 667 → **28 549** (1,63–1,78×,
+  30,5 TFLOP/s à M=1 024).
+- **Servi** : 27B 3 252 tokens **TTFT 11 225 → 7 222 ms (1,55×)**, `gemm_nt_q`
+  1,69× (préfill **288 → 450 tok/s**) ; 372 tokens 1 326 → 986 ms ; décodage
+  inchangé (28,93 tok/s) ; texte identique au bit.
+- **`hc_read`, N en scratch : mesuré, non livré.** N est reconstruit 12× par
+  rangée ; le sortir du `down` rend 10,8–12,6 % du core, mais le scratch net
+  **~8 % (≈1,09× à 4 096)**, sous la barre de 1,15×.
+- **R42** — *livré (W33)* : la tuile registre 2×4 est le bon levier pour le
+  trellis, et le décodage parallèle n'est qu'un appoint (il fait tomber le gs1
+  de 110 à 87 VGPR et évite le spill de la tuile). Ne pas rejouer la piste
+  « décodage distribué » seule : elle vaut ≤ 4 %. La borne restante est
+  l'arithmétique (37 % du plafond f16 WMMA).
+- **Reste** : 27B `attn_paged` devient le 2ᵉ poste (12,8 %) ; préfill Flash-Next
+  toujours dominé par `moe_gemm_q` (PCIe) ; `hc_read` 1,7× vers son plancher.

@@ -707,7 +707,7 @@ antérieurs sont rappelés quand ils changent la conclusion.
 | `attn_dense` hd72 (tour vision, 2048²) | **5,30 TFLOP/s** (233 ms à 16 384 patches × 16 têtes) | 437 VALU/clé ⇒ **115 ms** (VALU pur) / 163 ms (issue 100 %) | **~1,4×** | **clos (R40)** : ~70 % d'issue ; lane = clé **+23 %**, kStage 64 ×9,9, launch_bounds(128,3) ×3,8, waves 3/5 bruit ; sorties = FMA, tampon de scores 64 KiB/ligne, softmax en une passe (contrat) |
 | `hc_read` (préfill Flash-Next) | **0,53 s / 972 tok** (17,6 %), **4,0 s à 4 098** | 630 Mo de matrices à ~900 GB/s ⇒ ~0,7 s par chunk | ~1,7× (chunk 4 k) | **livré W32** : 2 rangées/lane (1,5 LDS/MAC) + 2×2 en `up` (1,0), norm 64 rangées/bloc, quant par réduction ; 1,23× à M=1, 1,78× à 128, 2,94× à 512, **7,7–7,9× cumulé depuis W30**, bit-exact |
 | `moe_gemm_q` (préfill Flash-Next) | 1,71 s / 972 tok (**56,5 %**, premier poste) | continuation de trellis = 0,80 ms des 2,59 ms de plancher | ~1,5× | tuile étroite **rejetée** (kbench 1,27× à M=128 mais **+8,5 %** en service à M=1204, R39) ; le levier est la continuation, puis le chunking du planificateur |
-| `gemm_nt_q` IQR (27B, 3 252 tok) | **17,2 TFLOP/s** (88 % du préfill) | 23,5 (notre tuile bf16) / 81,9 (plafond f16 WMMA) | 1,4× / 4,8× | poids **trellis u4/u5** (`tcq=16`) : le décodage de l'unité tourne sur la vague 0 pendant que trois attendent ; la tuile 2×4 à copie parallèle (1,94×) est gardée sur `kSigned` et ne s'applique donc pas (R41) ; piste = recouvrement K+1 (double buffer), pas copie |
+| `gemm_nt_q` IQR/trellis (27B, 3 252 tok) | **30,5 TFLOP/s** (80,8 % du préfill, M=1 024) | 23,5 (notre tuile bf16) / 81,9 (plafond f16 WMMA) | **dépassée** / 2,7× | **livré W33** : tuile registre 2 tokens × 4 lignes (0,75 chargement/`dot4`) sur la forme **trellis** (`kTrellisMad`, `LRB=0`), décodage de l'unité par les 4 vagues (`state1`), bit-identique, 226 VGPR/2 blocs/CU ; 1,63–1,78× device, 1,55× servi. Le décodage distribué seul ne vaut que ≤ 4 % (R42) ; au-delà : tuile 4×4 (spill) ou autre arithmétique |
 | `attn_paged` (27B, 3 252 tok) | 0,91 s (7,9 %) | — | — | livré (split-KV) |
 | décodage (Flash-Next, 27B) | 12,73 / 16,8 tok/s | ~14 / ~18 tok/s (poids à 900 GB/s) | ~10 % | flux de poids ; levier = octets lus ou acceptation MTP, pas un noyau |
 
@@ -720,7 +720,7 @@ mesure, avant les deux passes) :
 | Flash-Next texte 3 252 tok, préfill | 13,56 s | 8,19 s | **6,32 s** |
 | Flash-Next image 1 024², TTFT | 9,58 s | 4,66 s | **4,05 s** |
 | Flash-Next image 2 048², TTFT | 39,2 s | 19,1 s | **17,0 s** |
-| 27B texte 3 252 tok, TTFT | 11,44 s | 11,39 s | — (IQR 88 %) |
+| 27B texte 3 252 tok, TTFT | 11,44 s | 11,39 s | **7,22 s** (450 tok/s) |
 
 Prochain ordre de valeur : `moe_gemm_q` au préfill (continuation de trellis,
 puis chunking du planificateur), `hc_read` vers son plancher (1,7× au chunk de
