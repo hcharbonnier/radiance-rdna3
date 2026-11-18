@@ -726,3 +726,13 @@ Prochain ordre de valeur : `moe_gemm_q` au préfill (continuation de trellis,
 puis chunking du planificateur), `hc_read` vers son plancher (1,7× au chunk de
 4 k), puis la tuile IQR. `attn_dense` est clos sous contrat ; le décodage reste
 au roofline de ses poids.
+
+**W34 — stager de préfill (fusionné, coût corrigé).** Le préfill 972 tokens
+passe de 2 497 à **2 120–2 133 ms (1,18×)**, `moe_gemm_q` de 1 717 à
+**1 326 ms (1,30×)** ; neutre à 3 252 (chunks de 2 048 déjà stagés) et
+~2 % plus lent à 92 tokens (sous le plancher de 256 rangées). Le coût de
+décodage initial (−5 à −7 %, 16 441 experts résidents au lieu de 16 802) est
+**corrigé** : le prêt de la dalle est rendu au premier pas non stagé
+(`set_loan`), et le décodage revient à **19,25 tok/s** à ctx 3 252 et
+**30,13** à 92 tokens, soit ≤ 1,2 % de l'arbre sans stager. Texte identique.
+Le levier passe donc sous la barre R43 (2 %).

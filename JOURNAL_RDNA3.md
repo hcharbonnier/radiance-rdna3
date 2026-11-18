@@ -1687,3 +1687,60 @@ la barre de 1,15×. Aucun code livré.
 au-dessus de notre tuile bf16 (23,5) ; au-delà, il faudrait une tuile 4×4
 (spill de 88 VGPR mesuré), une autre arithmétique, ou un double buffer si
 l'occupation baisse.
+
+## 2026-11-18 — W34 : stager de préfill (livré, coût de décodage corrigé)
+
+**Contexte.** Le préfill Flash-Next est dominé par `moe_gemm_q` (51 % à 972
+tokens) et 19,08 GiB d'experts vivent dans le host pool : 35,5 GiB relus par
+préfill, 1,86 s de MoE pour un plancher PCIe de 1,51 s (81 % du lien x16 à
+25,2 GB/s). Le prompt de 972 tokens est coupé en **deux chunks par site**
+(896 + 76), tous deux sous l'ancien seuil du stager : chaque couche routée
+lisait ses experts sur PCIe **sur le chemin critique**.
+
+**Tentative.** Réserver le ring de staging aux niveaux d'arène intermédiaires
+(`arena_lent` exclut le ring, `arena_lent_full` le rend à la dalle pour les pas
+qui ne stagèrent pas), ring publié pour les passes ≥ 256 rangées, seuil du
+planificateur inchangé (aucun chunk, quantum ni ancre de `prefix-resume` ne
+bouge). Mesuré : un chunk de 82 tokens stagé coûte plus qu'il ne rend
+(0,81 s contre 0,72 s) et la queue de 67 rangées d'un prompt de 963 tokens
+double les octets stagés sans gain — d'où le plancher à 256.
+
+| servi, Flash-Next | sans stager | avec stager |
+|---|---:|---:|
+| préfill 972 tok | 2 497 ms | **2 102 ms (1,19×)** |
+| `moe_gemm_q` à 972 tok | 1 717 ms | **1 319 ms (1,30×)** |
+| préfill 3 252 tok | 6 037 / 6 092 | 6 066 / 6 104 (neutre) |
+| préfill 92 tok | 801 / 803 / 800 | 801 / 800 / 802 (neutre) |
+| décodage, ctx 92 tok | **30,5 tok/s** | 28,3 tok/s (**−7 %**) |
+| décodage, ctx 3 252 tok | **19,35 tok/s** | 18,4 tok/s (**−5 %**) |
+
+Texte identique aux deux contextes (le texte de W31 à 32 tokens est le préfixe
+exact de celui de W35 à 64 tokens) ; régression reproductible à 1 ms près sur
+deux runs par arbre.
+
+**Mécanisme du coût, trouvé et corrigé (W35).** Le prêt de la dalle n'était
+**jamais rendu** : un chunk stagé rétrécissait la part de la dalle pour réserver
+le ring, et `arena_step` ne faisait que la rétrécir davantage. Après 64 pas de
+décodage la dalle tenait **16 441 experts au lieu de 16 802** (arbre sans
+stager), et le décodage relisait les 361 manquants sur l'hôte : −5 à −7 %,
+reproductible. Le correctif rend le prêt plein (`set_loan`) au **premier pas
+dont la passe ne stagère pas**, ce qui restaure exactement la résidence
+(16 802) et le décodage au débit sans stager.
+
+| Flash-Next | sans stager (W34) | stager seul (W35) | stager + prêt rendu (W36) |
+|---|---:|---:|---:|
+| préfill 972 tok | 2 497 ms | 2 105 ms | **2 120–2 133 ms (1,18×)** |
+| `moe_gemm_q` 972 tok | 1 717 ms | 1 316 ms | **1 326 ms (1,30×)** |
+| préfill 3 252 tok | 6 037 / 6 092 | 5 936 / 5 982 | 5 960 / 5 990 |
+| préfill 92 tok | 801 / 803 / 800 | 804 | 816 / 825 |
+| décodage ctx 3 252 | **19,35 tok/s** | 18,31 | **19,25 (−0,5 %)** |
+| décodage ctx 92 | **30,5 tok/s** | 28,20 | **30,13 (−1,2 %)** |
+
+Texte identique à 3 252×64 (même texte que W34) et aux autres tailles. Le
+levier rentre donc dans la règle R43 : gain de TTFT de 1,18× pour **≤ 1,2 %** de
+décodage, sous la barre des 2 %. Fusionné (`52fd19d`), puis les documents
+corrigés (`5d67900` + cette entrée).
+
+À noter pour la lecture des chiffres : le préfill de 3 252 tokens est **neutre**
+ici ; le 8 186 → 5 964 ms observé entre W31 et W35 vient de la **tuile trellis
+IQR** (W33), pas du stager.

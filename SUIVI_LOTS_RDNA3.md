@@ -392,3 +392,33 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   l'arithmétique (37 % du plafond f16 WMMA).
 - **Reste** : 27B `attn_paged` devient le 2ᵉ poste (12,8 %) ; préfill Flash-Next
   toujours dominé par `moe_gemm_q` (PCIe) ; `hc_read` 1,7× vers son plancher.
+
+## W34 — stager de préfill (2026-11-18, essayé, non livré)
+
+- **Cause confirmée** du préfill 972 tokens : deux chunks par site (896 + 76)
+  sous l'ancien seuil du stager, donc 19,08 GiB d'experts relus sur PCIe sur le
+  chemin critique (35,5 GiB par préfill, 81 % du lien x16).
+- **Tentative** : ring réservé aux niveaux d'arène intermédiaires, publié pour
+  les passes ≥ 256 rangées, seuil du planificateur inchangé (aucun quantum ni
+  ancre R22 touché).
+- **Résultat** : préfill 972 tok **2 497 → 2 102 ms (1,19×)**,
+  `moe_gemm_q` 1,30× ; neutre à 3 252 et 92 tokens ; mais **décodage −7 % à
+  92 tokens et −5 % à 3 252** (30,5 → 28,3 et 19,35 → 18,4 tok/s),
+  reproductible à 1 ms près. Texte identique.
+- **Cause du coût** : le prêt de la dalle n'était jamais **rendu** après un
+  chunk stagé ; `arena_step` ne faisait que le rétrécir. Après 64 pas de
+  décodage la dalle tenait **16 441 experts au lieu de 16 802**, et les 361
+  manquants étaient relus sur PCIe.
+- **Correction** : `set_loan` rend le prêt plein au premier pas dont la passe
+  ne stagère pas. Résidence restaurée (16 802), décodage **19,25 tok/s** à
+  3 252 et **30,13** à 92 tokens (≤ 1,2 % de l'arbre sans stager), préfill
+  972 tok **2 120–2 133 ms (1,18×)**, texte identique.
+- **Décision** : **fusionné** (`52fd19d`, correctif compris). Le levier rentre
+  dans R43.
+- **R43** — *règle de mesure (W34)* : tout levier moteur qui touche l'arène se
+  juge sur **les deux** : TTFT des prompts concernés **et** débit de décodage ;
+  > 2 % de décodage = refus. Le stager est passé sous cette barre après
+  correction.
+- **Reste** : la proposition chiffrée sur le chunk de queue (99 tokens = 86 %
+  des experts), sans toucher à `core/sched/` ; et la marge `hc_read` (1,7× vers
+  son plancher).

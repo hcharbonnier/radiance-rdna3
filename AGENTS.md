@@ -243,7 +243,13 @@ cumulé depuis W30) : servi, Flash-Next texte 972 tok 3,13 → **2,56 s**, 3 252
 tok 8,19 → **6,32 s**, image 1 024² 4,66 → **4,05 s**, texte identique au bit.
 `attn_dense` est **clos sous contrat** (R40 : lane=clé +23 %, kStage 64 ×9,9).
 Le run map MoE à tuile étroite est **rejeté** : kbench 1,27× à M=128 mais
-**+8,5 % en service** à M=1204 (R39). `final-all` est
+**+8,5 % en service** à M=1204 (R39). **W34** : le stager de préfill stagère
+aussi les chunks de 256–1 024 rangées — Flash-Next texte 972 tokens
+2 497 → **2 120 ms** (1,18×, `moe_gemm_q` 1,30×) — et le prêt de la dalle est
+rendu au premier pas non stagé (`set_loan`), sans quoi le décodage perdait
+5–7 % (16 441 experts résidents au lieu de 16 802) : après correctif,
+**19,25 tok/s** à ctx 3 252 et **30,13** à 92 (≤ 1,2 % de l'arbre sans
+stager). R43 (> 2 % de décodage = refus) reste la règle. `final-all` est
 l'arbre **W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ;
 détails dans `RAPPORT_REBASE_V2_1_0.md`.
 
