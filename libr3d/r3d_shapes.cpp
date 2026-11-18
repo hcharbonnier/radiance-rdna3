@@ -1096,6 +1096,30 @@ int r3d_shape_gemm_nt_q_gated(const RadParam* p, int n_p, int operand, RadOpdDes
     R3D_PICK(list);
 }
 
+/* DFlash2's grouped dynamic depthwise convolution, slot for slot from libref's shape hook. `delta`
+ * is declared at the coefficient projection's rank so the descriptor carries the pitch the slice is
+ * read at; x and out are [T, hidden_size]. */
+int r3d_shape_dflash_conv(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t T    = gi(p, n_p, "T", 0);
+    const int64_t H    = gi(p, n_p, "hidden_size", 0);
+    const int64_t taps = gi(p, n_p, "taps", 0);
+    const int64_t NG   = gi(p, n_p, "NG", 0);
+    const int64_t grp  = gi(p, n_p, "group_size", 0);
+    const uint32_t D   = act_dt(p, n_p);
+    /* The entry point's conditions: NG is H/group and a thread owns eight channels. */
+    if (T <= 0 || H <= 0 || taps <= 0 || NG <= 0 || grp <= 0) return RAD_E_UNSUPPORTED;
+    if (H % (grp * 8) || NG != H / grp) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd(D, T, H),
+        /* A slice of the [T, 2, taps, NG] projection, row pitch 2*taps*NG: a packed pitch would
+         * silently read the other half's coefficients. */
+        opd(D, T, 2, taps, NG),
+        opd(D, taps, H),                    /* base: the [taps, H] weight, contiguous */
+        opd(D, T, H),                       /* out; must not alias x */
+    };
+    R3D_PICK(list);
+}
+
 /* DFlash2's candidate walk, slot for slot from libref's shape hook. `cand` and `anchor` hold token
  * ids bounded by n_vocab so the codebook gather stays inside the plane; cand/unary/hp carry one
  * row per (sequence, step), M * steps. */

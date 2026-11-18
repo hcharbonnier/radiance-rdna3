@@ -499,6 +499,11 @@ static void check_shapes() {
         { "sample_ngram_ban", { PI("M", 2048), PI("n_vocab", 130560) } },
         { "sample_mask", { PI("M", 2048), PI("n_vocab", 130560) } },
         { "sample_logprobs", { PI("M", 2048), PI("n_vocab", 130560), PI("k", 21) } },
+        /* The 27B drafter's convolution band: 5120 channels in 320 groups of 16, two taps, and a
+         * four-row query block (NS=3), which masks the second tap on every fourth row. */
+        { "dflash_conv", { PI("T", 4), PI("hidden_size", 5120), PI("taps", 2),
+                           PI("group_size", 16), PI("NG", 320), PI("block_size", 4),
+                           PS("dtype", "bf16") } },
         /* MiniCPM5-2B's speculative decoder band: a 7-token draft block, 16 candidates a step, a
          * rank-256 codebook over a 130560-token vocabulary (63.8 MiB each), anchors 7 apart. */
         { "dflash_select", { PI("M", 256), PI("steps", 7), PI("top_k", 16), PI("rank", 256),
@@ -889,6 +894,9 @@ static void make_params(Case& c, const RadKernelInfo* k, const RadOpSchema* s) {
         if (sp.key && !std::strcmp(sp.key, "N")) out.ival = 11008;
         if (sp.key && !std::strcmp(sp.key, "K")) out.ival = 4096;
         if (sp.key && !std::strcmp(sp.key, "n_embd")) out.ival = 4096;
+        /* The 27B drafter's convolution width and its 16-channel groups. */
+        if (sp.key && !std::strcmp(sp.key, "hidden_size")) out.ival = 5120;
+        if (sp.key && !std::strcmp(sp.key, "NG")) out.ival = 320;
         if (sp.key && !std::strcmp(sp.key, "n_vocab")) out.ival = 128256;
         if (sp.key && !std::strcmp(sp.key, "group")) out.ival = 128;
         if (sp.key && !std::strcmp(sp.key, "pb1")) out.ival = 128;

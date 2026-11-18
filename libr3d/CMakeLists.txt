@@ -53,6 +53,11 @@ set(R3D_UNITS
   # The speculative decoder's accept step: a walk over the draft block's candidate lattice, which is
   # a gather out of two codebooks rather than arithmetic.
   "r3d_dflash_f32|"
+  # The drafter's grouped dynamic convolution: the coefficient add, every tap and the block mask
+  # in one pass. Device math in r3dh_dflash_conv_body.h, which also compiles standalone for ISA
+  # review. Without this row the drafter's whole weight group is pinned to the container's mapping
+  # (a group with a host-only op is never copied), so the 27B refuses any speculative deployment.
+  "r3d_dflash_conv|"
   # The gated MLP band: GEMM, gate and output quantiser in one launch, so the [M,N] intermediate
   # is never written to memory.
   "r3d_gemm_fp8a8_gated|"

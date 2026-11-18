@@ -187,7 +187,8 @@ if(TARGET libr3d AND RAD_HIP_FOUND)
                                 gemv_n1_device_test vision_rows_device_test
                                 gdn_conv_recurrent_had_device_test logits_bf16_device_test
                                 mtp_enter_e4m3_device_test logit_rerank_iqr_device_test
-                                act_i8g_group256_device_test tp2_collectives_device_test)
+                                act_i8g_group256_device_test tp2_collectives_device_test
+                                dflash_conv_device_test)
   set(RAD_TESTS_WITH_R3D_HOST hc_layout_test)
 else()
   list(FILTER RAD_TESTS EXCLUDE REGEX "/iqr_device_test\\.cpp$")
@@ -211,6 +212,7 @@ else()
   list(FILTER RAD_TESTS EXCLUDE REGEX "/logit_rerank_iqr_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/act_i8g_group256_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/tp2_collectives_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/dflash_conv_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/hc_layout_test\\.cpp$")
 endif()
 foreach(t ${RAD_TESTS})
@@ -406,7 +408,7 @@ if(RAD_HIP_FOUND)
             gather_rows_u8_device_test
             gemv_n1_device_test vision_rows_device_test gdn_conv_recurrent_had_device_test
             logits_bf16_device_test mtp_enter_e4m3_device_test logit_rerank_iqr_device_test
-            act_i8g_group256_device_test tp2_collectives_device_test)
+            act_i8g_group256_device_test tp2_collectives_device_test dflash_conv_device_test)
     if(TARGET ${n})
       add_test(NAME ${n}_card COMMAND ${n})
       set_tests_properties(${n}_card PROPERTIES

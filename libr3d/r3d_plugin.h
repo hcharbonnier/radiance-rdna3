@@ -366,6 +366,7 @@ extern "C" int r3d_shape_gemm_nt_q_gated (const RadParam*, int, int, RadOpdDesc*
 extern "C" int r3d_layout_gemm_nt_q_w2a8(const RadParam*, int, int, const RadEncoding*,
                                          const int* sel, const RadTensor* planes, int n_planes,
                                          RadLayout*);
+extern "C" int r3d_shape_dflash_conv       (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_dflash_select     (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_row_topk          (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_sample_argmax     (const RadParam*, int, int, RadOpdDesc*);
@@ -388,6 +389,7 @@ extern "C" int r3d_shape_sample_logprobs   (const RadParam*, int, int, RadOpdDes
 int r3d_rad_gemm_nt_q_w2a8     (const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_gated  (const RadArgs* a, RadStream s);
 int r3d_rad_dflash_select      (const RadArgs* a, RadStream s);
+int r3d_rad_dflash_conv        (const RadArgs* a, RadStream s);
 int r3d_rad_row_topk           (const RadArgs* a, RadStream s);
 int r3d_rad_sample_argmax      (const RadArgs* a, RadStream s);
 int r3d_rad_sample_temp        (const RadArgs* a, RadStream s);

@@ -642,6 +642,18 @@ static const RadOperandSpec oGemmQGated[] = {
     { "out_bf16", RAD_OPD_OUT, 1 },
 };
 
+/* DFlash2's grouped dynamic depthwise convolution: the tap gains are base[j] + delta[t][j][g] and
+ * the shifted tap is masked at each block's first rows. `T` is the band's row ceiling, never the
+ * row count; `block_size` is the query block and any value >= 1 is served, since the mask is a
+ * modulo; `NG` is hidden_size / group_size. */
+static const RadParamSpec pDflashConv[] = { P_INT("T"), P_INT("hidden_size"), P_INT("taps"),
+                                            P_INT("group_size"), P_INT("NG"),
+                                            P_INT("block_size"), P_STR("dtype") };
+static const RadOperandSpec oDflashConv[] = {
+    { "x", RAD_OPD_IN, 0 },    { "delta", RAD_OPD_IN, 0 },
+    { "base", RAD_OPD_WEIGHT, 0 }, { "out", RAD_OPD_OUT, 0 },
+};
+
 /* DFlash2's candidate walk: a draft block of `steps` proposals with `top_k` candidates each,
  * rescored against the target's rank-d codebooks. `anchor_stride` is optional and defaults to 1.
  * `hp` is an optional per-edge scaling of the predecessor's codebook row; absent, it is a plane of
@@ -1279,6 +1291,10 @@ static const RadOpSchema kSchemas[] = {
            "product is narrowed, and the row is coded per group of `group` columns with the amax that "
            "group's scale comes from. `out_bf16`, when asked for, is the narrowed gated tensor before "
            "the coding."),
+    SCHEMA("dflash_conv", pDflashConv, oDflashConv,
+           "DFlash2's grouped dynamic depthwise convolution: the coefficient add, every tap's "
+           "shift and the block-position mask in one pass over [T, hidden_size]. `delta` is a "
+           "slice of the [T, 2, taps, NG] coefficient projection, read at its own row pitch."),
     SCHEMA("dflash_select", pDflashSelect, oDflashSelect,
            "DFlash2's greedy walk over a draft block: at each of `steps` steps the candidate with "
            "the best `unary + pred[pid] . (hp * succ[cand])` is picked, and becomes the predecessor "
@@ -2378,6 +2394,13 @@ static const RadConstraint cGemmGatedI8W256[] = { C_IN("dtype", "i8a8h"),
                                                   C_EQ("group", 256), C_GE("M", 1),
                                                   C_LE("M", 16), C_DIV("K", 256),
                                                   C_DIV("N", 512) };
+
+/* The convolution's two tap gains are the grouped form DFlash2 trains, and one thread owns eight
+ * channels a group, so the hidden width is a multiple of group_size * 8 = 128. `block_size` is not
+ * constrained: the kernel takes the position modulo it, so any value >= 1 is served (the shim
+ * refuses 0). `delta`'s pitch is checked on the tensor (a slice of the projection), not here. */
+static const RadConstraint cDflashConv[] = { C_EQ("taps", 2), C_EQ("group_size", 16),
+                                             C_DIV("hidden_size", 128), C_IN("dtype", "bf16") };
 
 /* Every key the walk reads is required and in the band, so all are bound; `top_k <= 256` gives each
  * candidate one lane. `anchor_stride` is deliberately unbound: it is optional, defaults to 1, and
@@ -4268,6 +4291,20 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r3d_rad_gemm_nt_q_iqr_gated, r3d_rad_gemm_nt_q_iqr_gated_scratch,
   r3d_rad_layout_iqr, r3d_rad_relayout_iqr,
   r3d_shape_gemm_nt_q_gated_i8a8h, r3d_rad_unrelayout_iqr },
+
+{ "dflash_conv_t2_g16_bf16", "dflash_conv", "draft",
+  "DFlash2's grouped dynamic depthwise conv: coefficient add, both taps and the block-position "
+  "mask in one pass, eight channels a thread",
+  "score[t][h] = (base[0][h] + delta[t][0][g]) * x[t][h] + (base[1][h] + delta[t][1][g]) * "
+  "x[t-1][h] where t % block_size >= 1, g = h / 16, ascending in the tap and rounded once to bf16 "
+  "at the store, which is libref's order with -ffp-contract=off; delta is a slice of the "
+  "[T, 2, taps, NG] projection read at its own row pitch (2*taps*NG), and out must not alias x",
+  "bf16 x / delta / base / out; a padded x, out or base row or a delta pitch that is not "
+  "2*taps*NG is refused (RAD_E_STRIDE); block_size 0 refused; any block_size >= 1 served",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cDflashConv), NOTUNE,
+  nullptr, nullptr, r3d_rad_dflash_conv, nullptr, nullptr, nullptr,
+  r3d_shape_dflash_conv },
 
 { "dflash_select_bf16", "dflash_select", "draft",
   "DFlash2's greedy walk over the candidate lattice, one lane a (sequence, candidate) pair",
