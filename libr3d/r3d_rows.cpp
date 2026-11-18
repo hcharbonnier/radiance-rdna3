@@ -4838,10 +4838,11 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r3d_rad_rope_axial, nullptr, nullptr, nullptr, r3d_shape_rope_axial },
 
 { "gemm_nt_bias_bf16", "gemm_nt_bias", "gemm",
-  "the vision tower's linear layer: a 16-row x 32-column tile a block, both operands staged as "
-  "f32 in LDS, two output columns a thread walking k ascending with one multiply and one add a "
-  "step; the bias is added in f32 and the result narrowed, then act (exact or tanh GELU) and the "
-  "residual each narrowed where a separate tensor would round",
+  "the vision tower's linear layer: a 32-row x 64-column tile a block with four waves, both "
+  "operands staged as bf16 in a k-major LDS layout and widened to f32 in registers, four rows by "
+  "four columns a thread walking k ascending with one multiply and one add a step; the bias is "
+  "added in f32 and the result narrowed, then act (exact or tanh GELU) and the residual each "
+  "narrowed where a separate tensor would round",
   "bf16; any M, N and K (tails clamp); a/b/y/res at their row pitches; bias a dense [N]; act "
   "none, gelu or gelu_tanh; no split-K, no scratch",
   "bf16 a, b, bias, res and y; every output's chain is libref's ascending k with separate "
