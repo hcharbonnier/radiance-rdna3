@@ -563,9 +563,11 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   `NS=2` refusé par l'arch (bloc entraîné = 4).
 - **R47 clos** : la row lève le blocage de placement.
 - **R48** — *mesure (W38)* : `NS=3` sur le 27B vaut **1,23× à 135 tokens,
-  1,03× à 2 047** ; le verify M=4 coûte ~2,3× un pas à une rangée quand le
-  tronc est compute-bound, et le drafter ajoute ~45 ms. Le « 1,5× » de W37
-  était faux : contexte long → `NS=0`, contexte court → `NS=3` (texte
+  1,03× à 2 047**. L'arithmétique des pas (64 tokens à 70 % d'acceptation
+  ≈ 21 verify + 21 drafter en 4,04 s, contre 65 ms/token à `NS=0`) situe le
+  verify à 4 rangées vers 2,3× un pas à une rangée et le drafter vers 45 ms :
+  le « 1,5× » de W37 supposait un verify quasi gratuit, faux sur un tronc
+  dense compute-bound. Contexte long → `NS=0`, contexte court → `NS=3` (texte
   glouton inchangé).
 - **Couverture** : kbench laisse les 112 cas `dflash_conv` du 27B en
   « skipped » (la déclaration porte la plane entière, le site d'issue la

@@ -2018,11 +2018,13 @@ entraîné est 4.
 - **R47 clos** : la row `dflash_conv` lève le blocage de placement ; le prérequis
   KV (`ee291d2`) et celui-ci étaient les deux pièces manquantes.
 - **R48** — *mesure (W38)* : `NS=3` sur le 27B vaut **1,23× à 135 tokens mais
-  1,03× à 2 047**. Le verify à M=4 coûte ~2,3× un pas à une rangée quand le
-  tronc devient compute-bound, et la passe du drafter (~45 ms) s'ajoute : le
-  « 1,5× » estimé en W37 était faux. Servir le 27B à `NS=0` pour un contexte
-  long ; `NS=3` n'a d'intérêt que quand la cible est memory-bound (contexte
-  court), et il ne change pas le texte glouton.
+  1,03× à 2 047**. L'arithmétique des pas (64 tokens à 70 % d'acceptation
+  ≈ 21 verify + 21 passes de drafter en 4,04 s, contre 65 ms par token à
+  `NS=0`) situe le verify à quatre rangées autour de 2,3× un pas à une rangée
+  et le drafter autour de 45 ms : le « 1,5× » estimé en W37 supposait un verify
+  quasi gratuit, faux sur un tronc dense compute-bound. Servir le 27B à `NS=0`
+  pour un contexte long ; `NS=3` n'a d'intérêt que quand la cible est
+  memory-bound (contexte court), et il ne change pas le texte glouton.
 
 Artefacts : `<work-root>/work/w38-results/{w39-dflashconv.md,ns27b40/,
 ns27b_scan/,ns27b_final/}`.
