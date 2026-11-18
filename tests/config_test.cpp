@@ -584,6 +584,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--prefill-span", { "2" } },
         { "--checkpoint-slots", { "4" } }, { "--checkpoint-policy", { "tip-only" } },
         { "--prefix-resume", { "nearest" } },
+        { "--tail-anchor", { "off" } },
         { "--num-speculative-tokens", { "2" } }, { "--spec-ngram", { "4" } },
         { "--spec-ngram-min", { "1" } }, { "--spec-ngram-max", { "6" } },
         { "--draft-window", { "fixed" } }, { "--draft-short-from", { "4" } },
@@ -1101,6 +1102,29 @@ TEST(prefix_resume_is_exact_unless_nearest_is_asked_for) {
     CHECK_EQ(parse({ "--prefix-resume", "exact" }, &c), RAD_OK);
     CHECK(c.prefix_exact);
     CHECK_EQ(parse({ "--prefix-resume", "deepest" }, &c), RAD_E_INVAL);
+}
+
+/* --tail-anchor keeps the short-turn anchor unless off is asked for, and the report shows it. */
+TEST(the_tail_anchor_is_on_unless_off_is_asked_for) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK(d.tail_anchor);
+    Config c;
+    CHECK_EQ(parse({ "--tail-anchor", "off" }, &c), RAD_OK);
+    CHECK(!c.tail_anchor);
+    CHECK_EQ(parse({ "--tail-anchor", "on" }, &c), RAD_OK);
+    CHECK(c.tail_anchor);
+    CHECK_EQ(parse({ "--tail-anchor", "later" }, &c), RAD_E_INVAL);
+    auto row = [](const Config& cfg) {
+        for (const diag::ConfigRow& r : diag::config_rows(cfg))
+            if (r.flag == "--tail-anchor") return r;
+        return diag::ConfigRow{};
+    };
+    CHECK_EQ(row(d).value, std::string("on"));
+    CHECK_EQ(row(d).source, std::string("default"));
+    Config o;
+    CHECK_EQ(parse({ "--tail-anchor", "off" }, &o), RAD_OK);
+    CHECK_EQ(row(o).value, std::string("off"));
 }
 
 /* --checkpoint-slots is auto by default, resolved by the engine once a snapshot's size is known;

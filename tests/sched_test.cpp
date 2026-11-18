@@ -1125,6 +1125,38 @@ TEST(an_exact_tail_snapshot_is_where_the_last_chunk_starts) {
     CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1792 }));
 }
 
+/* --tail-anchor off drops the short-turn anchor: a prompt under the first interval runs its whole
+ * last chunk and writes no off-grid snapshot, so its next turn re-prefills it. At or past the
+ * interval the cut is the same either way: the interval's checkpoint is a chunk end, not a tail
+ * anchor. */
+TEST(a_prompt_under_the_interval_runs_one_chunk_with_the_tail_anchor_off) {
+    Fixture f;
+    f.build(4096, 64, /*max_tok=*/2048);
+    f.cfg.checkpoint_interval = 2048;
+    REQUIRE_EQ(f.start(), RAD_OK);
+    CHECK_EQ(f.sch.tail_checkpoint(972), (int64_t)896);
+    Cut c = cut_from(f.sch, 0, 972, 2048);
+    CHECK((c.ends == std::vector<int64_t>{ 896, 972 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 896 }));
+
+    Fixture t;
+    t.build(4096, 64, /*max_tok=*/2048);
+    t.cfg.checkpoint_interval = 2048;
+    t.cfg.tail_anchor = false;
+    REQUIRE_EQ(t.start(), RAD_OK);
+    CHECK_EQ(t.sch.tail_checkpoint(972), (int64_t)-1);
+    CHECK_EQ(t.sch.tail_checkpoint(900), (int64_t)-1);
+    c = cut_from(t.sch, 0, 972, 2048);
+    CHECK((c.ends == std::vector<int64_t>{ 972 }));
+    CHECK(c.ckpts.empty());
+
+    const Cut a = cut_from(f.sch, 0, 3000, 2048);
+    const Cut b = cut_from(t.sch, 0, 3000, 2048);
+    CHECK(a.ends == b.ends);
+    CHECK(a.ckpts == b.ckpts);
+    CHECK(!a.ckpts.empty());
+}
+
 /* The property itself, over every geometry and many prompt lengths: every checkpoint past the
  * first interval is on the grid and is a chunk start of the cold run of the prompt that wrote it
  * and of any longer prompt it prefixes (an agent's next turn), and from it the hit cuts exactly the

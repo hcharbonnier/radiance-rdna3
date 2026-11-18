@@ -2402,6 +2402,39 @@ TEST(a_conversation_under_one_checkpoint_interval_reuses_its_tail) {
     CHECK_EQ(s.stop(), 0);
 }
 
+/* --tail-anchor off: the same conversation writes no tail snapshot, so its next turn resumes from
+ * nothing instead of the tail it used to keep. The prefill of a prompt under one interval then
+ * runs its whole last chunk, which is what a mixture-of-experts server wants (one expert sweep
+ * instead of two) at the price of the reuse this test's sibling measures. */
+TEST(a_conversation_under_one_interval_keeps_no_tail_snapshot_with_the_tail_anchor_off) {
+    REQUIRE(world().ok);
+    Server s;
+    REQUIRE(s.start(world().qwen35, { "--max-num-seqs", "1", "--num-speculative-tokens", "0",
+                                      "--tail-anchor", "off" }));
+    const auto counter = [&](const char* name, const char* label) {
+        return label ? metric_where(s.port, name, label) : metric(s.port, name);
+    };
+
+    std::vector<int32_t> transcript = prompt_ids(97, 600);
+    int status = 0;
+    const json t1 = post(s.port, "/completion", completion(transcript, 8), &status);
+    REQUIRE_EQ(status, 200);
+    const std::vector<int32_t> reply1 = tokens_of(t1);
+    REQUIRE_EQ(reply1.size(), 8u);
+    CHECK_EQ(counter("radiance:linear_cached_tokens_total", nullptr), 0.0);
+    CHECK_EQ(counter("radiance:linear_checkpoints_written_total", nullptr), 0.0);
+
+    transcript.insert(transcript.end(), reply1.begin(), reply1.end());
+    const std::vector<int32_t> message = prompt_ids(98, 120);
+    transcript.insert(transcript.end(), message.begin(), message.end());
+    const json t2 = post(s.port, "/completion", completion(transcript, 8), &status);
+    REQUIRE_EQ(status, 200);
+    REQUIRE_EQ(tokens_of(t2).size(), 8u);
+    CHECK_EQ(counter("radiance:linear_cached_tokens_total", nullptr), 0.0);
+    CHECK(counter("radiance:prefix_hit_cuts_total", "reason=\"no_snapshot\"") > 0.0);
+    CHECK_EQ(s.stop(), 0);
+}
+
 /* A snapshot store that cannot be had stops the start, naming --checkpoint-slots, the size and
  * what to change; served without it, every prefix hit on a hybrid model would prefill from the
  * start. The largest count the flag takes is more bytes than a 64-bit size says, whatever a slot's
