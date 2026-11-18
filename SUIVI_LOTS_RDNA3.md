@@ -513,3 +513,24 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   1,16–1,18× à 1 536, 1,16× à 2 047) et **disparaît à exactement I**
   (1,01–1,02×) : un intervalle plein n'a pas de queue partielle à ancrer.
   Ne pas attendre de gain au-delà de I, ne pas conclure à une régression.
+
+## W38b — 27B `NS=3` : bande KV corrigée, placement bloquant (2026-11-18)
+
+- **Mesuré d'abord** (`build-w38`, prompt 2 047 tokens, 64 générés, serveur
+  neuf par configuration) : KV i8 `NS=0` sert à **15,4 tok/s** ; KV i8 `NS=3`
+  refuse (rows `attn_paged`/`kv_store` du drafter h128 non servies en int8) ;
+  KV bf16 refuse aussi (le tronc h256 n'a pas de row bf16). Un dtype global ne
+  peut pas servir les deux groupes : leurs têtes diffèrent (256 vs 128).
+- **Livré** (`ee291d2`) : le groupe KV du drafter prend sa propre dtype ;
+  `qwen35_fp8` le garde en **bf16** quand le tronc est en i8 (note au
+  démarrage), contrat porté par `arch_test`. `build-w39` : suite complète verte
+  (sched 548 964, e2e 1 087/3 skips, fixture 109 671, config 2 927, device
+  verts, selftest 195/0/16), kbench ciblé 27B **854/854**, 0 divergence.
+- **Blocage suivant** : `dflash_conv` n'a **pas de row device** dans `libr3d`,
+  donc le groupe de poids du drafter est épinglé sur le *mapped tier*, et ses
+  normes (déclarées f32, stockées bf16) exigent un élargissement au chargement
+  → refus « widened at load ». `--placement all_vram` ne change rien.
+- **R47** — *constat (W38)* : le 27B en `NS=3` n'est pas une recette ; il faut
+  une row device `dflash_conv`. Le prérequis KV est livré, le reste est du
+  noyau (hors périmètre sans feu vert). Le 27B reste servi à `NS=0`
+  (**15,4 tok/s** à 2 047 tokens).

@@ -1900,3 +1900,55 @@ les 12 paires.
 
 Artefacts : `<work-root>/work/w38-results/{flashnext,dense27b,minicpm}.{md,log}`,
 `strict.log`, `ta4/`, `ta5/`.
+
+## 2026-11-18 — W38b : 27B en `NS=3` — bande KV corrigée, blocage de placement mesuré
+
+**But** : le levier §6.B.1 (« 27B en NS=3, ~1,5× sur le décodage, effort
+faible »). Mesuré d'abord sans toucher au code, `build-w38`, prompt de
+2 047 tokens, 64 tokens générés, une requête par serveur neuf :
+
+| configuration | démarrage | décodage |
+|---|---|---:|
+| KV i8, NS=0 | oui | **15,35–15,39 tok/s** |
+| KV i8, NS=3 | **non** | — |
+| KV bf16, NS=0 | **non** | — |
+| KV bf16, NS=3 | **non** | — |
+
+- **i8 + NS=3** : `attn_paged`/`kv_store` du **drafter** (head_dim 128, gqa 4,
+  fenêtre 2 048) ne sont servis qu'en **bf16/fp8_e4m3** ; les rows int8 sont
+  celles du tronc (head_dim 256). Trois bandes device non résolues → refus.
+- **bf16 + NS=0** : symétrique — le **tronc** h256 n'a pas de row bf16 dans
+  `libr3d`. Un seul `--kv-cache-dtype` global ne peut donc pas servir les
+  deux : les deux groupes ont des formes de tête différentes.
+
+**Correction livrée** (`ee291d2`) : `drafter_kv_group` accepte une dtype propre
+au groupe ; `qwen35_fp8` garde le cache du drafter en **bf16** quand le tronc
+est en i8 (note au démarrage). `tests/arch_test.cpp` porte le nouveau contrat
+(`qwen35_i8_trunk_keeps_the_int8_group_and_the_drafter_its_bf16_cache`) : tronc
+i8 h256, drafter bf16 h128, chaque op sur sa dtype. Suite complète sur
+`build-w39` verte : `arch_test` (après mise à jour), `sched_test` 548 964,
+`engine_e2e_test` 1 087 (3 skips), `fixture_test` 109 671, `config_test`
+2 927, tous les device (dont `attn_paged_device_test` 8/9), selftest
+**195/0/16** ; kbench ciblé 27B (`attn_paged`, `gemm_nt_q`, `mtp_enter`,
+`logit_rerank`, `dflash_conv`) **854/854**, 0 divergence, pire `rel_l2`
+2,976e-03.
+
+**Blocage suivant, mesuré** : le démarrage échoue désormais plus loin, sur
+`'dflash.blk.0.attn_norm.weight' was placed on the mapped tier ... (widened at
+load)`. `--debug-placement` donne la cause : **`dflash_conv` ne résout qu'un
+kernel hôte** dans `libr3d`, donc tout le groupe de poids du drafter est épinglé
+sur le *mapped tier* (lecture en place du conteneur) ; les normes du drafter
+sont déclarées f32 alors que le conteneur les stocke en bf16, ce qui exige un
+élargissement au chargement — incompatible avec la lecture en place. Forcer
+`--placement all_vram` ne change rien (le groupe hôte reste épinglé).
+
+- **R47** — *constat (W38)* : `NS=3` sur le 27B **n'est pas une recette**. Il
+  faut au minimum une **row device `dflash_conv`** dans `libr3d` ; sans elle le
+  bloc drafter est hôte, ses poids vont sur le *mapped tier*, et ses normes
+  élargies font échouer le chargement. Le prérequis KV (cache du drafter en
+  bf16) est livré ; le reste est du travail de noyau, donc hors du périmètre
+  sans feu vert. Tant que la row manque, le 27B reste servi à `NS=0`
+  (**15,4 tok/s** à 2 047 tokens, 64 tokens générés, KV i8).
+
+Artefacts : `<work-root>/work/w38-results/ns27b/` (refus W38),
+`ns27b39/`, `ns27b39v/` (build-w39), `w39-27b-targeted.{md,log}`.
