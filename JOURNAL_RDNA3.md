@@ -1557,6 +1557,7 @@ Effet servi (`profile-ops`, même protocole, NS=0) :
 | texte 972 tok, TTFT | 3 133 ms | **2 560 ms** (−18 %) |
 | texte 3 252 tok, préfill | 8 186 ms | **6 316 ms** (−23 %) |
 | image 1 024², TTFT | 4 660 ms | **4 049 ms** (−13 %) |
+| image 2 048², TTFT | 19 100 ms | **16 967 ms** (−11 %) |
 | `hc_read` dans le préfill 972 tok | 1 197 ms (32,6 %) | **534 ms** (17,6 %) |
 
 Texte servi **identique au bit** (Flash-Next 3 252 tokens, drafts 19/39).

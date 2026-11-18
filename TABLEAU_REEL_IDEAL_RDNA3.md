@@ -719,7 +719,7 @@ mesure, avant les deux passes) :
 | Flash-Next texte 972 tok, TTFT | 4,78 s | 3,13 s | **2,56 s** |
 | Flash-Next texte 3 252 tok, préfill | 13,56 s | 8,19 s | **6,32 s** |
 | Flash-Next image 1 024², TTFT | 9,58 s | 4,66 s | **4,05 s** |
-| Flash-Next image 2 048², TTFT | 39,2 s | 19,1 s | — (voir W31) |
+| Flash-Next image 2 048², TTFT | 39,2 s | 19,1 s | **17,0 s** |
 | 27B texte 3 252 tok, TTFT | 11,44 s | 11,39 s | — (IQR 88 %) |
 
 Prochain ordre de valeur : `moe_gemm_q` au préfill (continuation de trellis,
