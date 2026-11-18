@@ -1301,8 +1301,10 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
      * grid point under exact -- is kept as it is: it is where the cold run chunks anyway. */
     const bool on_boundary = short_anchor % I == 0 || (geo_.exact && geo_.on_grid(short_anchor));
     if (!on_boundary) short_anchor = (target - anchor_margin) / Q * Q;
-    const int64_t short_tail = cfg_.prefix_cache && target <= I && short_anchor >= kShortTailMin
-                             ? short_anchor : -1;
+    /* --tail-anchor off drops the short-turn anchor: a prompt under one interval then runs its
+     * whole last chunk and no snapshot is taken off the grid. */
+    const int64_t short_tail = cfg_.prefix_cache && geo_.tail_anchor && target <= I &&
+                               short_anchor >= kShortTailMin ? short_anchor : -1;
     if (geo_.exact) {
         /* --prefix-resume exact: where the prompt's last chunk starts on the resume grid, so an
          * exact repeat re-prefills that chunk as the cold run did, and an appended turn that chunk

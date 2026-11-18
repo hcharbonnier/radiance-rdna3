@@ -178,6 +178,7 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
     const bool splits = I0 > 0 && (!g.window_ckpt || g.window_periodic);
     const int64_t budget_chunk = cfg.max_tok / g.quantum * g.quantum;
     g.exact = cfg.prefix_exact && cfg.prefix_cache;
+    g.tail_anchor = cfg.tail_anchor;
     if (g.exact && splits && I0 > budget_chunk && I0 % budget_chunk != 0) {
         g.checkpoint_interval = align_up(I0, budget_chunk);
         RAD_WARN("--checkpoint-interval %lld resolves to %lld: --prefix-resume exact needs it a "
@@ -227,6 +228,9 @@ int chunk_geometry_resolve(const Program& prog, const Config& cfg, ChunkGeometry
                  "there): the next turn resumes on it and recomputes the interval's end in a "
                  "shorter chunk", (long long)g.grid,
                  g.grid_origin > 0 ? fmt(" from %lld", (long long)g.grid_origin).c_str() : "");
+    if (!g.tail_anchor)
+        RAD_INFO("tail anchor off: a prompt under one checkpoint interval runs its whole last "
+                 "chunk and writes no snapshot there; its next turn re-prefills it");
     if (cfg.prefill_span > 1) {
         /* What the span does here, said once: the intervals the budget holds can be fewer than
          * the flag asks for, and a model without an interval grid spans nothing. */

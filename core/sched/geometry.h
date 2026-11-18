@@ -80,6 +80,12 @@ struct ChunkGeometry {
     int64_t grid = 0;
     int64_t grid_origin = 0;
 
+    /* --tail-anchor off (Config::tail_anchor): no short-turn anchor. A prompt under the first
+     * interval then runs its whole last chunk instead of stopping at the off-grid tail position,
+     * so a later turn of a short conversation re-prefills it. A prefill timer's lever on a
+     * mixture-of-experts server, where every chunk sweeps the expert plane once. On by default. */
+    bool tail_anchor = true;
+
     bool checkpoints() const { return checkpoint_interval > 0; }
 
     /* The deepest grid position at or below `pos`; `pos` itself when not exact. */

@@ -193,6 +193,11 @@ static const Flag g_flags[] = {
     "                                    re-prefill" },
     { "--checkpoint-policy",  "NAME",   "which snapshots a session retains: geometric-backoff "
                                         "(default), tip-only, keep-all" },
+    { "--tail-anchor",        "MODE",   "on (default) keeps the short-turn anchor a prompt under\n"
+    "                                    the first checkpoint interval takes, so its next turn\n"
+    "                                    resumes there; off runs that prompt as one chunk and\n"
+    "                                    re-prefills it on the next turn. A prefill lever on a\n"
+    "                                    mixture-of-experts server" },
 
     { "--num-speculative-tokens", "N",  "speculative window; 0 disables. Default `auto`: the drafter's\n"
     "                                    own operating point, which the plugin states. A container\n"
@@ -853,6 +858,15 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!std::strcmp(v, "nearest")) c->prefix_exact = false;
             else {
                 RAD_ERR("--prefix-resume '%s' is not one of exact, nearest", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--tail-anchor")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "on"))        c->tail_anchor = true;
+            else if (!std::strcmp(v, "off"))  c->tail_anchor = false;
+            else {
+                RAD_ERR("--tail-anchor '%s' is not one of on, off", v);
                 return RAD_E_INVAL;
             }
         }
@@ -1525,6 +1539,8 @@ const ShowRow kShow[] = {
           return std::string(c.prefix_cache ? "not given: prefix caching on" : "prefix caching off"); } },
     { "--prefix-resume",      [](const Config& c) {
           return std::string(c.prefix_exact ? "exact" : "nearest"); } },
+    { "--tail-anchor",        [](const Config& c) {
+          return std::string(c.tail_anchor ? "on" : "off"); } },
     { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },
     { "--num-speculative-tokens", [](const Config& c) { return c.n_spec < 0 ? std::string("auto") : num(c.n_spec); } },
     { "--spec-ngram",         [](const Config& c) {

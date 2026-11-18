@@ -977,6 +977,12 @@ struct Config {
      *   at its last quantum boundary. Up to a chunk less is re-prefilled a turn, and a hit can
      *   differ from a cold run in the last bits (a near-tie in greedy text). */
     bool    prefix_exact = true;
+    /* --tail-anchor on|off (default on): off drops the short-turn anchor of a prompt under the
+     * first checkpoint interval, so the prompt runs its whole last chunk and no snapshot is taken
+     * off the grid. On a mixture-of-experts server every chunk sweeps the expert plane once, so
+     * the dropped tail chunk is worth its prefill time; the cost is that the next turn of a short
+     * conversation resumes from nothing. Never affects a prompt at or past the interval. */
+    bool    tail_anchor = true;
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as unmeasured;
      * core/mem/prefix.h ships the two extremes so they can be compared. */
     std::string checkpoint_policy = "geometric-backoff";
