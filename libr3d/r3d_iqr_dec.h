@@ -232,6 +232,17 @@ struct Dec {
         if (s % 8u == 0u && L % 8u == 0u) return window(cw[e][i], cw[e][i + 1u], s, L);
         return (mw[e][i] >> (s - 16u)) & ((1u << L) - 1u);
     }
+    /* The same state for one column, whose words a worker lane decoded alone. Parallelising a
+     * unit's decode gives a lane one column of one lane segment, so it cannot build the 4xNW
+     * arrays; the arithmetic is state()'s, unchanged. */
+    __device__ static uint32_t state1(const uint32_t* cw, const uint32_t* mw, uint32_t q) {
+        constexpr uint32_t L = F::L;
+        static_assert(L <= 16u, "a crossing state within bits 16 .. 47");
+        const uint32_t o = q * B, i = o >> 5, s = o & 31u;
+        if (s + L <= 32u) return (cw[i] >> s) & ((1u << L) - 1u);
+        if (s % 8u == 0u && L % 8u == 0u) return window(cw[i], cw[i + 1u], s, L);
+        return (mw[i] >> (s - 16u)) & ((1u << L) - 1u);
+    }
     static constexpr bool HALF = H16 && TR && !MAD && F::LRB != 0;
     static constexpr uint32_t kTab = F::KIND == kTable ? 256u
                                    : GRID ? (1u << B) << F::LV

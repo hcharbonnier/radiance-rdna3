@@ -31,6 +31,11 @@
  * block into LDS while all four waves consume it (gemm_iqr_resident_kernel, below). The
  * arithmetic per (token, row) is this kernel's, so the two are bit-identical.
  *
+ * The computed trellis at prefill heights (M >= kIqrPairMinM) takes the register-tiled kernel
+ * instead (gemm_iqr_resident_pair_kernel, below): each lane owns two tokens by four rows, and the
+ * unit is decoded with all four waves in parallel, one column a lane. The arithmetic per
+ * (token, row) is still this kernel's, in the same order, so its output is bit-identical too.
+ *
  * Above kIqrWmmaMinM rows the tiled row runs the same residency on the int8 wave matrix
  * (gemm_iqr_wmma_kernel, below): the decoded 16x128 unit is the B fragment, a 16-token
  * activation tile the A fragment, and the eight 16x16x16 steps of a group chain one exact i32
@@ -467,6 +472,40 @@ int form_supported(const Form& f) {
            f.bits >= 8 && f.bits <= 12;
 }
 
+/* Stage a computed trellis's 16x128 unit into sW with all four waves decoding in parallel: each
+ * wave takes eight of the unit's 32 lane segments, four lanes a segment and one column a lane.
+ * The state chain is per column, so this is the same arithmetic as Dec::rows() (state extraction,
+ * the masked hash and its byte sum), only split across the wave's 32 lanes; the byte the value
+ * would have packed into column e is stored at that byte, and rows() places state q at w[15-q].
+ * The caller barriers before the tile is consumed. */
+template <class F>
+__device__ __forceinline__ void stage_mad_parallel(uint32_t* sW, const Ctx& c, uint32_t rt,
+                                                   uint32_t kb, uint32_t wave, uint32_t lane) {
+    static_assert(F::KIND == kTrellisMad && F::LRB == 0,
+                  "the parallel trellis stage serves the computed trellis, one scale a row");
+    const uint32_t seg = wave * 8u + (lane >> 2u);
+    const uint32_t e = lane & 3u;
+    const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, seg, true);
+    constexpr uint32_t NW = Dec<F>::NW;
+    uint32_t cw[NW], mw[NW];
+#pragma unroll
+    for (uint32_t i = 0; i < NW; ++i) cw[i] = Dec<F>::colw(r, e, i);
+#pragma unroll
+    for (uint32_t i = 0; i < NW; ++i)
+        mw[i] = i + 1u < NW ? __builtin_amdgcn_alignbit(cw[i + 1u], cw[i], 16u) : 0u;
+    constexpr Form f{ F::KIND, F::B, F::LV, F::L, F::LRB, F::SC, 0 };
+    const uint32_t* ab = (const uint32_t*)(c.W + aux_off(f, c.N, (int64_t)c.nkb * 128));
+    const uint32_t A = ab[0], Bc = ab[1];
+    uint8_t* sb = (uint8_t*)sW;
+#pragma unroll
+    for (uint32_t q = 0; q < 16u; ++q) {
+        const uint32_t st = Dec<F>::state1(cw, mw, q);
+        const uint32_t h = (__umul24(st, A) + Bc) & 0x3F3F3F3Fu;
+        const int v = __builtin_amdgcn_sudot4(false, (int)h, false, 0x01010101, -126, false);
+        sb[(15u - q) * (kIqrSWPitch * 4u) + 4u * seg + e] = (uint8_t)v;
+    }
+}
+
 /* ---- GS=1 path, restored from the W26 kernel: the W27 group loop costs 17% on the
  * 27B (GS=1); GS=2 keeps the grouped kernels below. ---- */
 
@@ -507,7 +546,9 @@ gemm_iqr_resident_gs1_kernel(const int8_t* __restrict__ a, const float* __restri
     for (int i = 0; i < NP; ++i) acc[i] = 0.0f;
 
     for (uint32_t kb = 0; kb < nkb; ++kb) {
-        if (wave == 0) {
+        if constexpr (Dec<F>::MAD && F::LRB == 0) {
+            stage_mad_parallel<F>(sW, c, rt, kb, wave, lane);
+        } else if (wave == 0) {
             const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
             uint32_t w[16];
             Dec<F>::rows(r, c, 1.0f, w);
@@ -543,6 +584,132 @@ gemm_iqr_resident_gs1_kernel(const int8_t* __restrict__ a, const float* __restri
         if (mu >= (uint32_t)M) continue;
         const int m = (int)mu, q = p % 16;
         y[(long long)m * y_ld + row0 + q] = f32_to_bf16(acc[i] * row_scale<F>(c, row0 + q));
+    }
+}
+
+/* ---- the register-tiled computed-trellis tile ---------------------------------------------------
+ *
+ * The resident tile above gives each lane one weight row and eight tokens, so each c4 step is one
+ * activation load, one weight load and one dot4: every activation dword feeds one row, and the
+ * tile's other fifteen rows load it again. At the 27B's ffn_gate_up (N = 34816, K = 5120) that is
+ * 256 activation dwords and 256 weight dwords for 256 dot4 a lane per K block, and the measured
+ * 15.6-17.3 TFLOP/s does not move when the trellis decode is split across the four waves (W33:
+ * 3-4 %), so the decode is not the limiter; the activation stream and the dot4 chain's latency are.
+ *
+ * Here each lane owns two tokens by four rows: an 8-output register tile. One c4 step is two
+ * activation dwords and four weight dwords feeding eight dot4, so an activation dword is consumed
+ * by four rows in registers instead of one, and the load count per dot4 falls from 2 to 0.75. The
+ * four row quads of a wave read the same activation pair (a 4-way broadcast). A 4x4 tile was
+ * measured on the rotated int8 grid first and is *not* used: its sixteen group sums plus sixteen
+ * accumulators spilled 88 VGPRs and ran 24-39 % slower; 2x4 is the widest tile that stays resident.
+ *
+ * The decode is the parallel stage above, so the kernel's registers hold the 2x4 compute instead of
+ * the 64-state decode. The arithmetic per (token, row) is the resident tile's, in the same order:
+ * each c4 accumulates in ascending k into the group's exact i32 sub, groups ascend, the group's
+ * two f32 factors multiply left to right, and the row scale is the epilogue's. The output is
+ * therefore bit-identical. A tail token past M loads the last real row (in bounds) and drops its
+ * store. GS = 1 only: the 27B's trunk is one 128-K scale a block.
+ */
+constexpr int kIqrPairWaves = 4;    /* 16-token slices a workgroup: 64 tokens a weight tile */
+constexpr int kIqrPairMinM = 128;   /* served prefill heights; below, the old tile skips idle
+                                     * tail outputs instead of clamping them */
+
+template <class F, int W>
+__global__ void __launch_bounds__(W * kIqrWave) R3D_WAVES(4)
+gemm_iqr_resident_pair_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
+                              const uint8_t* __restrict__ b, const uint8_t* __restrict__ bs,
+                              uint16_t* __restrict__ y, int M, int N, int K, int a_ld, int y_ld,
+                              uint32_t run_tiles) {
+    const uint32_t lane = threadIdx.x & (kIqrWave - 1);
+    const uint32_t wave = threadIdx.x / kIqrWave;
+    static_assert(F::KIND == kTrellisMad && F::LRB == 0,
+                  "the pair tile serves the computed trellis, one scale a row");
+    static_assert(W == 4, "the parallel stage gives each of four waves eight segments");
+    const uint32_t nkb = (uint32_t)(K / 128);
+    constexpr uint32_t kBlockTokens = 16u * (uint32_t)W;
+    const uint32_t nm = ((uint32_t)M + kBlockTokens - 1u) / kBlockTokens;
+    /* Consecutive blocks share a weight tile, so the L2 stream a group of blocks reads is one. */
+    const uint32_t rt = (uint32_t)blockIdx.x / nm;
+    const uint32_t m0 = ((uint32_t)blockIdx.x % nm) * kBlockTokens;
+    Ctx c;
+    c.W = b;
+    c.S = bs;
+    c.N = (uint32_t)N;
+    c.nkb = nkb;
+    c.run_tiles = run_tiles;
+    c.tab = nullptr;
+    c.ngrp = nkb;
+    c.gs = 1u;
+
+    __shared__ uint32_t sW[16 * kIqrSWPitch];
+    const int row0 = (int)rt * 16;
+
+    /* This lane's token pair and its quad of weight rows. */
+    const uint32_t tq = lane >> 2, rq = lane & 3u;
+    const uint32_t tm = m0 + wave * 16u + 2u * tq;
+    int mrow[2];
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+        const uint32_t mt = tm + (uint32_t)t;
+        mrow[t] = mt < (uint32_t)M ? (int)mt : M - 1;   /* tail: read in bounds, drop the store */
+    }
+    const int rbase = row0 + (int)(4u * rq);
+
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = 0.0f;
+
+    for (uint32_t kb = 0; kb < nkb; ++kb) {
+        stage_mad_parallel<F>(sW, c, rt, kb, wave, lane);
+        __syncthreads();
+
+        const int8_t* ap[2];
+#pragma unroll
+        for (int t = 0; t < 2; ++t)
+            ap[t] = a + (long long)mrow[t] * a_ld + (long long)kb * 128;
+        const uint32_t* wp = sW + (size_t)(4u * rq) * kIqrSWPitch;
+
+        int sub[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sub[i] = 0;
+#pragma unroll
+        for (int c4 = 0; c4 < 32; ++c4) {
+            uint32_t av[2], wv[4];
+#pragma unroll
+            for (int t = 0; t < 2; ++t) av[t] = *(const uint32_t*)(ap[t] + 4 * c4);
+#pragma unroll
+            for (int r = 0; r < 4; ++r) wv[r] = wp[(size_t)r * kIqrSWPitch + c4];
+#pragma unroll
+            for (int t = 0; t < 2; ++t)
+#pragma unroll
+                for (int r = 0; r < 4; ++r)
+                    sub[t * 4 + r] = dot4_i8(av[t], wv[r], sub[t * 4 + r]);
+        }
+        __syncthreads();
+
+        float sa[2], sb[4];
+#pragma unroll
+        for (int t = 0; t < 2; ++t) sa[t] = as[(size_t)mrow[t] * nkb + kb];
+#pragma unroll
+        for (int r = 0; r < 4; ++r) sb[r] = fold_f32<F>(c, (uint32_t)(rbase + r), kb);
+#pragma unroll
+        for (int t = 0; t < 2; ++t) {
+            if (tm + (uint32_t)t >= (uint32_t)M) continue;
+#pragma unroll
+            for (int r = 0; r < 4; ++r)
+                acc[t * 4 + r] += (float)sub[t * 4 + r] * sa[t] * sb[r];
+        }
+    }
+
+    float rs[4];
+#pragma unroll
+    for (int r = 0; r < 4; ++r) rs[r] = row_scale<F>(c, (uint32_t)(rbase + r));
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+        if (tm + (uint32_t)t >= (uint32_t)M) continue;
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+            y[(long long)mrow[t] * y_ld + rbase + r] = f32_to_bf16(acc[t * 4 + r] * rs[r]);
     }
 }
 
@@ -625,14 +792,38 @@ static int launch_resident_gs1(const uint8_t* b, const uint8_t* bs, long a, long
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+/* The register-tiled computed-trellis launch: one workgroup a (weight tile, 64-token block). */
+template <class F>
+static int launch_resident_pair(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
+                                int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream) {
+    constexpr int W = kIqrPairWaves;
+    const long long nt = N / 16;
+    const long long nm = ((long long)M + 16 * W - 1) / (16 * W);
+    const long long blocks = nt * nm;
+    if (blocks > 0x7FFFFFFFll) return -2;
+    const dim3 grid((unsigned)blocks), block(W * kIqrWave);
+    R3D_KLAUNCH(R3D_KNAME((gemm_iqr_resident_pair_kernel<F, W>)), grid, block, (hipStream_t)stream,
+                (const int8_t*)a, (const float*)as, b, bs, (uint16_t*)y, M, N, K, a_ld, y_ld,
+                run_tiles);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 /* The tiled row's dispatch: the same residency and wave-matrix switch for every form. */
 template <uint32_t KIND, uint32_t B, uint32_t LV, uint32_t L, uint32_t LRB, uint32_t SC,
           uint32_t GS = 1>
 static int launch_tiled_form(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int M,
                              int N, int K, int a_ld, int y_ld, uint32_t run_tiles, long stream) {
     using F = FormT<KIND, B, LV, L, LRB, SC>;
-    if constexpr (GS == 1)
+    if constexpr (GS == 1) {
+        /* The computed trellis's served prefill heights take the 2x4 register tile; below
+         * kIqrPairMinM its padded rows outweigh the load saving, so the old tile stays. */
+        if constexpr (F::KIND == kTrellisMad && F::LRB == 0) {
+            if (M >= kIqrPairMinM)
+                return launch_resident_pair<F>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles,
+                                               stream);
+        }
         return launch_resident_gs1<F>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
+    }
     if (M >= kIqrWmmaMinM) return launch_wmma<F, GS>(b, bs, a, as, y, M, N, K, a_ld, y_ld,
                                                     run_tiles, stream);
     return launch_resident<F, GS>(b, bs, a, as, y, M, N, K, a_ld, y_ld, run_tiles, stream);
