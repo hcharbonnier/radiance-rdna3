@@ -461,3 +461,22 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   toute variante passe par un drapeau et une revue R22. Et vérifier par la
   mesure, pas par l'arithmétique, qu'un chunk plus gros réduit le TTFT : sur
   Flash-Next le contraire est mesuré (+19 % à 3 252 tokens en un chunk).
+
+## W37 — `--tail-anchor off` (2026-11-18, livré opt-in)
+
+- **Livré** : `--tail-anchor on|off` (défaut `on`). Avec `off`, le cas court de
+  `tail_checkpoint` rend -1 : un prompt sous le premier intervalle s'exécute en
+  **un chunk** et n'écrit **aucun snapshot hors grille**. Aucun autre
+  changement (intervalle, quantum, `--prefix-resume`).
+- **Effet servi** (Flash-Next, même build, texte identique) : préfill 972 tok
+  **2 068 → 1 488 ms (1,39×)**, décodage −0,9 % (bruit) ; 3 252 tok neutre et
+  décodage identique.
+- **Prix** : la conversation courte re-préfille son prompt au tour suivant
+  (0 snapshot, `reason="no_snapshot"`), d'où le **défaut `on`**.
+- **Tests** : `sched_test` 548 964 (+12), `engine_e2e_test` 1 087 (+11),
+  `config_test` 2 927, suite complète verte, selftest 195/0/16.
+- **R45** — *décision (W37)* : le drapeau est la forme livrable de la fusion
+  de queue, et il reste **opt-in**. Un serveur conversationnel le laisse à
+  `on` (l'ancre courte sert M6/R22) ; un serveur à prompt unique ou orienté
+  préfill sur MoE le passe à `off` et gagne 1,39× sur les prompts de 256–1 024
+  tokens. Ne pas changer le défaut sans mesurer la reprise d'un tour appendu.

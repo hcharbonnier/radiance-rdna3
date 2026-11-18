@@ -249,7 +249,12 @@ aussi les chunks de 256–1 024 rangées — Flash-Next texte 972 tokens
 rendu au premier pas non stagé (`set_loan`), sans quoi le décodage perdait
 5–7 % (16 441 experts résidents au lieu de 16 802) : après correctif,
 **19,25 tok/s** à ctx 3 252 et **30,13** à 92 (≤ 1,2 % de l'arbre sans
-stager). R43 (> 2 % de décodage = refus) reste la règle. `final-all` est
+stager). R43 (> 2 % de décodage = refus) reste la règle. **W37** : le drapeau
+`--tail-anchor off` (défaut `on`) fait courir à un prompt sous le premier
+intervalle son dernier chunk entier et supprime l'ancre courte — Flash-Next
+972 tokens **2 068 → 1 488 ms (1,39×)**, texte identique, décodage inchangé,
+3 252 tokens neutre — au prix de la reprise courte du tour suivant (0
+snapshot). À laisser `on` sur un serveur conversationnel. `final-all` est
 l'arbre **W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ;
 détails dans `RAPPORT_REBASE_V2_1_0.md`.
 

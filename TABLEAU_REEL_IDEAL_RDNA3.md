@@ -745,3 +745,9 @@ plus gros = une copie en moins » est **fausse** ici : budget 4096 avec
 `checkpoint-interval` 4096 sur 3 252 tokens donne **5 453 → 6 486 ms (+19 %)**,
 la résidence coûtant plus que la copie épargnée (R44). Ne pas y toucher sans
 drapeau et revue R22.
+
+**W37 — `--tail-anchor off` (livré, opt-in).** Le drapeau fait courir à un
+prompt sous le premier intervalle son dernier chunk entier : préfill Flash-Next
+972 tokens **2 068 → 1 488 ms (1,39×)**, texte identique, décodage inchangé,
+3 252 tokens neutre. Prix : la reprise courte du tour suivant disparaît, d'où
+le défaut `on` (R45).

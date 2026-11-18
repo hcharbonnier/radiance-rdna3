@@ -1775,3 +1775,55 @@ gain *single-shot*, la seule forme acceptable est un drapeau
 défaut, et il faut d'abord écrire trois tests (ancre courte linéaire à I=2048
 dans `sched_test`, e2e froid/hit/tour appendu à I=2048, fixtures `--strict`).
 R44.
+
+## 2026-11-18 — W37 : `--tail-anchor off` (livré, opt-in)
+
+**Ce qui est livré.** Le drapeau `--tail-anchor on|off` (défaut `on`) coupe
+l'ancre courte de `Scheduler::tail_checkpoint` : avec `off`, un prompt sous le
+premier intervalle s'exécute en **un seul chunk** et n'écrit **aucun snapshot
+hors grille** (`scheduler.cpp`, `geometry.{h,cpp}`, `config.cpp`,
+`rad_core.h`). Rien ne change à l'intervalle ni au-delà : le checkpoint de fin
+d'intervalle est une fin de chunk, pas une ancre de queue. La ligne de
+démarrage le dit quand le drapeau est actif.
+
+**Mesure servi** (Flash-Next, même build, `flock`, `profile-ops` désactivé,
+texte glouton) :
+
+| cas | défaut | `--tail-anchor off` | |
+|---|---:|---:|---|
+| préfill 972 tok | 2 068 ms | **1 488 ms** | **1,39×** |
+| décodage ctx 972 | 16,09 tok/s | 15,94 | −0,9 % (dans le bruit) |
+| préfill 3 252 tok | 5 438 ms | 5 472 ms | neutre |
+| décodage ctx 3 252 | 11,10 tok/s | 11,10 | identique |
+| texte | — | — | **identique** aux deux tailles |
+
+Le gain est exactement la queue de 76 tokens : un balayage du plan d'experts
+en moins. C'est le seul levier de préfill qui restait, et il est cohérent avec
+la proposition de W36 (fusion de la queue) sans en payer le prix : l'ancre
+n'existe plus, donc rien ne peut être « recalculé dans une forme jamais
+exécutée ». Le prix est explicite et mesuré : la conversation courte
+re-préfille son prompt au tour suivant, ce que le e2e pin (0 snapshot,
+`no_snapshot` compté).
+
+**Tests** (les trois manquants de la proposition W36, adaptés) :
+- `sched_test` `a_prompt_under_the_interval_runs_one_chunk_with_the_tail_anchor_off` :
+  972 tokens / I=2048 → 896+76 et snapshot 896 par défaut, **un chunk** et
+  aucun snapshot avec le drapeau ; 3 000 tokens identiques dans les deux cas.
+  **548 964 checks** (+12).
+- `engine_e2e_test`
+  `a_conversation_under_one_interval_keeps_no_tail_snapshot_with_the_tail_anchor_off` :
+  600 tokens, aucun snapshot écrit, tour suivant sans reprise
+  (`reason="no_snapshot"`). **1 087 checks** (+11).
+- `config_test` : parse `on|off`, refus de `later`, ligne de rapport.
+  **2 927 checks**.
+
+Suite complète (`build-w37`, build neuf) : `engine_e2e_test` 1 087 (3 skips),
+`fixture_test` 109 671, `iqr_device_test` 76/11, `ple_hc_device_test` 58/10,
+`moe_iqr_device_test` 15/15, `vision_rows_device_test` 66/10,
+`attn_paged_device_test` 8/9, tous les autres device verts, `r3d_selftest`
+**195 rows, 0 échec, 16 skips**.
+
+**Quand l'utiliser** : serveur à prompt unique ou orienté préfill (batch
+d'évaluation, génération longue) sur un modèle MoE où chaque chunk balaie le
+plan d'experts. Le laisser **off** sur un serveur conversationnel : c'est là
+que l'ancre courte fait son travail (M6, R22).
