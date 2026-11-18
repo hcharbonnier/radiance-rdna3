@@ -27,8 +27,10 @@
 #include <dlfcn.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -588,6 +590,143 @@ TEST(vision_rows_refuse_unsupported_calls) {
         t[0] = ten(dx.p, RAD_BF16, { 3, 4 });
         t[0].stride[1] = 2;
         CHECK_EQ(run(kx, t, p), RAD_E_STRIDE);
+    }
+}
+
+/* ---- attn_dense hd72 device timing -------------------------------------------------------- */
+
+/* Device timing for the vision tower's dense attention, no oracle: warm up, then the fastest of
+ * three batches, as attn_paged_device_test's RAD_ATTN_BENCH mode does. `rows` is the q plane's
+ * extent, `heads` its query heads, `cu` bounds the real segments, and `msl` is the band's
+ * `max_seqlen` (0 omits it). The FLOP count is 4 * sum(len^2) * head_dim over the cu segments,
+ * all heads (QK^T and PV); the per-head figure the profile-ops report uses omits the head count.
+ * The kbench reference case is one head (four 512 x 72 bf16 planes), so both are measured. */
+bool bench_attn_dense(const char* name, int rows, int heads, const std::vector<int32_t>& cu,
+                      int msl, int iters) {
+    /* RAD_ATTN_DENSE_ONLY narrows the matrix to the cases whose name contains it, so a counter
+     * run or a quick re-measure pays one geometry instead of the whole walk. */
+    if (const char* only = std::getenv("RAD_ATTN_DENSE_ONLY")) {
+        if (!std::strstr(name, only)) return true;
+    }
+    if (const char* only_rows = std::getenv("RAD_ATTN_DENSE_ROWS")) {
+        if (std::atoi(only_rows) != rows) return true;
+    }
+    const RadKernelInfo* kd = g_r3d.find("attn_dense", RAD_DOMAIN_DEVICE, "attn_dense_bf16_h72");
+    if (!kd) return true;
+    const int hd = 72, nh = heads, gqa = 1;
+    const size_t n = (size_t)rows * nh * hd;
+    std::vector<uint16_t> q(n), k(n), v(n, 0x3c00u);
+    std::mt19937 rng(91u + (unsigned)rows);
+    std::uniform_int_distribution<int> U(-1024, 1024);
+    for (size_t i = 0; i < n; ++i) {
+        q[i] = bfv((float)U(rng) / 1024.0f);
+        k[i] = bfv((float)U(rng) / 1024.0f);
+    }
+    Dev dq(n * 2), dk(n * 2), dv(n * 2), dout(n * 2), dcu(cu.size() * 4);
+    up(dq, q.data(), dq.bytes);
+    up(dk, k.data(), dk.bytes);
+    up(dv, v.data(), dv.bytes);
+    up(dcu, cu.data(), dcu.bytes);
+
+    std::vector<RadParam> p{ pi("head_dim", hd), pi("gqa", gqa), pi("causal", 0),
+                             ps("dtype", "bf16") };
+    if (msl > 0) p.push_back(pi("max_seqlen", msl));
+    std::vector<RadTensor> t{
+        ten(dq.p, RAD_BF16, { rows, nh, hd }), ten(dk.p, RAD_BF16, { rows, nh, hd }),
+        ten(dv.p, RAD_BF16, { rows, nh, hd }), ten(dcu.p, RAD_I32, { (long long)cu.size() }),
+        ten(dout.p, RAD_BF16, { rows, nh, hd })
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof a);
+    a.t = t.data();
+    a.n_t = (int)t.size();
+    a.p = p.data();
+    a.n_p = (int)p.size();
+    a.kv_used_max_h = -1;
+
+    const int rc = kd->launch(&a, (RadStream)0);
+    hipDeviceSynchronize();
+    if (rc != RAD_OK) {
+        std::fprintf(stderr, "attn_dense bench %s: launch returned %d\n", name, rc);
+        return false;
+    }
+    for (int i = 0; i < 2; ++i) kd->launch(&a, (RadStream)0);
+    hipDeviceSynchronize();
+
+    float best = 1e30f;
+    for (int batch = 0; batch < 3; ++batch) {
+        hipEvent_t e0, e1;
+        hipEventCreate(&e0);
+        hipEventCreate(&e1);
+        hipEventRecord(e0, (hipStream_t)0);
+        for (int i = 0; i < iters; ++i) kd->launch(&a, (RadStream)0);
+        hipEventRecord(e1, (hipStream_t)0);
+        hipEventSynchronize(e1);
+        float ms = 0.0f;
+        hipEventElapsedTime(&ms, e0, e1);
+        hipEventDestroy(e0);
+        hipEventDestroy(e1);
+        best = std::min(best, ms / (float)iters);
+    }
+
+    /* The real segment rows are the cu spans, not the padded plane; a many-segment pass does
+     * sum(len^2) key pairs, not total^2. */
+    double sq = 0.0;
+    for (size_t s = 0; s + 1 < cu.size(); ++s) {
+        const double len = (double)(cu[s + 1] - cu[s]);
+        sq += len * len;
+    }
+    const double flops = 4.0 * sq * (double)hd * (double)nh;
+    const double us = (double)best * 1000.0;
+    std::printf("VISIONBENCH %-28s rows=%5d nh=%2d cu=%zu keys=%9.0f msl=%5d  %9.1f us  "
+                "%7.1f GFLOP/s all heads  %6.1f GFLOP/s a head\n",
+                name, rows, nh, cu.size() - 1, sq, msl, us, flops / (us * 1e3),
+                flops / (double)nh / (us * 1e3));
+    return true;
+}
+
+/* RAD_ATTN_DENSE_BENCH=1 walks M=512..16384 at one and sixteen heads, plus the served launch's
+ * declared band and a many-segment pass. The 512/one-head case is the kbench reference; the
+ * padded and many-segment cases separate the key walk's length from the workgroup count and from
+ * the declared band. */
+TEST(attn_dense_hd72_device_timing) {
+    if (!std::getenv("RAD_ATTN_DENSE_BENCH")) return;
+    if (!ready()) return;
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess || nd < 1) {
+        radtest::skip("attn_dense bench: no device visible");
+        return;
+    }
+    hipDeviceProp_t prop;
+    std::memset(&prop, 0, sizeof prop);
+    if (hipGetDeviceProperties(&prop, 0) != hipSuccess) {
+        radtest::skip("attn_dense bench: device properties unavailable");
+        return;
+    }
+    /* HIP reports the WGP count on RDNA, not the 96 CUs rocminfo lists. */
+    std::printf("VISIONBENCH device=%s wgp=%d clock=%d kHz\n", prop.name,
+                prop.multiProcessorCount, prop.clockRate);
+
+    for (int M : { 512, 1024, 2048, 4096, 16384 })
+        CHECK(bench_attn_dense("one segment, 1 head", M, 1, { 0, M }, M,
+                               M <= 1024 ? 20 : (M <= 4096 ? 4 : 2)));
+
+    for (int M : { 512, 1024, 2048, 4096, 16384 })
+        CHECK(bench_attn_dense("one segment, 16 heads", M, 16, { 0, M }, M,
+                               M <= 1024 ? 20 : (M <= 4096 ? 4 : 2)));
+
+    /* The served launch declares max_seqlen 16384 with a 4096-row plane: the shim drops a band
+     * past the row count, so the grid is the same as the unpadded case. */
+    CHECK(bench_attn_dense("msl 16384, 4096 rows", 4096, 16, { 0, 4096 }, 16384, 4));
+
+    /* A q plane padded to the declared band, one real segment of 4096 rows. */
+    CHECK(bench_attn_dense("padded plane 16384", 16384, 16, { 0, 4096 }, 16384, 4));
+
+    /* The same work as 32 segments of 128 rows: many short walks, 512 workgroups. */
+    {
+        std::vector<int32_t> cu;
+        for (int s = 0; s <= 32; ++s) cu.push_back(s * 128);
+        CHECK(bench_attn_dense("32 segments of 128", 4096, 16, cu, 128, 4));
     }
 }
 
