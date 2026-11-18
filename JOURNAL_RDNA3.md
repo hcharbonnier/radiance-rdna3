@@ -1952,3 +1952,25 @@ sont déclarées f32 alors que le conteneur les stocke en bf16, ce qui exige un
 
 Artefacts : `<work-root>/work/w38-results/ns27b/` (refus W38),
 `ns27b39/`, `ns27b39v/` (build-w39), `w39-27b-targeted.{md,log}`.
+
+**Contrôles du changement** : texte 27B `NS=0` **identique** entre `build-w38`
+et `build-w39` (même prompt 2 047 tokens, 64 tokens gloutons, 309 caractères
+au bit) ; sweep 27B **entier** sur `build-w39` — **3 181/3 181**, 0 échec,
+0 divergence, pire `rel_l2` 3,619e-03 (identique à W38) ; ciblé
+(`attn_paged`, `gemm_nt_q`, `mtp_enter`, `logit_rerank`, `dflash_conv`)
+**854/854**.
+
+**Vision re-mesurée** sur l'arbre de référence (`build-w38`, sans
+`profile-ops`) : image 1 024² → 1 045 tokens, **TTFT 3,28 s** (contre 4,05 s
+daté W32) ; 2 048² → 4 117 tokens, **TTFT 16,33 s** (contre 16,97 s). Le gain
+de 1 024² vient des lots W33–W34 (tuile trellis, stager dès 256 rangées, ancre
+de queue par défaut), pas d'un changement de ce lot. Les textes restent
+cohérents.
+
+**Flash-Next, décodage re-mesuré** sur `build-w38` (prompt 3 252 tokens,
+64 tokens générés, un serveur neuf par configuration) : `NS=0`
+**11,03 tok/s** (préfill 5 473 ms), `NS=3` **19,29 tok/s** (préfill
+6 003 ms, **+9,7 %** : la passe de contexte du drafter se paie au préfill),
+texte **identique** (313 caractères). Les chiffres de §5.2 d'`AGENTS.md`
+(11,10 / 19,25) sont donc toujours justes ; le coût de préfill du MTP, lui,
+n'était pas chiffré.

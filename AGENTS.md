@@ -214,8 +214,9 @@ octets opaques, pitches larges) ; `mtp_enter_e4m3_device_test` et
 `logit_rerank_iqr_device_test` couvrent le MTP (22 + 36 checks). MTP servi à
 `NS=3` : 4,51 → 8,21 tok/s (1,82×), texte identique, acceptation 40,3 %. Vision : build **`-DRAD_WITH_FFMPEG=ON`**
 (libavformat 62.3), `capabilities.image=true`, image 512² → 256 tokens,
-1024² → 1 024, 2048² → 4 096 (un pass complet, TTFT ~121 s) ; au-delà de
-`image-max-pixels` l'image est réduite à 2048², pas refusée. La tour
+1024² → 1 024, 2048² → 4 096 (TTFT servi 3,3 s / 16,3 s, mesuré W38 sur
+`build-w38`) ; au-delà de `image-max-pixels` l'image est réduite à 2048², pas
+refusée. La tour
 (856,68 Mio) est en VRAM, le staging média 48,27 Mio.
 
 État **rebasé** (2026-11-17, `main` v2.1.0 `3045979`, branche `rdna3-iqr`) :
@@ -286,7 +287,8 @@ en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
 - **Passes média** : une image au-delà de `image-max-pixels` (4 194 304 px) est
   redimensionnée à 2048², pas refusée ; le watchdog peut journaliser
   « nothing has been logged for 20/40 s » (`core/engine.cpp:1307`) pendant une
-  passe de ~121 s, c'est du bruit. `THROTTLE_STATUS` d'`amd-smi` vaut
+  passe longue (121 s à l'arrivée de la vision, 16 s depuis W32), c'est du
+  bruit. `THROTTLE_STATUS` d'`amd-smi` vaut
   `THROTTLED` même au repos ici : suivre puissance et fréquence.
 - Les cas `ngram_hint` restent sans oracle : leur « Not covered » n'est pas une
   régression. Les cas **MTP 48** sont en revanche exigibles depuis l'ADR-7

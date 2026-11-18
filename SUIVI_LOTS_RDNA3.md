@@ -534,3 +534,13 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   une row device `dflash_conv`. Le prérequis KV est livré, le reste est du
   noyau (hors périmètre sans feu vert). Le 27B reste servi à `NS=0`
   (**15,4 tok/s** à 2 047 tokens).
+- **Contrôles du changement** : texte 27B `NS=0` identique entre `build-w38` et
+  `build-w39` ; sweep 27B entier sur `build-w39` **3 181/3 181**, 0 échec,
+  0 divergence, même pire `rel_l2` ; ciblé 854/854.
+- **Vision re-mesurée** (`build-w38`, sans `profile-ops`) : 1 024² →
+  **TTFT 3,28 s** (W32 : 4,05 s), 2 048² → **16,33 s** (W32 : 16,97 s) ; le
+  gain du petit cas vient de W33–W34 (trellis, stager, ancre de queue).
+- **Flash-Next décodage re-mesuré** (`build-w38`, 3 252 tokens, 64 générés) :
+  `NS=0` 11,03 tok/s, `NS=3` **19,29 tok/s** (1,75×), texte identique ; le
+  préfill paie **+9,7 %** (5 473 → 6 003 ms) pour la passe de contexte du
+  drafter.
