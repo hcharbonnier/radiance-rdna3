@@ -480,3 +480,36 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   `on` (l'ancre courte sert M6/R22) ; un serveur à prompt unique ou orienté
   préfill sur MoE le passe à `off` et gagne 1,39× sur les prompts de 256–1 024
   tokens. Ne pas changer le défaut sans mesurer la reprise d'un tour appendu.
+
+## W38 — jalon validation : kbench complet, strict, `--tail-anchor` (2026-11-18, aucun code)
+
+- **But** : solder la dette de mesure de W30–W37 sur un build neuf (`6d9084b`
+  rsyncé, `build-w38` Release/gfx1100/FFmpeg, cache de tune recopié) : les
+  compteurs kbench d'`AGENTS.md` dataient de W29, et seuls des runs ciblés
+  avaient été refaits après `hc_read` (W31/W32), `gemm_nt_bias` (W31) et la
+  tuile trellis de `gemm_nt_q` (W33).
+- **kbench complet, `--bench`, un conteneur à la fois** : 27B **3 181/3 181**,
+  MiniCPM **1 802/1 802**, Flash-Next **4 786/4 786** — 0 échec,
+  0 divergence, comptes **identiques** à W29, pires `rel_l2` identiques
+  (3,619e-03 / 3,485e-03 / 1,520e-02). 542 + 368 + 2 310 s de carte.
+- **Replay strict des fixtures** (forme du ctest `kbench_ref`, `libref` seul,
+  `--strict --coverage data/kbench_rows`) : **1 134/1 134**, 0 stale,
+  0 divergence, pire `rel_l2` 3,442e-03, exit 0, 80 s. `fixture_test` n'a pas
+  d'option `--strict` : la commande juste est celle du ctest.
+- **Suite de tests** : compteurs de W37 reproduits au chiffre près
+  (`sched_test` 548 964, `engine_e2e_test` 1 087/3 skips, `fixture_test`
+  109 671, `config_test` 2 927, tous les device verts, selftest **195/0/16**).
+- **`--tail-anchor off` mesuré à 1 536/2 047/2 048** (payloads identiques entre
+  modes, nonce neuf par probe, `cache_n = 0`, `prompt_n` exact par bissection,
+  deux réplicats) : Flash-Next **1,16–1,18×** à 1 536, **1,16×** à 2 047,
+  **1,02×** à 2 048 ; 27B **1,07–1,08×**, **1,06×**, **1,01×**. Textes
+  identiques sur les 12 paires ; décodage inchangé (NS=0, 8 tokens).
+- **Décision** : jalon validation de la §6.A du handover W37 **clos**. Le
+  prochain levier est la recette 27B en `NS=3` (gain servi potentiel ~1,5×,
+  effort faible), puis `hc_read` (1,7× vers son plancher) ; la vision reste
+  une décision de contrat.
+- **R46** — *règle (W38)* : le gain de `--tail-anchor off` vit dans
+  `(kShortTailMin, I)` quand le dernier chunk est partiel (1,39× à 972,
+  1,16–1,18× à 1 536, 1,16× à 2 047) et **disparaît à exactement I**
+  (1,01–1,02×) : un intervalle plein n'a pas de queue partielle à ancrer.
+  Ne pas attendre de gain au-delà de I, ne pas conclure à une régression.

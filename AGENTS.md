@@ -203,7 +203,12 @@ flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
 **948/948** (4 946/4 946 en `--bench` dans les deux modes, W24), MiniCPM5-2B
 **384/384** et 27B **653/653**, 0 échec, 0 divergence (pires rel_l2 1,206e-02,
 1,810e-03, 3,619e-03) ; le nombre de cas suit les rows résolues, pas la
-couverture. Test de contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
+couverture. **Sweep complet rejoué en W38** sur un build neuf (`build-w38`,
+`6d9084b`) : 27B **3 181/3 181**, Flash-Next **4 786/4 786**, MiniCPM
+**1 802/1 802**, 0 échec, 0 divergence, mêmes pires `rel_l2` ; replay
+`--strict` des fixtures (`rad-kbench --kernels libref`, forme du ctest
+`kbench_ref`) **1 134/1 134** — `fixture_test` n'a pas d'option `--strict`.
+Test de contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
 `gather_rows_u8_device_test` couvre les rows u8 du tier KV (fragment 4 128 octets,
 octets opaques, pitches larges) ; `mtp_enter_e4m3_device_test` et
 `logit_rerank_iqr_device_test` couvrent le MTP (22 + 36 checks). MTP servi à

@@ -1827,3 +1827,76 @@ Suite complète (`build-w37`, build neuf) : `engine_e2e_test` 1 087 (3 skips),
 d'évaluation, génération longue) sur un modèle MoE où chaque chunk balaie le
 plan d'experts. Le laisser **off** sur un serveur conversationnel : c'est là
 que l'ancre courte fait son travail (M6, R22).
+
+## 2026-11-18 — W38 : jalon validation (kbench complet, replay strict, `--tail-anchor` à 1 536/2 047/2 048)
+
+**Arbre et build.** `6d9084b` rsyncé vers `w29-rebase`, build **neuf**
+`build-w38` (Release, `-DRAD_GPU_TARGETS=gfx1100 -DRAD_WITH_FFMPEG=ON`), cache
+de tune de `build-clean` recopié (**36 rows** chargées au démarrage). Aucun
+changement de code : ce lot mesure, il ne livre rien.
+
+**Suite de tests de la §5.5** — identique au bit aux compteurs de W37 sur un
+build neuf : `sched_test` **548 964 / 213**, `engine_e2e_test` **1 087 / 52**
+(3 skips), `fixture_test` **109 671 / 59**, `config_test` **2 927 / 71**,
+`iqr_device_test` 76/11, `ple_hc_device_test` 58/10, `moe_iqr_device_test`
+15/15, `vision_rows_device_test` 66/10, `attn_paged_device_test` 8/9,
+`logits_bf16_device_test` 8/4, `gather_rows_u8_device_test` 33/3,
+`mtp_enter_e4m3_device_test` 22/3, `logit_rerank_iqr_device_test` 36/5,
+`act_i8g_group256_device_test` 103/6, `tp2_collectives_device_test` 12/2,
+`r3d_selftest` **195 rows, 0 échec, 16 skips**.
+
+**kbench complet, trois conteneurs** (`--bench`, un conteneur à la fois sous
+`flock`, `build-w38`) :
+
+| conteneur | cas | échecs | divergences | pire `rel_l2` | mur |
+|---|---:|---:|---:|---:|---:|
+| 27B (iq4r-l) | **3 181 / 3 181** | 0 | 0 | 3,619e-03 | 542 s |
+| MiniCPM5-2B (IQ8R) | **1 802 / 1 802** | 0 | 0 | 3,485e-03 | 368 s |
+| Flash-Next (IQR v4) | **4 786 / 4 786** | 0 | 0 | 1,520e-02 | 2 310 s |
+
+Comptes **identiques** à la référence W29 d'`AGENTS.md`, pires `rel_l2`
+identiques : `hc_read` (W31/W32), `gemm_nt_bias` (W31) et la tuile trellis de
+`gemm_nt_q` (W33) ne dégradent rien. Les `skipped` restent ceux des oracles
+absents (`gemm_nt_q`/`gemm_nt_q_gated` décrits par `libref` lui-même,
+`gated_had_quant_i8g`, `rmsnorm_had_quant_i8g`, `ngram_hint` x8).
+
+**Replay strict des fixtures** (la forme du ctest `kbench_ref` :
+`rad-kbench --kernels libref --max-cases 1 --strict --coverage data/kbench_rows
+--fixture …/kernels.rkb --fixture …/kernels_moe.rkb`) : **1 134 / 1 134**,
+0 échec, 0 stale, 0 divergence, 211 capped, pire `rel_l2` 3,442e-03, 80 s.
+`fixture_test` n'a **pas** d'option `--strict` (usage : `[pattern...] [--list]
+[--shard i/n]`) : la ligne de la §6.A.3 du handover W37 est corrigée.
+
+**`--tail-anchor off` au-delà de 972 tokens.** Protocole : cache de préfixe
+**actif** (le drapeau n'agit que si `prefix_cache` est vrai,
+`scheduler.cpp:1306`), mais chaque requête porte un **nonce de tête neuf** :
+`cache_n = 0` et `prompt_n` exact sont vérifiés sur chaque point ; la longueur
+en caractères est calibrée par **bissection** sur `prompt_n` (les pas de 5
+caractères sautent de 2–3 tokens aux frontières BPE, 2 048 était inatteignable
+par pas fixes). Le payload gagnant du serveur `on` est **rejoué à
+l'identique** sur le serveur `off` (`temperature 0`, `max_tokens 8`), donc les
+textes sont comparables. Deux réplicats indépendants (nonces différents,
+serveurs relancés) :
+
+| modèle | prompt | `on` (ms) | `off` (ms) | gain | texte |
+|---|---:|---:|---:|---:|---|
+| Flash-Next | 1 536 | 2 646 / 2 704 | 2 282 / 2 298 | **1,16–1,18×** | identique |
+| Flash-Next | 2 047 | 3 395 / 3 434 | 2 938 / 2 968 | **1,16×** | identique |
+| Flash-Next | 2 048 | 3 000 / 3 025 | 2 952 / 2 978 | 1,02× (neutre) | identique |
+| 27B | 1 536 | 3 368 / 3 394 | 3 154 / 3 147 | **1,07–1,08×** | identique |
+| 27B | 2 047 | 4 810 / 4 830 | 4 554 / 4 554 | **1,06×** | identique |
+| 27B | 2 048 | 4 616 / 4 618 | 4 576 / 4 571 | 1,01× (neutre) | identique |
+
+Le décodage (`NS=0`, 8 tokens générés : **indicatif**) ne bouge pas
+(13,2–14,6 tok/s Flash-Next, 17,1–19,3 27B), et les textes sont identiques sur
+les 12 paires.
+
+- **R46** — *règle (W38)* : le gain de `--tail-anchor off` vit dans
+  `(kShortTailMin, I)` quand le dernier chunk est **partiel** : 1,39× à 972,
+  1,16–1,18× à 1 536, 1,16× à 2 047, puis **1,01–1,02× à exactement I**. À
+  un intervalle plein il n'y a pas de queue partielle à ancrer : `on` et `off`
+  convergent. Attendre un gain au-delà de I est une erreur d'arithmétique,
+  pas une régression.
+
+Artefacts : `<work-root>/work/w38-results/{flashnext,dense27b,minicpm}.{md,log}`,
+`strict.log`, `ta4/`, `ta5/`.
