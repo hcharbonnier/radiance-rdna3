@@ -1429,6 +1429,10 @@ Lecture :
   M=512 (350,7 µs) mais **19 GFLOP/s à 4 096** (251 ms/couche, 11× pire par
   FLOP), non causal, `gqa=1`, `max_seqlen=16384` déclaré. Aucun changement de
   contrat n'est nécessaire pour corriger ça (même ordre arithmétique).
+  **Corrigé en W31 : ce chiffre est faux** — la forme servie est 16 384 patches
+  × 16 têtes, la row fait **5,30 TFLOP/s** et son efficacité monte avec M ; il
+  n'y a pas d'effondrement, et les variantes de scheduling sont neutres. Voir
+  l'entrée W31.
 - **`hc_read` reste un poste de préfill** : 2,84 s par chunk de 972 tokens
   (53 %), 11,3 s à 4 098 tokens, soit 28 µs par rangée et par site — ~4,6× le
   plancher de ses 630 Mo de matrices relues.
@@ -1436,3 +1440,84 @@ Lecture :
   à 17,2 TFLOP/s, c'est-à-dire son noyau ; le gagner demande de gagner le
   noyau IQR tiled (16,8 → 23,5 TFLOP/s pour notre propre tuile bf16).
 
+## 2026-11-18 — W31 : vision et préfill, trois noyaux (agents parallèles)
+
+**Correction d'abord.** Le profil de W30 annonçait `attn_dense` à « 19 GFLOP/s
+à M=4096 » puis un effondrement : c'était une **erreur de comptage**. La forme
+servie par la tour est **16 384 patches × 16 têtes** (4 096 est le nombre de
+tokens après le merger), soit 1,237 TFLOP par couche. La row fait **5,30
+TFLOP/s** à cette forme, et son efficacité **monte** avec M (3,03 à 512×16,
+4,71 à 4 096×16, 5,30 à 16 384×16). Ce n'est pas un effondrement : c'est 53 %
+de sa borne d'issue VALU (~435 instructions VALU par clé et par thread, sans
+FMA, avec le recalcul du max imposé par le bit-exact). Variantes mesurées et
+**rejetées** : 256 threads/bloc 238,2 ms, kStage 32 235,4, waves/EU 2 239,5,
+waves/EU 6 239,7, VOPD 236,1 (baseline 235,3). Aucun noyau modifié ; seul un
+**mode temps** est ajouté (`RAD_ATTN_DENSE_BENCH=1`), qui couvre 1 et 16 têtes
+et les segments `cu`, avec le compte de FLOPs correct. Pour ≤ 50 ms il faudrait
+le FMA (ou une softmax en une passe) : **décision de contrat**, pas de
+scheduling.
+
+**`hc_read` — tuilage par rangées (bit-exact).** Cause mesurée : le coût était
+**par rangée**, pas par octet (hot et cold à moins de 3 %) ; `hc_down` ne
+gardait que 16 lanes actives sur 256 et chaque rangée relisait la matrice
+entière (108 octets lus par octet de matrice à M=108). Un workgroup `down`
+couvre maintenant 32 sorties × 8 rangées, un `up` 32 colonnes × 8 rangées ;
+la tranche stagée sert les 8 rangées ; les noyaux W28 à une rangée par bloc
+sont **conservés** sous une tuile (M < 8, décodage).
+
+| `hc_read` M | avant (hot, µs) | après | gain |
+|---:|---:|---:|---:|
+| 1 | 400,3 | 399,2 | 1,00 |
+| 128 | 3 766,1 | **1 297,5** | 2,9× |
+| 512 | 14 894,5 | **5 656,8** | 2,6× |
+| 1 024 | 27 929,6 | **10 787,4** | 2,6× |
+| 4 096 | 107 975,6 | **38 263,7** | 2,8× |
+
+`ple_hc_device_test` **58 checks/10 cas** (dont un oracle E4M3, M=10 pour la
+tuile partielle), bit-identique sur x/inj/q/rq/scales.
+
+**`gemm_nt_bias_bf16` — tuile bf16 (bit-exact).** Cause : l'ancien noyau stagait
+les opérandes en **f32** avec un pitch de 128 f32 (multiple de 32 mots), soit
+un conflit de banques 16 voies, 3 LDS par 2 MAC et une seule chaîne de deux
+colonnes par thread. Nouveau : staging **bf16** k-major, pitchs 36/68
+halfwords, tuile 32×64, 128 threads, **4 rangées × 4 colonnes par thread**
+(16 chaînes indépendantes), mul et add séparés (`-ffp-contract=off`).
+
+| forme | avant | après | gain |
+|---|---:|---:|---:|
+| 512×1152×1536 | 2 857,2 µs (0,63 TF/s) | **259,8 µs (6,97)** | 11,0× |
+| 1 045×1152×1152 + res | 3 332,0 µs (0,83) | **385,1 µs (7,20)** | 8,7× |
+| 1 024×4 608×4 608 gelu | 44 971 µs (0,97) | **6 251,9 µs (6,96)** | 7,2× |
+
+kbench ciblé : **140/140**, `rel_l2` libr3d **0,00e+00** sur tous les M ; la row
+est désormais **2,3–2,5× plus rapide que libavx** (« libavx 2,8× mieux » est
+inversé). Le plafond bit-exact est ~11 TF/s (mix 2,75 instructions/MAC) ; on en
+tient 63–66 %. Le repère 23,5 TF/s est le chemin `dot2`, **non** bit-exact.
+
+**Effet servi** (`profile-ops`, même protocole, NS=0, `build-w31`) :
+
+| cas | avant (W30) | après (W31) | |
+|---|---:|---:|---|
+| Flash-Next texte 972 tok, TTFT | 4,78 s | **3,13 s** | −34 % |
+| Flash-Next texte 3 252 tok, préfill | 13,56 s | **8,19 s** | −40 % |
+| Flash-Next image 1 024², TTFT | 9,58 s | **4,66 s** | −51 % |
+| Flash-Next image 2 048², TTFT | 39,2 s | **19,1 s** | −51 % |
+| 27B texte 3 252 tok, TTFT | 11,44 s | 11,39 s | — (IQR 88 %) |
+
+Détail de la passe 2 048² : `attn_dense` 6,54 s (inchangé), `hc_read` 11,28 →
+**4,01 s**, `gemm_nt_bias` 14,71 → **2,12 s**, `moe_gemm_q` 2,98 s,
+`attn_paged` 1,82 s. Texte servi **identique au bit** : Flash-Next 3 252
+tokens (32 tokens générés, drafts 19/39) et 27B 372 tokens.
+
+**Validation** : `sched_test` 548 952, `engine_e2e_test` 1 076 (3 skips),
+`fixture_test` 109 671, `iqr_device_test` 76, `vision_rows_device_test` 66/10
+(79 avec les deux modes temps), `ple_hc_device_test` 58/10, tous les autres
+tests device verts, `r3d_selftest` **195 rows, 0 échec, 16 skips**. Branches
+agents fusionnées : `735ed0f` (bench attn_dense), `d724d55` (hc_read),
+`6c26c24` (gemm vision), `e80e87d` (bench vision).
+
+**Reste.** Vision : `attn_dense` (6,5 s d'une passe 2 048²) ne peut descendre
+qu'avec un changement de contrat (FMA ou softmax en une passe) ; la piste
+« lane = clé » avec scores en LDS viserait ~124 ms au mieux. Préfill
+Flash-Next : `moe_gemm_q` est désormais 46 % d'un préfill de 972 tokens, et
+`hc_read` 33 % ; le 27B reste borné par la tuile IQR.

@@ -277,3 +277,38 @@ vision sont revenus dans la cible le 2026-11-16 (ADR-7).
   décodage. Ne pas promettre un texte bit-identique à travers deux
   compositions de lot.
 
+## W31 — vision et préfill, trois noyaux (2026-11-18)
+
+Trois agents en worktrees séparés, chacun sur son arbre hôte, tous les runs
+sous le même `flock` (aucun bench concurrent).
+
+- **Livré `hc_read`** : tuilage par rangées (32 sorties × 8 rangées en `down`,
+  32 colonnes × 8 rangées en `up`), noyaux W28 à une rangée conservés sous une
+  tuile (décodage). **2,6–2,9×** à M ≥ 128 (128 : 3 766 → 1 298 µs ; 4 096 :
+  107 976 → 38 264), M=1 inchangé (400,3 → 399,2), **bit-exact**.
+- **Livré `gemm_nt_bias`** : staging bf16 k-major, tuile 32×64, 4×4 par thread,
+  pitchs 36/68 halfwords (plus de conflit 16 voies), mul/add séparés.
+  **8,7–11×** (1 045×1152×1152 : 3 332 → 385 µs, 7,20 TFLOP/s), **0 ulp**,
+  kbench 140/140 `rel_l2 = 0` ; la row est désormais 2,3–2,5× plus rapide que
+  libavx.
+- **Mesuré `attn_dense`, aucun noyau changé** : la forme servie est 16 384
+  patches × 16 têtes, la row fait **5,30 TFLOP/s** (efficacité croissante avec
+  M), soit 53 % de sa borne d'issue VALU ; les variantes de scheduling sont
+  neutres. Mode temps ajouté (`RAD_ATTN_DENSE_BENCH=1`).
+- **Effet servi** : Flash-Next texte 972 tok 4,78 → **3,13 s** ; 3 252 tok
+  13,56 → **8,19 s** ; image 1 024² 9,58 → **4,66 s** ; image 2 048² 39,2 →
+  **19,1 s** ; 27B inchangé (IQR 88 %). Texte servi identique au bit.
+- **Validation** : tous les tests verts, `r3d_selftest` 195/0/16.
+- **R37** — *correction (W31)* : le « 19 GFLOP/s à M=4096 » de W30 était un
+  comptage faux (16 têtes et 16 384 patches oubliés). `attn_dense` n'est pas
+  effondré : 5,30 TFLOP/s à la forme servie. Ne pas rouvrir un chantier
+  scheduling sur cette base ; pour aller plus vite il faut le FMA ou une
+  softmax en une passe (contrat).
+- **R38** — *décision (W31)* : le contrat **bit-exact** de `gemm_nt_bias` est
+  tenu en gagnant 8–11×. La référence libr4d (`gemm_bf16_nt_bias_tiled`) est
+  tuilée fp32 et ne promet pas le bit-exact, mais rien n'oblige à s'en écarter :
+  le plafond bit-exact est ~11 TFLOP/s (mix 2,75 instr/MAC). Ne pas passer au
+  chemin `dot2` (23,5 TFLOP/s) sans décision explicite de contrat.
+- **Reste** : `moe_gemm_q` est devenu le premier poste du préfill Flash-Next
+  (46 % à 972 tokens) ; `hc_read` garde 1,7× vers son plancher ; `attn_dense`
+  1,3–1,9× sans contrat ; le 27B reste borné par la tuile IQR.

@@ -695,26 +695,33 @@ défaut de parallélisme. Pas de chantier multi-rangées.
 
 ## Profil servi 2026-11-18 — réel / idéal par poste
 
-`profile-ops`, `RADIANCE_PROFILE_EVERY=1`, `build-opt`, une requête par cas,
-NS=0. Les temps sont gonflés par les barrières du mode ; les parts sont la
-lecture, et les débits sont calculés sur les FLOPs utiles.
+`profile-ops`, `RADIANCE_PROFILE_EVERY=1`, une requête par cas, NS=0. Les
+temps sont gonflés par les barrières du mode ; les parts sont la lecture, et
+les débits sont calculés sur les FLOPs utiles. Colonne « réel » = état **W31**
+(noyaux `hc_read` et `gemm_nt_bias` refaits) ; les chiffres W30 sont rappelés
+quand ils changent la conclusion.
 
-| poste (cas) | réel | idéal (borne) | écart | cause | levier |
-|---|---:|---:|---:|---|---|
-| `gemm_nt_bias` (tour vision, 1024²) | **0,23 TFLOP/s** (11,8 ms/layer, N=K=1152, M=1045) | 20–23 TFLOP/s (notre tuile bf16) | **~90×** | row **bit-exacte** : tuile 16×32, f32 en LDS, un mul + un add par k ; `max(M=512) = 0,83–0,96 TFLOP/s` à kbench, et libavx 32 threads fait **2,8×** mieux que la carte | noyau rapide **avec changement de contrat** (1 bf16 ULP) ; lire libr4d d'abord |
-| `attn_dense` hd72 (tour vision, 2048²) | **19 GFLOP/s** (251 ms/couche à 4 096) | 215 GFLOP/s — la même row à M=512 (350,7 µs) | **11× par FLOP** | effondrement au-delà de la bande mesurée (M ≤ 512) ; `max_seqlen=16384`, non causal, `gqa=1` | même arithmétique, meilleure tuile/partition : aucun changement de contrat |
-| `hc_read` (préfill Flash-Next) | 2,84 s / 972 tok (53 %), 28 µs/rangée/site ; 11,3 s à 4 098 tok | 630 Mo de matrices à ~900 GB/s ⇒ **~0,7 s** par chunk | **~4×** | ordre des tuiles : les 873 appels relisent 2,9 Go (4,6× les matrices) | localité (un site, toutes ses tuiles) ou fusion dans les producteurs |
-| `moe_gemm_q` (préfill Flash-Next) | 1,71 s / 972 tok (32 %) ; 3,04 s à 4 098 | η 70 % de la row à M=32 (IQR) | 2–3× | dispersion des experts au préfill | ordonnancement par expert, pas un noyau |
-| `gemm_nt_q` IQR (27B, 3 252 tok) | **17,2 TFLOP/s** (88 % du préfill) | 23,5 (notre tuile bf16) / 81,9 (plafond f16 WMMA) | 1,4× / 4,8× | décodage 5–6 bits : le coût est le décodage, pas le produit | ordonnancement de la tuile `v_dot4` (double buffer, 8 fragments, épilogue) |
-| `attn_paged` (27B, 3 252 tok) | 0,91 s (7,9 %) | — | — | livré (split-KV) | rien |
-| décodage (Flash-Next, 27B) | 12,73 / 16,8 tok/s | ~14 / ~18 tok/s (poids à 900 GB/s) | ~10 % | flux de poids | octets lus (quantification, placement) ou acceptation MTP, pas un noyau |
+| poste (cas) | réel (W31) | idéal (borne) | écart | cause / état |
+|---|---:|---:|---:|---|
+| `gemm_nt_bias` (tour vision, 1045×1152×1152) | **7,20 TFLOP/s** (385 µs/layer), **0 ulp** | 20–23 (notre tuile bf16) | ~3× | **livré W31** : staging bf16 k-major, tuile 32×64, 4×4 par thread ; 8,7–11× sur l'ancienne row (0,83) et désormais 2,3–2,5× plus rapide que libavx |
+| `attn_dense` hd72 (tour vision, 2048²) | **5,30 TFLOP/s** (233 ms à 16 384 patches × 16 têtes) | ~435 instructions VALU/clé/thread ⇒ 123–173 ms | **1,3–1,9×** | **pas un effondrement** (le « 19 GFLOP/s » de W30 était un comptage faux : 16 têtes et 16 384 patches) ; efficacité croissante avec M ; 53 % de la borne d'issue ; variantes de scheduling neutres |
+| `hc_read` (préfill Flash-Next) | **1,20 s / 972 tok** (33 %), **4,0 s à 4 098** | 630 Mo de matrices à ~900 GB/s ⇒ ~0,7 s par chunk | ~1,7× | **livré W31** : tuilage 8 rangées × 32 sorties, 2,6–2,9× à M ≥ 128, M=1 inchangé, bit-exact ; 10,1 µs/rangée à M=128 (29,4 avant) |
+| `moe_gemm_q` (préfill Flash-Next) | 1,70 s / 972 tok (**46 %**, premier poste) | η 70 % de la row à M=32 (IQR) | 2–3× | dispersion des experts au préfill ; le poste est devenu le premier après W31 |
+| `gemm_nt_q` IQR (27B, 3 252 tok) | **17,2 TFLOP/s** (88 % du préfill) | 23,5 (notre tuile bf16) / 81,9 (plafond f16 WMMA) | 1,4× / 4,8× | décodage 5–6 bits : le coût est le décodage, pas le produit ; ordonnancement `v_dot4` |
+| `attn_paged` (27B, 3 252 tok) | 0,91 s (7,9 %) | — | — | livré (split-KV) |
+| décodage (Flash-Next, 27B) | 12,73 / 16,8 tok/s | ~14 / ~18 tok/s (poids à 900 GB/s) | ~10 % | flux de poids ; levier = octets lus ou acceptation MTP, pas un noyau |
 
-Ordre de valeur produit : `attn_dense` long (aucun contrat à changer),
-`gemm_nt_bias` (contrat à trancher), `hc_read` préfill (localité), puis le noyau
-IQR. Le décodage est au roofline de ses poids ; l'attention n'est plus un poste.
+Effet bout en bout de W31 (`profile-ops`, même protocole) :
 
+| cas | W30 | W31 |
+|---|---:|---:|
+| Flash-Next texte 972 tok, TTFT | 4,78 s | **3,13 s** (−34 %) |
+| Flash-Next texte 3 252 tok, préfill | 13,56 s | **8,19 s** (−40 %) |
+| Flash-Next image 1 024², TTFT | 9,58 s | **4,66 s** (−51 %) |
+| Flash-Next image 2 048², TTFT | 39,2 s | **19,1 s** (−51 %) |
+| 27B texte 3 252 tok, TTFT | 11,44 s | 11,39 s (IQR 88 %) |
 
-
-
-
-
+Prochain ordre de valeur : `moe_gemm_q` au préfill (premier poste texte),
+`hc_read` vers son plancher (1,7×), `attn_dense` (1,3–1,9× sans contrat, plus
+seulement avec FMA/softmax en une passe), puis la tuile IQR. Le décodage reste
+au roofline de ses poids.

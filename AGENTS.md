@@ -230,7 +230,12 @@ aussi en split-KV depuis W30 (cible 128 workgroups, repli `splits=1` sans
 aréna) : q=17 à 8K **2 376 µs** (gqa6) / **1 795** (gqa12) contre 12 122 /
 13 635, et 8 508 / 6 364 à 32K, décodage inchangé ; les multi-rangées
 doivent préserver l'ordre par rangée, mais le **verify M=4** n'est pas un
-levier (W30 : q=4 ≈ q=1 en gqa6, +23–31 % en gqa12, R36). `final-all` est
+levier (W30 : q=4 ≈ q=1 en gqa6, +23–31 % en gqa12, R36). **W31** : `hc_read`
+**2,6–2,9×** au préfill (bit-exact, M=1 inchangé) et `gemm_nt_bias` de la tour
+vision **8,7–11×** (0 ulp) ; servi, Flash-Next texte 3 252 tokens 13,56 →
+**8,19 s**, image 2 048² 39,2 → **19,1 s**, texte identique au bit. `attn_dense`
+n'est **pas** effondré (5,30 TFLOP/s à 16 384 patches × 16 têtes, 53 % de sa
+borne VALU ; le « 19 GFLOP/s » de W30 était un comptage faux, R37). `final-all` est
 l'arbre **W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ;
 détails dans `RAPPORT_REBASE_V2_1_0.md`.
 
