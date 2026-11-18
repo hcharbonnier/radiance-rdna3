@@ -1601,6 +1601,23 @@ tuile rétrécit** : une déclaration doit se dimensionner pour la tuile la plus
 branche (l'historique est aplati : il n'y a pas de commit mort), résultat
 consigné ici ; l'agent reprend le sujet avec la géométrie servie comme porte.
 
+**IQR — tuile registre 2×4 : réelle sur la grille signée, inapplicable au 27B.**
+L'agent a diagnostiqué juste (le décodage de l'unité 16×128 tourne sur la
+vague 0 pendant que trois vagues attendent au barrage, 110 VGPR, 4 blocs/CU) et
+livré une tuile registre 2 tokens × 4 lignes avec **copie parallèle des
+octets** de l'unité par les quatre vagues. Sur la grille **i8 signée** :
+34816×5120 M=1626 **32,91 → 16,94 ms (1,94×)**, 34,2 TFLOP/s, 0 ulp ;
+M=1 inchangé ; `iqr_device_test` 78/12. Mais la garde est
+`if constexpr (F::KIND == kSigned && F::B == 8)` et **`rad-info --recipe` montre
+que les poids denses du 27B sont trellis u4/u5/u6 (`tcq=16`, `tcq_code=mad`)**,
+donc `kTrellisMad` : la tuile n'est **jamais sélectionnée**. Mesure servi
+(prompt 3 252 tokens) : **TTFT 11 244 ms**, `gemm_nt_q` 10 048 ms — inchangé
+(11 390 / 10 180 avant). Un gain de kbench sur une forme absente du graphe ne
+compte pas (R39) : commits retirés, sujet rendu à l'agent avec la forme trellis.
+La piste correcte pour le trellis n'est pas la copie parallèle (chaîne d'états)
+mais le **recouvrement** du décodage du bloc K+1 avec la consommation du bloc K
+(double buffer entre blocs K, ordre d'accumulation inchangé).
+
 **Validation (`build-w32`, build neuf)** : `sched_test` 548 952,
 `engine_e2e_test` 1 076 (3 skips), `fixture_test` 109 671,
 `ple_hc_device_test` **58 checks/10 cas**, `moe_iqr_device_test` 15/15,

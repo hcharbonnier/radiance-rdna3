@@ -351,3 +351,16 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   (changement de schéma) ou une softmax en une passe — décisions de contrat.
 - **Reste** : `moe_gemm_q` (56,5 % du préfill 972 tokens) via la continuation
   de trellis, puis `hc_read` (17,6 %).
+- **IQR — tuile 2×4 rejetée (W32)** : 1,94× réel à M=1626 (32,91 → 16,94 ms,
+  34,2 TFLOP/s, 0 ulp) mais sur la grille **i8 signée**, gardée par
+  `F::KIND == kSigned && F::B == 8` ; le 27B est **trellis u4/u5**
+  (`rad-info --recipe` : `tcq=16 tcq_code=mad`), donc la tuile ne tourne pas.
+  Servi inchangé (TTFT 11 244 ms, `gemm_nt_q` 10 048 ms). La piste trellis est
+  le **recouvrement** du décodage K+1 avec la consommation de K (double buffer),
+  pas une copie parallèle d'octets, la chaîne d'états n'étant pas parallèle.
+- **R41** — *décision (W32)* : une optimisation d'une row ne se juge que sur
+  la **forme que les conteneurs servis déclarent**. Avant de toucher à
+  `gemm_iqr_tiled`, vérifier `rad-info --recipe` (trellis vs signé) ; une tuile
+  gardée par `kSigned` ne peut pas gagner sur le 27B, le Flash-Next ou
+  MiniCPM. Une variante device-only se refuse même si elle est plus rapide et
+  exacte.
