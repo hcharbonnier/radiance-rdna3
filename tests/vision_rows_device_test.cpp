@@ -295,6 +295,72 @@ bool run_gemm(const GemmCase& c, const char* what) {
     return ok;
 }
 
+/* Device timing for the row, no oracle: warm up, then the median and the minimum of fifteen
+ * individually timed launches. Used with RAD_VISION_BENCH=1 on the tower's served shapes. */
+bool bench_gemm(const char* name, int M, int N, int K, const char* act, bool res) {
+    const RadKernelInfo* kd = g_r3d.find("gemm_nt_bias", RAD_DOMAIN_DEVICE, "gemm_nt_bias");
+    if (!kd) return true;
+
+    Gen g(9001u + (uint32_t)M + (uint32_t)N + (uint32_t)K);
+    HBuf A, B, bias, rb, y;
+    fill_plane(&A, M, K, K, 0, &g);
+    fill_plane(&B, N, K, K, 0, &g);
+    fill_plane(&bias, 1, N, N, 0, &g);
+    if (res) fill_plane(&rb, M, N, N, 0, &g);
+    fill_plane(&y, M, N, N, 0, &g);
+
+    Dev da(A.v.size() * 2), db(B.v.size() * 2), dbias(bias.v.size() * 2);
+    Dev dres(res ? rb.v.size() * 2 : 16), dy(y.v.size() * 2);
+    up(da, A.v.data(), da.bytes);
+    up(db, B.v.data(), db.bytes);
+    up(dbias, bias.v.data(), dbias.bytes);
+    if (res) up(dres, rb.v.data(), dres.bytes);
+    up(dy, y.v.data(), dy.bytes);
+
+    std::vector<RadTensor> t{
+        ten(da.p, RAD_BF16, { M, K }), ten(db.p, RAD_BF16, { N, K }),
+        ten(dbias.p, RAD_BF16, { N }),
+        res ? ten(dres.p, RAD_BF16, { M, N }) : RadTensor{},
+        ten(dy.p, RAD_BF16, { M, N })
+    };
+    std::vector<RadParam> p{ pi("M", M), pi("N", N), pi("K", K), ps("dtype", "bf16") };
+    if (act) p.push_back(ps("act", act));
+    RadArgs a;
+    std::memset(&a, 0, sizeof a);
+    a.t = t.data();
+    a.n_t = (int)t.size();
+    a.p = p.data();
+    a.n_p = (int)p.size();
+
+    for (int i = 0; i < 3; ++i) kd->launch(&a, (RadStream)0);
+    hipDeviceSynchronize();
+
+    hipEvent_t e0, e1;
+    hipEventCreate(&e0);
+    hipEventCreate(&e1);
+    std::vector<float> us(15);
+    for (int i = 0; i < 15; ++i) {
+        hipEventRecord(e0, (hipStream_t)0);
+        kd->launch(&a, (RadStream)0);
+        hipEventRecord(e1, (hipStream_t)0);
+        hipEventSynchronize(e1);
+        float ms = 0.0f;
+        hipEventElapsedTime(&ms, e0, e1);
+        us[(size_t)i] = ms * 1000.0f;
+    }
+    hipEventDestroy(e0);
+    hipEventDestroy(e1);
+
+    std::sort(us.begin(), us.end());
+    const float med = us[us.size() / 2], best = us[0];
+    const double flops = 2.0 * (double)M * (double)N * (double)K;
+    std::printf("GEMMBENCH %-26s M=%4d N=%4d K=%4d act=%-4s res=%d  med=%9.1f us "
+                "min=%9.1f us  %6.3f / %6.3f TFLOP/s\n",
+                name, M, N, K, act ? act : "none", res ? 1 : 0, med, best,
+                flops / ((double)med * 1e-6) / 1e12, flops / ((double)best * 1e-6) / 1e12);
+    return true;
+}
+
 /* The tower's geometries. They are the 27B's shape family: width = 16 heads x 72, ff 4304,
  * patch 16 with temporal 2 and 3 channels (patch_dim 1536) and merge^2 = 4. */
 TEST(gemm_nt_bias_vision_shapes_match_libref) {
@@ -365,6 +431,17 @@ TEST(gemm_nt_bias_zero_and_nonzero_bias_match_libref) {
     CHECK(run_gemm(c, "bias"));
     c.zero_bias = true; c.seed = 32;
     CHECK(run_gemm(c, "zero bias"));
+}
+
+/* The served tower's whole-image pass, timed with no oracle (RAD_VISION_BENCH=1). The shapes are
+ * the ones the 2048^2 pass issues: the patch projection, the attention projection at the patch
+ * count of the 27B's 2048^2 image, and the deepstack merger's GELU layer. */
+TEST(vision_gemm_bench) {
+    if (!std::getenv("RAD_VISION_BENCH")) return;
+    if (!ready()) return;
+    CHECK(bench_gemm("patch embed", 512, 1152, 1536, nullptr, false));
+    CHECK(bench_gemm("attn proj + res", 1045, 1152, 1152, nullptr, true));
+    CHECK(bench_gemm("merger fc gelu", 1024, 4608, 4608, "gelu", false));
 }
 
 /* ---- grid_embed --------------------------------------------------------------------------- */
