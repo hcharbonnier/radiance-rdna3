@@ -9934,9 +9934,11 @@ TEST(gemma3_dflash2_drafter_taps_and_block) {
 }
 
 /* --kv-cache-dtype i8: int8 K and V with one f16 scale each per token and head. The trunk's
- * group is int8 at head_dim 256 and the DFlash2 drafter's at its 128 (the core adds a row's four
- * scale bytes), and every op that names a cache dtype bands on i8. */
-TEST(qwen35_i8_cache_is_an_int8_group_at_the_models_head_dim) {
+ * group is int8 at head_dim 256; the DFlash2 drafter's group keeps **bf16** at its 128, because
+ * the served attention rows cover the drafter's head shape in bf16/fp8_e4m3 but not int8 (the
+ * int8 rows are the trunk's head_dim 256 ones). Both groups are declared apart and each bands
+ * its ops on its own dtype. */
+TEST(qwen35_i8_trunk_keeps_the_int8_group_and_the_drafter_its_bf16_cache) {
     MetaKV mk = with_dflash2(q35fp8_meta());
     RadBuilder b;
     RadBuildCtx ctx = spec_ctx(0, 1, 7);
@@ -9945,16 +9947,18 @@ TEST(qwen35_i8_cache_is_an_int8_group_at_the_models_head_dim) {
     const RadKVGroupDecl& f = b.kv_groups[0].d;
     CHECK_EQ(f.dtype, (uint32_t)RAD_I8);
     CHECK_EQ(f.head_dim, 256);
-    CHECK_EQ(b.kv_groups.back().d.dtype, (uint32_t)RAD_I8);
+    CHECK_EQ(b.kv_groups.back().d.dtype, (uint32_t)RAD_BF16);
     CHECK_EQ(b.kv_groups.back().d.head_dim, 128);
-    int i8 = 0, other = 0;
+    int i8 = 0, bf16 = 0, other = 0;
     for (const auto& o : b.ops) {
         if (!param(&o, "kv_dtype")) continue;
         const std::string kd = pstr(&o, "kv_dtype");
         i8 += kd == "i8";
-        other += kd != "i8";
+        bf16 += kd == "bf16";
+        other += kd != "i8" && kd != "bf16";
     }
     CHECK(i8 > 0);
+    CHECK(bf16 > 0);
     CHECK_EQ(other, 0);
 }
 

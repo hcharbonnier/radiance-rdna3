@@ -374,8 +374,18 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
         return RAD_E_UNSUPPORTED;
     }
 
-    /* The window bounds the cache: the drafter's 2048-token window, not the context length. */
-    RAD_ARCH_TRY(drafter_kv_group(b, nm, ctx, dg, dc.window, base_layer, &m.kv_draft));
+    /* The window bounds the cache: the drafter's 2048-token window, not the context length.
+     *
+     * Its dtype is its own: libr3d serves the drafter's head_dim 128 attention cache in bf16 and
+     * fp8_e4m3, never int8 (the int8 rows are the trunk's head_dim 256 ones). With the trunk on
+     * --kv-cache-dtype i8, which is how this model is served, the drafter's attn_paged/kv_store
+     * bands would resolve to no kernel and startup would refuse every speculative deployment, so
+     * the drafter's group keeps bf16 while the trunk keeps the int8 cache. */
+    const uint32_t draft_kv = rad_kv_cache_dtype(ctx, RAD_BF16) == RAD_I8 ? RAD_BF16 : 0;
+    if (draft_kv)
+        rad_note(b, "DFlash2's cache stays bf16 while the trunk's is int8: the drafter's head_dim "
+                    "128 is served in bf16 (and fp8_e4m3), not int8");
+    RAD_ARCH_TRY(drafter_kv_group(b, nm, ctx, dg, dc.window, base_layer, &m.kv_draft, draft_kv));
 
     /* Activations. The context pass has one row per committed token over a whole prefill chunk;
      * the query pass one row per draft position, `block` per sequence; the two are sized apart.
