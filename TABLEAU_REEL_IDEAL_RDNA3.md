@@ -802,7 +802,9 @@ SUIVI_LOTS_RDNA3.md (R39–R51).
 
 ### Ordre de valeur restant
 
-gemm_nt_bias vision (7,20 TF/s pour un plafond bit-exact ~11 → ~1,5×), puis
+gemm_nt_bias vision (W42 : **9,10 TF/s** profilé sur la passe 2 048²,
+1,42× ; le reste est l'instruction mix du contrat ~2,6 instr/MAC, pas un
+levier bit-exact immédiat), puis
 les octets du MoE au préfill (81 % du lien), puis ttn_paged h256 au préfill
 (12,6 %). Aucun levier bit-exact n'est ouvert sur le décodage : hc_read est à
 son plancher, le GEMM 27B à 76 % du plafond, l'attention h256 et la vision

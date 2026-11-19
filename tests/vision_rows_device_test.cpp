@@ -9,7 +9,8 @@
  *                 residual stream in the epilogue. Cases cover the tower's geometries (hidden
  *                 width, 3x qkv, the ffn, the merger and the patch projection), a variable M
  *                 including tails, both activations, the residual present and absent, zero and
- *                 non-zero biases, row pitches and unaligned bases.
+ *                 non-zero biases, row pitches and unaligned bases, the finite bf16 domain of the
+ *                 tanh GELU exhaustively, and both tile heights around their dispatch boundary.
  *
  *   grid_embed    the learned position table added before the first block. Cases cover the
  *                 48 x 48 table of the 27B resampled to patch grids (including 1-wide and
@@ -185,6 +186,7 @@ struct GemmCase {
     bool res = false;
     bool res_alias = false;                         /* res is y itself, the stream in place */
     bool zero_bias = false;
+    bool exhaustive_gelu_domain = false;            /* A holds every bf16 code once, B = 1 */
     const char* act = nullptr;                      /* null: the optional parameter is omitted */
     uint32_t seed = 1;
 };
@@ -217,6 +219,18 @@ bool run_gemm(const GemmCase& c, const char* what) {
     fill_plane(&A, c.M, c.K, a_ld, c.a_off, &g);
     fill_plane(&B, c.N, c.K, b_ld, c.b_off, &g);
     fill_plane(&bias, 1, c.N, c.N, c.bias_off, &g, c.zero_bias);
+    if (c.exhaustive_gelu_domain) {
+        /* K = N = 1 and B = 1: every output is one bf16 input, so A carries each finite bf16 code
+         * once and the row's gelu_tanh epilogue sees its whole finite domain. The non-finite codes
+         * map to +0: their NaN payloads are not part of the contract and would depend on where the
+         * host and the device round them. */
+        for (int r = 0; r < c.M; ++r) {
+            const uint16_t code = (uint16_t)r;
+            A.p()[(size_t)r * a_ld + 0] = ((code & 0x7f80u) == 0x7f80u) ? 0 : code;
+        }
+        B.p()[0] = 0x3f80;                    /* 1.0f */
+        bias.p()[0] = 0;
+    }
     if (c.res) fill_plane(&res, c.M, c.N, res_ld, c.res_off, &g);
     fill_plane(&y0, c.M, c.N, y_ld, c.y_off, &g);
     if (c.res_alias) res = y0;
@@ -431,6 +445,35 @@ TEST(gemm_nt_bias_zero_and_nonzero_bias_match_libref) {
     CHECK(run_gemm(c, "bias"));
     c.zero_bias = true; c.seed = 32;
     CHECK(run_gemm(c, "zero bias"));
+}
+
+/* The tanh GELU's input is always a bf16 value (the biased sum is narrowed before the epilogue),
+ * so its reachable domain is the finite bf16 codes. The row evaluates them with tanhf; this case
+ * runs the whole finite domain through the row against libref, which uses tanh in double, and
+ * compares the stored bytes -- including the negative tail where 1+th is only a few f32 ulps. */
+TEST(gemm_nt_bias_gelu_tanh_covers_every_finite_bf16_input) {
+    if (!ready()) return;
+    GemmCase c;
+    c.M = 65536; c.N = 1; c.K = 1;
+    c.act = "gelu_tanh"; c.exhaustive_gelu_domain = true; c.seed = 41;
+    CHECK(run_gemm(c, "gelu_tanh all finite bf16"));
+}
+
+/* The tall (64-row) tile takes over at kTallMin; a pass just above it has a one-row M tail, and a
+ * row/column/k tail on top of that. The two rows around the dispatch boundary are checked so the
+ * switch itself is covered, each against libref. */
+TEST(gemm_nt_bias_tall_tile_tails_match_libref) {
+    if (!ready()) return;
+    GemmCase c;
+    c.M = 1025; c.N = 67; c.K = 71; c.act = "gelu_tanh"; c.seed = 42;
+    CHECK(run_gemm(c, "tall tile tails"));
+    c.act = nullptr; c.res = true; c.seed = 43;
+    CHECK(run_gemm(c, "tall tile tails res"));
+    c.res = false; c.act = "gelu_tanh"; c.seed = 44;
+    c.M = 1023;
+    CHECK(run_gemm(c, "short tile at the boundary"));
+    c.M = 1024; c.seed = 45;
+    CHECK(run_gemm(c, "tall tile at the boundary"));
 }
 
 /* The served tower's whole-image pass, timed with no oracle (RAD_VISION_BENCH=1). The shapes are

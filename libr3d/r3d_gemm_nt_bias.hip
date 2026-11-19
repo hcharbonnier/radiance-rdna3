@@ -10,7 +10,7 @@
  *
  * ---- the arithmetic -------------------------------------------------------------------------
  *
- * One thread owns a pair of output columns for one row, and its two sums walk k ascending:
+ * Each output's accumulator walks k ascending:
  *
  *     acc = 0; for k ascending: acc = acc + a[m][k] * b[n][k]
  *
@@ -24,18 +24,24 @@
  *
  * ---- the tile -------------------------------------------------------------------------------
  *
- * A block carries a 32-row x 64-column tile with four waves: a thread owns four rows by four
- * columns, so one activation value feeds four outputs and one weight value four rows. Both
+ * A block carries a 64-column tile four waves wide: a thread owns four columns and a run of rows,
+ * so one activation value feeds four outputs and one weight value every row the thread owns. Both
  * operands stage to LDS as the checkpoint's bf16 bytes -- not f32 -- in a k-major layout (one
- * staged row is the block's whole width for one k), so a thread's four rows, or its four columns,
- * are two aligned 32-bit reads that widen to f32 in registers. The staged row pitch is padded to
- * 36 and 68 halfwords (18 and 34 dwords), which spreads a k row across the banks: the compute
- * loop's reads are conflict-free and the transposed store in is four-way. Rows and columns past
- * the band clamp to the last real one, so the tile walk stays branch-free; the store drops them.
+ * staged row is the block's whole width for one k), so a thread's rows, or its four columns, are
+ * aligned 32-bit reads that widen to f32 in registers. The staged row pitch is padded by four
+ * halfwords, which spreads a k row across the banks: the compute loop's reads are conflict-free
+ * and the transposed store in is four-way. Rows and columns past the tensor's M or N clamp to the
+ * last real one, so the tile walk stays branch-free; the store drops them.
+ *
+ * There are two row heights. At a pass's large patch counts a block carries 64 rows and a thread
+ * eight (twice the reuse a staged byte, the served heights), and under kTallMin rows it carries 32
+ * with four a thread: a small pass has few blocks, and the tall tile pays for its bigger staged
+ * rows there without the block count to hide it (measured: 64 rows is 7.5% faster on the 2048^2
+ * pass's shapes, 20-27% slower at M <= 128).
  *
  * k is walked in 64-wide tiles, ascending, so every output's chain is still libref's ascending k
- * with one separate multiply and one separate add a step. The sixteen accumulators a thread are
- * sixteen independent chains, so the add latency is hidden without reassociating anything.
+ * with one separate multiply and one separate add a step. The RM x 4 accumulators a thread are
+ * independent chains, so the add latency is hidden without reassociating anything.
  *
  * ---- pitches --------------------------------------------------------------------------------
  *
@@ -57,26 +63,33 @@
 
 namespace {
 
-constexpr int kThr = 128;       /* four waves: eight 4-row groups by sixteen 4-column groups */
-constexpr int kMT  = 32;        /* rows one block carries */
+constexpr int kThr = 128;       /* four waves: eight row groups by sixteen 4-column groups */
 constexpr int kNT  = 64;        /* columns one block carries */
 constexpr int kKT  = 64;        /* k one staged tile covers */
-constexpr int kRM  = 4;         /* rows one thread accumulates */
 constexpr int kRN  = 4;         /* columns one thread accumulates */
-constexpr int kSA  = kMT + 4;   /* halfwords a staged activation k row: 18 dwords */
 constexpr int kSB  = kNT + 4;   /* halfwords a staged weight k row: 34 dwords */
+constexpr int kTallMin = 1024;  /* rows from which the 64-row tile takes over */
+constexpr int kShortMT = 32;    /* rows a block carries below kTallMin */
+constexpr int kTallMT  = 64;    /* rows a block carries from kTallMin */
 
-/* The tile map, pinned: four warps stage two k a lane over a 64-wide tile, and sixteen 4-column
- * groups span the block's rows. A change that breaks these breaks the staging or the epilogue. */
+/* The tile map, pinned: four warps stage two k a lane over a 64-wide tile, and eight row groups by
+ * sixteen 4-column groups fill the 128 threads; a row group is MT / 8 rows a thread. */
 static_assert(kThr / kWave == 4, "the stage walks four warps");
 static_assert(kKT == 2 * kWave, "a warp's lanes stage two k each");
-static_assert(kThr == 16 * (kMT / kRM), "sixteen 4-row groups");
+static_assert(kThr == 8 * 16, "eight row groups by sixteen 4-column groups");
 static_assert(kNT == kRN * 16, "sixteen 4-column groups");
-static_assert(kSA % 2 == 0 && kSB % 2 == 0, "a staged k row must keep 32-bit reads aligned");
+static_assert(kSB % 2 == 0, "a staged k row must keep 32-bit reads aligned");
 
 /* The epilogue's activation, on the value the bias left (the reference's gemm_epilogue reads the
- * stored tensor back, so the argument is what bf16 holds). The double libm calls are narrowed
- * once, as ref_erf and ref_tanh do; the f32 expressions keep the reference's grouping. */
+ * stored tensor back, so the argument is what bf16 holds). The exact GELU's `erf` is libm's double
+ * form, narrowed once. The tanh form uses tanhf: its argument is derived only from a bf16 value
+ * (every output's bias sum is narrowed to bf16 before the activation), so the reachable domain is
+ * the bf16 codes; over every finite one, including the negative tail where 1+th is only a few f32
+ * ulps, tanhf and (float)std::tanh((double)) leave the same stored bf16 -- the exhaustive device
+ * case in vision_rows_device_test compares the whole finite domain against libref, so a libm that
+ * moved a rounding would turn it red. tanhf keeps the fc1 shape (whose K is small next to the
+ * activations one thread evaluates at the epilogue) off the f64 pipeline, where the double tanh
+ * cost more than the GEMM itself. */
 __device__ __forceinline__ float bias_act(int act, float x) {
     if (act == 1) {
         const float t = x * 0.70710678118654752f;
@@ -89,7 +102,7 @@ __device__ __forceinline__ float bias_act(int act, float x) {
         p = p * x;
         p = p * x;
         const float z = k0 * (x + p);
-        const float th = (float)std::tanh((double)z);
+        const float th = tanhf(z);
         return 0.5f * x * (1.0f + th);
     }
     return x;
@@ -121,29 +134,36 @@ __device__ __forceinline__ void bf16x2_to_f32(uint32_t u, float& lo, float& hi) 
 }
 
 /* y[M,N] = a[M,K] @ b[N,K]^T + bias, with the optional epilogue. Every output's chain is the
- * reference's ascending k; a 32 x 64 tile stages both operands as bf16 in a k-major LDS layout
- * and each thread accumulates four rows by four columns of it. */
+ * reference's ascending k; an MT x 64 tile stages both operands as bf16 in a k-major LDS layout
+ * and each thread accumulates MT/8 rows by four columns of it. */
+template <int MT>
 __global__ __launch_bounds__(kThr) R3D_WAVES(8) void gemm_nt_bias_kernel(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ B,
     const uint16_t* __restrict__ bias, const uint16_t* __restrict__ res,
     uint16_t* __restrict__ Y, int M, int N, int K, int a_ld, int b_ld, int res_ld, int y_ld,
     int act) {
-    /* sA[k][r] and sB[k][n]: one staged row holds the block's whole width for one k, so the four
-     * rows (or columns) a thread owns are four adjacent halfwords. */
-    __shared__ __align__(16) uint16_t sA[kKT * kSA];
+    constexpr int RM = MT / 8;             /* rows one thread accumulates */
+    constexpr int SA = MT + 4;             /* halfwords a staged activation k row */
+    static_assert(MT == 8 * RM, "eight row groups cover the tile's rows");
+    static_assert(RM % 2 == 0, "the paired halfword reads need an even row count");
+    static_assert(SA % 2 == 0, "a staged k row must keep 32-bit reads aligned");
+
+    /* sA[k][r] and sB[k][n]: one staged row holds the block's whole width for one k, so the rows
+     * (or columns) a thread owns are adjacent halfwords. */
+    __shared__ __align__(16) uint16_t sA[kKT * SA];
     __shared__ __align__(16) uint16_t sB[kKT * kSB];
 
     const int tid = (int)threadIdx.x;
     const int lane = tid & (kWave - 1);
     const int wv = tid / kWave;            /* the warp: stages rows wv, wv + 4, ... */
-    const int rg = tid >> 4;               /* rows rg*4 .. rg*4 + 3 */
+    const int rg = tid >> 4;               /* rows rg*RM .. rg*RM + RM - 1 */
     const int cg = tid & 15;               /* columns cg*4 .. cg*4 + 3 */
-    const int m0 = (int)blockIdx.y * kMT;
+    const int m0 = (int)blockIdx.y * MT;
     const int n0 = (int)blockIdx.x * kNT;
 
-    float acc[kRM][kRN];
+    float acc[RM][kRN];
 #pragma unroll
-    for (int i = 0; i < kRM; ++i)
+    for (int i = 0; i < RM; ++i)
 #pragma unroll
         for (int j = 0; j < kRN; ++j) acc[i][j] = 0.0f;
 
@@ -152,15 +172,15 @@ __global__ __launch_bounds__(kThr) R3D_WAVES(8) void gemm_nt_bias_kernel(
          * the tile's 64 k two each, so a row's 128 bytes are one coalesced request; the two
          * halfwords land in two k rows of LDS. k past K stages as +0 and is never consumed (the
          * compute loop stops at kl). */
-        for (int r = wv; r < kMT; r += 4) {
+        for (int r = wv; r < MT; r += 4) {
             int rr = m0 + r;
             if (rr >= M) rr = M - 1;
             const uint16_t* src = A + (size_t)rr * a_ld + kt + 2 * lane;
             uint16_t v0 = 0, v1 = 0;
             if (kt + 2 * lane < K) v0 = (uint16_t)ldg_u16(src);
             if (kt + 2 * lane + 1 < K) v1 = (uint16_t)ldg_u16(src + 1);
-            sA[(2 * lane) * kSA + r] = v0;
-            sA[(2 * lane + 1) * kSA + r] = v1;
+            sA[(2 * lane) * SA + r] = v0;
+            sA[(2 * lane + 1) * SA + r] = v1;
         }
         for (int r = wv; r < kNT; r += 4) {
             int nn = n0 + r;
@@ -175,41 +195,31 @@ __global__ __launch_bounds__(kThr) R3D_WAVES(8) void gemm_nt_bias_kernel(
         group_barrier();
 
         const int kl = K - kt < kKT ? K - kt : kKT;
-        const uint16_t* pa = sA + rg * 4;
+        const uint16_t* pa = sA + rg * RM;
         const uint16_t* pb = sB + cg * 4;
 #pragma unroll 4
         for (int kk = 0; kk < kl; ++kk) {
-            float a0, a1, a2, a3, b0, b1, b2, b3;
-            bf16x2_to_f32(*(const uint32_t*)(pa), a0, a1);
-            bf16x2_to_f32(*(const uint32_t*)(pa + 2), a2, a3);
-            bf16x2_to_f32(*(const uint32_t*)(pb), b0, b1);
-            bf16x2_to_f32(*(const uint32_t*)(pb + 2), b2, b3);
-            acc[0][0] = acc[0][0] + a0 * b0;
-            acc[0][1] = acc[0][1] + a0 * b1;
-            acc[0][2] = acc[0][2] + a0 * b2;
-            acc[0][3] = acc[0][3] + a0 * b3;
-            acc[1][0] = acc[1][0] + a1 * b0;
-            acc[1][1] = acc[1][1] + a1 * b1;
-            acc[1][2] = acc[1][2] + a1 * b2;
-            acc[1][3] = acc[1][3] + a1 * b3;
-            acc[2][0] = acc[2][0] + a2 * b0;
-            acc[2][1] = acc[2][1] + a2 * b1;
-            acc[2][2] = acc[2][2] + a2 * b2;
-            acc[2][3] = acc[2][3] + a2 * b3;
-            acc[3][0] = acc[3][0] + a3 * b0;
-            acc[3][1] = acc[3][1] + a3 * b1;
-            acc[3][2] = acc[3][2] + a3 * b2;
-            acc[3][3] = acc[3][3] + a3 * b3;
-            pa += kSA;
+            float a[RM], b[kRN];
+#pragma unroll
+            for (int i = 0; i < RM; i += 2)
+                bf16x2_to_f32(*(const uint32_t*)(pa + i), a[i], a[i + 1]);
+            bf16x2_to_f32(*(const uint32_t*)(pb), b[0], b[1]);
+            bf16x2_to_f32(*(const uint32_t*)(pb + 2), b[2], b[3]);
+#pragma unroll
+            for (int i = 0; i < RM; ++i)
+#pragma unroll
+                for (int j = 0; j < kRN; ++j)
+                    acc[i][j] = acc[i][j] + a[i] * b[j];
+            pa += SA;
             pb += kSB;
         }
         group_barrier();
     }
 
-    const int m = m0 + rg * 4;
+    const int m = m0 + rg * RM;
     const int n = n0 + cg * 4;
 #pragma unroll
-    for (int i = 0; i < kRM; ++i)
+    for (int i = 0; i < RM; ++i)
         if (m + i < M)
 #pragma unroll
             for (int j = 0; j < kRN; ++j)
@@ -227,15 +237,24 @@ extern "C" int r3d_gemm_nt_bias_bf16(long a, long b, long bias, long res, long y
     if (!a || !b || !bias || !y) return -1;
     if (M < 1 || N < 1 || K < 1 || act < 0 || act > 2) return -2;
     if (a_ld < K || b_ld < K || y_ld < N || (res && res_ld < N)) return -3;
-    const long long tiles_m = ((long long)M + kMT - 1) / kMT;
+    const bool tall = M >= kTallMin;
+    const int mt = tall ? kTallMT : kShortMT;
+    const long long tiles_m = ((long long)M + mt - 1) / mt;
     const long long tiles_n = ((long long)N + kNT - 1) / kNT;
     /* gfx11 caps grid y and z at 65535; x is 2^31. */
     if (tiles_n > 0x7fffffffLL || tiles_m > 65535LL) return -2;
-    R3D_KLAUNCH(gemm_nt_bias_kernel, dim3((uint32_t)tiles_n, (uint32_t)tiles_m),
-                dim3(kThr), (hipStream_t)(uintptr_t)stream, (const uint16_t*)(uintptr_t)a,
-                (const uint16_t*)(uintptr_t)b, (const uint16_t*)(uintptr_t)bias,
-                (const uint16_t*)(uintptr_t)res, (uint16_t*)(uintptr_t)y, M, N, K, a_ld, b_ld,
-                res_ld, y_ld, act);
+    if (tall)
+        R3D_KLAUNCH(gemm_nt_bias_kernel<kTallMT>, dim3((uint32_t)tiles_n, (uint32_t)tiles_m),
+                    dim3(kThr), (hipStream_t)(uintptr_t)stream, (const uint16_t*)(uintptr_t)a,
+                    (const uint16_t*)(uintptr_t)b, (const uint16_t*)(uintptr_t)bias,
+                    (const uint16_t*)(uintptr_t)res, (uint16_t*)(uintptr_t)y, M, N, K, a_ld, b_ld,
+                    res_ld, y_ld, act);
+    else
+        R3D_KLAUNCH(gemm_nt_bias_kernel<kShortMT>, dim3((uint32_t)tiles_n, (uint32_t)tiles_m),
+                    dim3(kThr), (hipStream_t)(uintptr_t)stream, (const uint16_t*)(uintptr_t)a,
+                    (const uint16_t*)(uintptr_t)b, (const uint16_t*)(uintptr_t)bias,
+                    (const uint16_t*)(uintptr_t)res, (uint16_t*)(uintptr_t)y, M, N, K, a_ld, b_ld,
+                    res_ld, y_ld, act);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
