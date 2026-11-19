@@ -385,6 +385,124 @@ TEST(attn_paged_h256_gqa12_block4_prefill_split_matches_libref_within_bf16) {
     CHECK(case_ok("h256/gqa12/bs4 prefill split", 24, 12, 256, 4, 17, 32, false));
 }
 
+/* ------------------------------------------------------------------ the h128 bf16 decode band
+ *
+ * A step of `attn_paged_bf16_decode` takes the head-per-workgroup band: one workgroup a (tile of
+ * query rows, head), 32 lanes split over the tile's rows, and -- for a one-row tile -- the scores
+ * kept in LDS so the second walk does not re-form the QK dot. It exists to be bit-identical to the
+ * wide two-pass kernel, so the test holds the row's own launch to `r3d_attn_decode_h128_wide` byte
+ * for byte over the geometries the band can meet: one row and the speculative tiles, causal and
+ * not, a window, several sequences, rectangular and the cu_seqlens form the engine actually hands
+ * every served step. Both entries run the same arithmetic; a split is not in play here.
+ */
+typedef int (*DecodeEntryFn)(long q, long kv, long bt, long seqused, long k_desc, long v_desc,
+                             long cu, long out, int num_seqs, int q_len, int head_dim, int gqa,
+                             int n_head, int block_size, int bt_cols, int bt_rs, int bt_cs,
+                             int max_ctx, int window, int causal, float scale, int kv_dt,
+                             long q_ld, long out_ld, int splits, long scratch, long stream);
+
+bool head_band_ok(const char* name, int n_head, int gqa, int block_size, int ctx, int window,
+                  int causal, int n_seq, int q_len = 1, bool ragged = false)
+{
+    const RadKernelInfo* kd = g_r3d.find("attn_paged", RAD_DOMAIN_DEVICE, "attn_paged_bf16_decode");
+    DecodeEntryFn wide = (DecodeEntryFn)dlsym(g_r3d.h, "r3d_attn_decode_h128_wide");
+    if (!kd || !wide) {
+        std::fprintf(stderr, "skip: no h128 bf16 decode row\n");
+        return true;
+    }
+    const int hd = 128, kv_heads = n_head / gqa;
+    const int blocks = (ctx + block_size - 1) / block_size;
+    const size_t qn = (size_t)q_len * n_seq * n_head * hd;
+    const size_t kvn = (size_t)blocks * kv_heads * block_size * 2 * hd;
+
+    auto qh = rand_bf16(qn, 900u + (unsigned)ctx + (unsigned)window + (unsigned)causal);
+    auto kvhh = rand_bf16(kvn, 700u + (unsigned)ctx + (unsigned)n_seq);
+    std::vector<int32_t> bth((size_t)n_seq * blocks);
+    for (int s = 0; s < n_seq; ++s)
+        for (int b = 0; b < blocks; ++b) bth[(size_t)s * blocks + b] = b;
+    std::vector<int32_t> suh((size_t)n_seq, ctx);
+    std::vector<int32_t> cuh((size_t)n_seq + 1);
+    for (int s = 0; s <= n_seq; ++s) cuh[(size_t)s] = s * q_len;
+
+    Dev dq(qn * 2), dkv(kvn * 2), dbt(bth.size() * 4), dsu((size_t)n_seq * 4);
+    Dev dcu(cuh.size() * 4);
+    Dev dout_a(qn * 2), dout_b(qn * 2);
+    up(dq, qh.data(), dq.bytes);
+    up(dkv, kvhh.data(), dkv.bytes);
+    up(dbt, bth.data(), dbt.bytes);
+    up(dsu, suh.data(), dsu.bytes);
+    up(dcu, cuh.data(), dcu.bytes);
+
+    auto p = std::vector<RadParam>{
+        pi("q_len", ragged ? q_len * n_seq : q_len), pi("head_dim", hd), pi("gqa", gqa),
+        pi("block_size", block_size), pi("causal", causal), pi("window", window),
+        ps("q_dtype", "bf16"), ps("kv_dtype", "bf16"),
+        pf("scale", 1.0 / std::sqrt((double)hd)), pi("max_ctx", ctx), pi("n_head", n_head),
+        pi("max_seqs", n_seq), pi("prefill_fp8", 0)
+    };
+    std::vector<RadTensor> ta = {
+        ten(dq.p, RAD_BF16, { q_len * n_seq, n_head, hd }),
+        ten(dkv.p, RAD_BF16, { blocks, kv_heads, block_size, 2 * hd }),
+        ten(dbt.p, RAD_I32, { n_seq, blocks }),
+        ten(dsu.p, RAD_I32, { n_seq }),
+        ten(nullptr, RAD_F32, { 0 }),
+        ten(nullptr, RAD_F32, { 0 }),
+        ten(ragged ? dcu.p : nullptr, RAD_I32, { ragged ? n_seq + 1 : 0 }),
+        ten(dout_a.p, RAD_BF16, { q_len * n_seq, n_head, hd })
+    };
+    /* The row's own entry: no scratch, so the shim halves its split count to one and the head band
+     * takes the step. */
+    const int rc = run(kd, ta, p);
+    if (rc != 0) {
+        std::fprintf(stderr, "%s: row rc=%d\n", name, rc);
+        return false;
+    }
+    std::vector<RadTensor> tb = ta;
+    tb[7] = ten(dout_b.p, RAD_BF16, { q_len * n_seq, n_head, hd });
+    const long long ld = (long long)n_head * hd;
+    const int rcb = wide((long)(uintptr_t)dq.p, (long)(uintptr_t)dkv.p, (long)(uintptr_t)dbt.p,
+                         (long)(uintptr_t)dsu.p, 0, 0, ragged ? (long)(uintptr_t)dcu.p : 0,
+                         (long)(uintptr_t)dout_b.p, n_seq, ragged ? q_len * n_seq : q_len,
+                         hd, gqa, n_head, block_size, blocks, blocks, 1, ctx, window, causal,
+                         1.0f / std::sqrt((float)hd), RAD_BF16, ld, ld, 1, 0, 0);
+    hipDeviceSynchronize();
+    if (rcb != 0) {
+        std::fprintf(stderr, "%s: wide rc=%d\n", name, rcb);
+        return false;
+    }
+    std::vector<uint16_t> a(qn), b(qn);
+    down(dout_a, a.data(), qn * 2);
+    down(dout_b, b.data(), qn * 2);
+    return same_bf16(a, b, name);
+}
+
+TEST(attn_paged_h128_bf16_decode_head_band_is_bit_identical_to_the_wide_band) {
+    if (!ready()) return;
+    /* one row a workgroup: the score plane's band */
+    CHECK(head_band_ok("h128/decode/ctx59", 16, 8, 16, 59, 0, 1, 1));
+    CHECK(head_band_ok("h128/decode/ctx969", 16, 8, 16, 969, 0, 1, 1));
+    CHECK(head_band_ok("h128/decode/ctx999", 16, 8, 16, 999, 0, 1, 1));
+    CHECK(head_band_ok("h128/decode/noncausal", 16, 8, 16, 969, 0, 0, 1));
+    CHECK(head_band_ok("h128/decode/window64", 16, 8, 16, 969, 64, 1, 1));
+    CHECK(head_band_ok("h128/decode/window64/noncausal", 16, 8, 16, 200, 64, 0, 1));
+    CHECK(head_band_ok("h128/decode/two-seqs", 16, 8, 16, 969, 0, 1, 2));
+    CHECK(head_band_ok("h128/decode/gqa4", 16, 4, 16, 969, 0, 1, 1));
+    CHECK(head_band_ok("h128/decode/gqa1", 16, 1, 16, 407, 0, 0, 1));
+    CHECK(head_band_ok("h128/decode/ragged", 16, 8, 16, 969, 0, 1, 1, 1, true));
+    CHECK(head_band_ok("h128/decode/ragged/two-seqs", 16, 8, 16, 999, 0, 1, 2, 1, true));
+    CHECK(head_band_ok("h128/decode/ragged/window", 16, 8, 16, 300, 64, 0, 3, 1, true));
+    /* the speculative tiles: two, four, eight and sixteen rows a workgroup */
+    CHECK(head_band_ok("h128/verify/q2", 16, 8, 16, 969, 0, 1, 1, 2, true));
+    CHECK(head_band_ok("h128/verify/q4", 16, 8, 16, 969, 0, 1, 1, 4, true));
+    CHECK(head_band_ok("h128/verify/q8", 16, 8, 16, 969, 0, 1, 1, 8, true));
+    CHECK(head_band_ok("h128/verify/q8/noncausal", 16, 8, 16, 999, 0, 0, 1, 8, true));
+    CHECK(head_band_ok("h128/verify/q16", 16, 8, 16, 969, 0, 1, 1, 16, true));
+    CHECK(head_band_ok("h128/verify/q8/window", 16, 8, 16, 600, 128, 1, 1, 8, true));
+    CHECK(head_band_ok("h128/verify/q3", 16, 8, 16, 969, 0, 1, 1, 3, true));
+    CHECK(head_band_ok("h128/verify/q5/two-seqs", 16, 8, 16, 500, 0, 1, 2, 5, true));
+    CHECK(head_band_ok("h128/verify/q4/rect", 16, 8, 16, 969, 0, 1, 1, 4));
+}
+
 TEST(attn_paged_h256_bench) {
     if (!std::getenv("RAD_ATTN_BENCH")) return;
     if (!ready()) return;
@@ -413,3 +531,4 @@ TEST(attn_paged_h256_bench) {
 }
 
 RAD_TEST_MAIN()
+
