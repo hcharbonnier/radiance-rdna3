@@ -2213,3 +2213,19 @@ sont **identiques au pristine** aux trois prompts (`NS=0` et `NS=7`,
 le re-baseline du texte MiniCPM (tolérance 1 bf16 ULP documentée) pour gagner
 10–11× sur son tronc, ou garder le texte actuel et traiter sa lenteur
 autrement. Rien n'est changé en attendant.
+
+**Validation du build fusionné.** `w40f` = `1943d0a2` + `276348c2` + les W40a–c
+(`b81e6269`) : suite complète verte (`sched_test` 548 964, `engine_e2e_test`
+1 087/3 skips, `fixture_test` 109 671, `config_test` 2 952, `ple_hc_device_test`
+76, `dflash_conv_device_test` 37, selftest 196/0/16), kbench **27B 3 181/3 181**
+(3,619e-03), **MiniCPM 1 802/1 802** (3,485e-03), **Flash-Next 4 786/4 786**
+(1,520e-02), 0 échec, 0 divergence — pires `rel_l2` identiques à W38. Gates
+servis : 27B **1,74×** et Flash-Next **1,68×** texte identique, MiniCPM textes
+identiques au pristine à 59/781/804 en `NS=0` et `NS=7`.
+
+**Bilan de la vague W40, pour le tableau des gains** : `hc_read` **+5,3–8,7 %**
+bit-exact sur la plage servie (TTFT −0,1 à −0,9 %, `f498bc06`) ; budget de
+chaleur **−21 % d'octets** sur le lien et décodage 3 252 **−1,75 %**
+(`d8a28952`) ; 27B `NS=3` **1,74×** à 2 047 et 1,44× à 139 (`b81e6269`) ;
+Flash-Next `NS=3` 18,99 contre 11,31 (1,68×) ; vision `attn_dense` **rejetée
+sur mesure** (1,46× au noyau, texte servi changé).
