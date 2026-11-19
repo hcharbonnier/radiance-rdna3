@@ -602,3 +602,16 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   « skipped » (la déclaration porte la plane entière, le site d'issue la
   tranche par `wrow_slice`), mais le sweep reste 3 181/3 181, 0 échec,
   0 divergence ; la row est couverte par `dflash_conv_device_test`.
+
+## W41a — décodage 27B : 4 chaînes i32 et grille split-K (2026-11-19)
+
+- **Profil** : ttn_paged **34,4 ms (50,5 %)**, GEMM IQR **27,5 ms (40,4 %)**,
+  reste 9 %. Le GEMM lit 15,25 Gio à **~555 Go/s** (plafond carte 726–734,
+  motif de tuile 611–676) ; le trellis n'est que 4–8 % du temps.
+- **Livré** (651d0bfc) : 4 chaînes i32 à M ∈ {2,4} et grille split-K
+  tranche-major, bit-exactes. Servi **+0,7 à +2,3 %** ; kbench gemm_nt_q
+  1,044× à M=1 et 1,058× à M=2/4 (5 120×6 144 M=1 1,19×) ; 27B 3 181/3 181.
+- **R50** — *constat* : le pas 27B est à moitié de l'attention, dont le split
+  est interdit par le contrat de texte ; le GEMM est à 76 % du plafond. Sous
+  contrat bit-exact, plus de levier > 1,06× sur ce GEMM. Ne pas rouvrir sans
+  accepter un changement d'arithmétique.
