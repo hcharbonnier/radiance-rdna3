@@ -2438,3 +2438,95 @@ seuls), miroir `w29-rebase` resynchronisé, build **neuf** `build-w42`
   aucun signe de throttling : écart de mesure, code inchangé depuis e42a7d89.
 - Artefacts : `/tmp/w42-kbench/`, `/tmp/w42-strict.log`,
   `<work-root>/work/w41-results/w42-gate/`.
+
+## 2026-11-19 — W42 : gemm_nt_bias vision hors du tanh double, tuile haute (bit-exact)
+
+Reprise au HEAD **b1f95704**, worktree `w42-gemm-vision`, arbre hôte **neuf**
+`<work-root>/work/w42a` (build `build-w42a`, gfx1100 + FFmpeg, cache de tune
+`w29-rebase/build-clean/radiance_home/tune/*.tune` recopié). Carte W7900 :
+au repos après les runs, 21 W, GFX 3 MHz, edge 49 °C / hotspot 57 °C ;
+`THROTTLE_STATUS=THROTTLED` même au repos (bruit connu), aucun run n'a
+signalé de ligne `throttled`.
+
+Objectif : le poste `gemm_nt_bias` bf16 de la tour vision (handover §6.B :
+2,1 s et 7,20 TF/s sur la passe 2 048², plafond bit-exact estimé ~11 TF/s).
+
+**Mesure d'abord.** `--profile-ops` (images 1 024²/2 048², payloads
+`/tmp/vision1024.json` et `/tmp/vision2048.json`, `RADIANCE_PROFILE_EVERY=1`) :
+`gemm_nt_bias` de la passe 2 048² = **2 146,0 ms**, dont `fc1`
+(N=4 304, K=1 152, act=gelu_tanh) **1 043,6 ms** (38,65 ms/appel, **4,2 TF/s**)
+contre `fc2` (N=1 152, K=4 304, mêmes FLOPs) 18,76 ms/appel (**8,6 TF/s**).
+L'ISA du noyau (gfx1100) montre ~180 opérations f64 par sortie : l'épilogue
+`gelu_tanh` appelle `(float)std::tanh((double)z)` sur chaque sortie, et sa part
+est d'autant plus grande que K est petit devant les sorties d'un thread. Ablation
+(`act == 2` → identité, build de diagnostic) : `fc1` M=512 **1 191,5 →
+643,4 µs (1,85×)**, `gelu` exact (erf double) inchangé.
+
+**Pourquoi `tanhf` est bit-exact ici.** L'entrée de l'activation est toujours
+la valeur bf16 `f32_to_bf16(somme + biais)` (le référence stocke le produit
+biaisé en bf16 avant son épilogue), donc le domaine atteignable est l'ensemble
+des codes bf16. Sonde exhaustive sur la carte : `tanhf(z)` et
+`(float)tanh((double)z)` ne donnent pas les mêmes bits f32 sur **106** codes,
+mais **la même bf16 stockée sur les 65 536** (les 106 écarts ne traversent pas
+la frontière d'arrondi) ; en particulier la queue négative où `1+th` ne vaut
+que quelques ulp f32. Le cas device
+`gemm_nt_bias_gelu_tanh_covers_every_finite_bf16_input` rejoue tout le domaine
+fini (M=65 536, N=K=1, A = chaque code, B=1) contre libref, comparaison au bit :
+c'est le garde-fou d'une libm device qui déplacerait un arrondi (R52).
+
+**Changements.** (1) `bias_act(act==2)` évalue `tanhf(z)` ; l'erf exact reste
+en double. (2) tuile haute : un bloc porte **64 rangées** (8 par thread) à
+partir de `kTallMin` = 1 024 rangées et **32** (4 par thread) en dessous ; le
+noyau est un template `MT`, la chaîne k reste ascendante et identique dans les
+deux, le launcher décide sur les rangées réelles (`numel(Y)/N`, jamais le
+plafond de bande). À M ≤ 128 la tuile courte garde les temps là où 64 rangées
+seules perdaient 20–27 %. (3) description de row (`r3d_rows.cpp`), cas device
+de queues M/N/K, de frontière 1 023/1 024 et du domaine fini.
+
+**Chiffres** (profil, même protocole ; le profil gonfle les temps, le servi est
+plus bas). `gemm_nt_bias` 2 048² : **2 146,0 → 1 515,5 ms (1,42×)** ; le
+`tanhf` seul donne **1 657,4 ms** et la tuile haute **1 515,5** (1,09× de plus).
+
+| poste 2 048² (profil) | avant | après | Δ |
+|---|---:|---:|---:|
+| `gemm_nt_bias` total | 2 146,0 ms | **1 515,5 ms** | **1,42×** |
+| `fc1` N=4 304 K=1 152 gelu_tanh | 38,65 ms/appel | **17,64** | **2,19×** |
+| `fc2` N=1 152 K=4 304 | 18,76 | 18,02 | 1,04× |
+| `qkv` N=3 456 K=1 152 | 15,77 | 14,48 | 1,09× |
+| `proj` N=1 152 K=1 152 | 4,84 | 4,63 | 1,05× |
+| merger1 / merger2 | 21,41 / 11,91 | 19,75 / 10,88 | 1,08× / 1,09× |
+| débit agrégé (1,379e13 FLOP) | 6,43 TF/s | **9,10 TF/s** | 1,42× |
+
+kbench ciblé (mêmes conditions, `--op gemm_nt_bias --bench`) : `fc1` M=512
+**1 169,7 → 667,2 µs (1,75×)** après le `tanhf` ; la tuile haute ne joue pas
+sous M=1 024 et les autres rows sont inchangées à ±0,6 %. Profil servi avec la
+tuile haute : `fc1` 19,245 → 17,639 ms/appel, `fc2` 19,758 → 18,024, qkv
+16,052 → 14,483, merger1 21,868 → 19,747, patch 6,476 → 6,097.
+
+**Gates.**
+- Suite complète du §3 du handover, build neuf : sched_test **548 964/213**,
+  engine_e2e **1 087/52** (3 skips), fixture_test **109 671/59**,
+  config_test **2 952/71**, iqr 76/11, ple_hc 76/10, moe_iqr 15/15,
+  **vision_rows 76/12** (66/10 + 10 checks : domaine fini, queues et
+  frontière), attn_paged 29/10, logits_bf16 8/4, gather_rows_u8 33/3,
+  mtp_enter 22/3, logit_rerank 36/5, act_i8g 103/6, tp2 12/2,
+  dflash_conv 37/3, `r3d_selftest` **196 rows, 0 échec, 16 skips**.
+- kbench ciblé `--op gemm_nt_bias` : **140/140**, 0 échec, 0 divergence,
+  `libr3d` 70/70, pire `rel_l2` **0,00e+00**. Flash-Next complet :
+  **4 786/4 786**, 0 échec, 0 divergence, pire `rel_l2` **1,520e-02**
+  (référence W41), 1 442 skips inchangés, 2 350 s.
+- Gates servis (serveurs neufs, même payload, `cache_n=0`) : Flash-Next
+  3 252 tokens NS=0/NS=3 préfill **5 333,2 / 5 859,4 ms** (réf. 5,38/5,87 s),
+  textes identiques à `fn-ns0.txt` et `fn-ns3.txt` (sha `960a2212e059`) ;
+  vision 1 024² **TTFT 3 115,3 ms** (réf. w40a 3 192,9 ; W41 3,3 s), 2 048²
+  **15 760,0 ms** (réf. 16 474,1 ; W41 16,3 s), textes identiques aux sha
+  `8144ea1cf398` / `4b24fd7ee70f`.
+- Relecture indépendante (task) : description de row périmée, domaine du cas
+  exhaustif borné aux codes finis (les NaN ne sont pas au contrat), assert
+  `RM` pair, cas de frontière — corrigés puis revalidés. La preuve du `tanhf`
+  est le cas device exhaustif, pas un raisonnement sur sa précision.
+
+Reste ouvert : la tuile haute ne couvre que M ≥ 1 024 (kbench ne teste que
+≤ 512, d'où les cas device dédiés) ; R52 est le seul risque nouveau. Artefacts :
+`<work-root>/work/w42a/`, `/tmp/w42a-suite.log`, `/tmp/w42a-final-kb.md`,
+`/tmp/w42a-fn.md`, `<work-root>/work/w42a-gate/`.
