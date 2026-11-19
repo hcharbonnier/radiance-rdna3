@@ -3974,10 +3974,14 @@ static const RadKernelInfo kKernels[] = {
  * waves would stage different blocks into the same LDS.
  */
 { "attn_paged_bf16_decode", "attn_paged", "attn",
-  "paged attention over a bf16 cache: one head group a workgroup, 16-token tiles, split-KV",
-  "head_dim 128; q_len <= 16; two passes over the blocks -- scores are recomputed in the second so "
-  "the softmax sum accumulates ascending like the reference, and a masked key is never exponentiated; "
-  "the block bounds come from the workgroup's 16 rows, because the staged tile is shared",
+  "paged attention over a bf16 cache: a workgroup is a tile of query rows and one head -- four "
+  "output dims a lane at one row a workgroup, with its scores kept in LDS, 32 at eight rows -- or "
+  "one head group a workgroup beyond that, 16-token tiles, split-KV",
+  "head_dim 128; q_len <= 16; a tile of one to sixteen query rows and one head a workgroup, 32 "
+  "lanes split over the rows, the key walk ascending with one f32 chain an output element; a "
+  "one-row tile keeps its scores in LDS for the second walk, a wider one recomputes them so the "
+  "softmax sum accumulates ascending like the reference; a masked key is never exponentiated; the "
+  "block bounds come from the tile's nominal rows, because the staged tile is shared",
   "bf16 q and out, bf16 cache, i32 block_table and seqused; a descale on a bf16 cache is refused",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_DECODE,
   ROW(cAttnBf16Decode), NOTUNE,
