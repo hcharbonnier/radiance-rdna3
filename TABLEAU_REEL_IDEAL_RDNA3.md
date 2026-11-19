@@ -751,3 +751,59 @@ prompt sous le premier intervalle son dernier chunk entier : préfill Flash-Next
 972 tokens **2 068 → 1 488 ms (1,39×)**, texte identique, décodage inchangé,
 3 252 tokens neutre. Prix : la reprise courte du tour suivant disparaît, d'où
 le défaut `on` (R45).
+
+## État courant 2026-11-19 — W41 (HEAD e42a7d89)
+
+Vue chiffrée de référence après W38–W41. Tous les gains sont **bit-exacts**
+sauf mention ; les textes servis ont été comparés au bit à composition de lot
+fixe. Détail et protocoles : JOURNAL_RDNA3.md (2026-11-18/19) et
+SUIVI_LOTS_RDNA3.md (R39–R51).
+
+### Noyaux
+
+| poste | avant | après | gain | note |
+|---|---:|---:|---:|---|
+| hc_read down (M ≥ 257) | 1×2×128 | tuile **2×2×64** | **+5,3 à +8,7 %** (512–4 096) | 4ed7281 ; TTFT −0,1 à −0,9 % ; **clos** (dot 2,75 instr/MAC vs plancher 2,0, reste = latence) |
+| ttn_dense hd72 vision | 237,1 ms | 162,9 ms | 1,46× au noyau, **1,15×** au TTFT 2048² | **rejeté** : texte servi changé (rel_l2 8,84e-5, 0,128 % des codes) ; FMA = 3,3 % plus **lent** (borné par la latence) |
+| dflash_conv (27B drafter) | hôte seul → *mapped tier* refusé | **row device** | débloque NS=3 | 63dffd ; 8 géométries au bit, dflash_conv_device_test 37/3 |
+| GEMM décodage 27B (m16, M ≤ 4) | 4 chaînes absentes | 4 chaînes i32 + grille split-K tranche-major | **+0,7 à +2,3 %** servi ; kbench M=1 **1,044×** (5 120×6 144 : 47,96 → 40,28 µs, **1,19×**) | 651d0bfc ; le GEMM est à **~555 Go/s** (plafond 726–734) |
+| ttn_paged h128 decode (tronc MiniCPM, drafter) | 9 011 µs/couche (969 clés) | **637 µs** | noyau **14×**, servi **11×** | 9e701396 ; découpe de la **dimension de sortie** (R51) ; 12 288 clés : 115 988 → 8 070 µs (14,4×) |
+| pas Flash-Next (ttn_paged h256 + hc) | 2 082 µs/couche attention | 1 855 µs | **−6,5 %** de décodage | 92722381 ; staging KV préchargé 4 pages, hc_norm 107 → 91 µs, hc_up 45 → 28 |
+| budget d'échanges de chaleur MoE | 64 swaps/étape/classe | 16 après *broad pass* | promotions **160,4 → 57,5 Mio/token**, lien **537 → 423 (−21 %)** | 49f9317a ; décodage 3 252 **−1,75 %**, TTFT −1,5 % |
+
+### Servi (64 tokens générés sauf mention)
+
+| modèle / cas | avant | après | gain |
+|---|---:|---:|---:|
+| 27B, 2 047, NS=0 | 15,48 | — | — |
+| 27B, 2 047, NS=3 | 15,77 (W38c) | **27,45** | **1,74 → 1,77×** |
+| 27B, 139, NS=3 | 34,2 (W38c) | **39,3** | 1,44× |
+| Flash-Next, 3 252, NS=0 / NS=3 | 11,29 / 18,95 | **11,98 / 19,77** | 1,65× |
+| Flash-Next vision 1 024² / 2 048² | 3 309 / 16 400 ms | **3 276 / 16 316 ms** | −1,0 / −0,5 % |
+| MiniCPM, 59 / 781 / 804, NS=0 | 22,6 / 3,08 / 2,99 | **92,0 / 33,9 / 33,2** | 4,1× / 11,0× / 11,1× |
+| MiniCPM, 59 / 781 / 804, NS=7 | 34,1 / 6,86 / 7,99 | **72,1 / 23,8 / 27,8** | 2,1× / 3,5× / 3,5× |
+
+### Ce qui explique les changements de conclusion
+
+- **Le pas de décodage 27B est à 50,5 % d'attention** (ttn_paged 34,4 ms) et
+  40,4 % de GEMM (27,5 ms) : le GEMM est à 76 % du plafond de bande, et
+  l'attention ne se découpe qu'en changeant l'arithmétique (R50).
+- **Le split-KV du drafter était désactivé en service** : les hooks
+  ttn_scratch lisaient ->t[0], que le builder ne passe jamais. C'est la
+  cause du 1,03× de W38, pas le verify (R48 caduc).
+- **Le split-KV n'est pas la seule parallélisation d'une attention** : la
+  découpe par dimension de sortie est bit-exacte et **domine** le split
+  (R49 clos, R51).
+- **Le « 63 Go/token » du MoE était la taille du plan** : 1,20 Gio d'experts
+  routés par token à 3 252, et le lien réel était celui des promotions (R39,
+  W40c).
+- **Le multi-flux 27B à 2 k ne multiplie pas** (8,5–10,8 tok/s agrégés en
+  NS=0) : le « 52–67 tok/s » est un chiffre de contexte court (W40e).
+
+### Ordre de valeur restant
+
+gemm_nt_bias vision (7,20 TF/s pour un plafond bit-exact ~11 → ~1,5×), puis
+les octets du MoE au préfill (81 % du lien), puis ttn_paged h256 au préfill
+(12,6 %). Aucun levier bit-exact n'est ouvert sur le décodage : hc_read est à
+son plancher, le GEMM 27B à 76 % du plafond, l'attention h256 et la vision
+bloquées par le contrat de texte.
