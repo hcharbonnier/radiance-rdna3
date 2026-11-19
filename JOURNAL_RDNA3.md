@@ -2438,3 +2438,95 @@ seuls), miroir `w29-rebase` resynchronisé, build **neuf** `build-w42`
   aucun signe de throttling : écart de mesure, code inchangé depuis e42a7d89.
 - Artefacts : `/tmp/w42-kbench/`, `/tmp/w42-strict.log`,
   `<work-root>/work/w41-results/w42-gate/`.
+
+## 2026-11-19 — W42b : attention h256 de préfill — plans f32 pré-échelonnés, 1,3–1,7× au noyau
+
+**Mesure de départ.** `--profile-ops` sur `/tmp/p3252_64.json` (serveur neuf,
+Flash-Next i8, `NS=0`) : préfill **5 218 ms**, dont **1 019 ms** sur les douze
+sites `attn_paged` (`attn_paged_i8_h256_gqa12_prefill`, 24 couches, deux par
+site ; six appels par site, soit trois lancements par couche — premier chunk de
+2 048, puis les deux restants). C'est la cible du handover §5.3 et §6.B. Le
+décodage h256 n'est pas touché (R50, `splits=1`), son texte non plus.
+
+**Diagnostic** (banc `attn_paged_device_test` en `RAD_ATTN_BENCH=1`, géométries
+servies ajoutées aux cas de banc) : par (lane, dim, clé) chaque jambe de la
+marche paie **quatre instructions** — chargement d'octet LDS, élargissement
+i8→f32, mise à l'échelle f16, FMA — et le second passage rejoue le produit
+scalaire **une clé à la fois** (chaîne de 64 additions dépendantes) parce que le
+plan de scores ne tient pas (96 rangées × 3 252 clés). 205 VGPR : une seule
+workgroup par CU. Les blocs partent dans l'ordre croissant, donc la carte finit
+sur les tuiles causales les plus longues.
+
+**Livré** (`15449cc9`) : la bande de préfill (six vagues) stage K et V **élargis
+et pré-échelonnés** en LDS — `code * scale` est exact en f32 (7 bits × 11 bits),
+c'est le même nombre où qu'on le forme —, en rangées rembourrées de huit
+flottants tous les 64 dims (les quatre lanes d'une rangée lisent quatre bancs au
+lieu d'un) ; les dots sortent **quatre clés à la fois** (une page de cache) dans
+les deux passages ; les tuiles partent **la plus lourde d'abord** (`blockIdx.x`
+croissant est l'ordre de dispatch, une tuile causale voit ses clés croître avec
+son index). Mêmes opérandes, même ordre, mêmes arrondis. La bande de décodage
+garde ses plans i8 et sa marche : elle tient deux workgroups par CU et manque de
+bande passante LDS avant de manquer de slots d'issue — mesuré, les plans f32 y
+coûtent **+31 %** à 8 k de contexte, contre 0 % en i8.
+
+**Noyau** (µs, médiane de 20 lancements × 3 lots, carte 2 693 MHz, 38 °C, aucun
+throttling) :
+
+| géométrie (`attn_paged`, µs) | avant | après | × |
+|---|---:|---:|---:|
+| gqa12 972/972 | 5 090 | **3 031** | 1,68 |
+| gqa12 2 048/2 048 | 17 874 | **12 096** | 1,48 |
+| gqa12 3 072/1 024 | 22 563 | **15 942** | 1,42 |
+| gqa12 3 252/1 204 | 26 762 | **19 542** | 1,37 |
+| gqa12 3 252/180 | 5 703 | **4 096** | 1,39 |
+| gqa12 32 768/q17 | 50 985 | **36 791** | 1,39 |
+| gqa6 2 048/2 048 | 17 722 | **12 003** | 1,48 |
+| gqa6 3 252/1 204 | 26 339 | **18 720** | 1,41 |
+| décodage 8 k/32 k (q1, q4) | 7 564/29 547/37 448 | 7 552/29 503/37 412 | 1,00 |
+
+**Servi** (payloads W41 inchangés, serveur neuf, `cache_n=0`) :
+
+| point | avant (`w41f`) | après | Δ |
+|---|---:|---:|---:|
+| TTFT 3 252 `NS=0` | 5 404 ms | **5 348** | −1,0 % |
+| TTFT 3 252 `NS=3` | 5 921 | **5 875** | −0,8 % |
+| TTFT 972 `NS=0` | 2 107 | **2 075** | −1,5 % |
+| TTFT 972 `NS=3` | 2 311 | **2 282** | −1,3 % |
+| texte Flash-Next 3 252 `NS=0`/`NS=3` | sha `960a2212e059f981` | identique | 0 |
+| texte 27B 1 260 / 2 158 / 138 tokens | `24a4e057`/`e622cf68`/`c98b818d` | identique | 0 |
+
+**L'écart servi/noyau est mesuré, pas supposé.** Au profil l'attention passe de
+1 019 à **940 ms** (−7,8 %) et le TTFT de −1 % à 3 252 ; une invite qui tient en
+**un chunk** encaisse le gain prédit (2 067 tokens : préfill 3 269 → 3 199 ms,
+soit le Δ du noyau à la milliseconde près), alors que le **second chunk**
+(q = 1 204 sur 3 252 clés) n'en rend rien. Le mover annonce **36,45 Gio h2d**
+par préfill — les 48 couches routées sont re-streamées à chaque chunk — donc
+dans un second chunk court l'attention n'est plus le chemin critique. Piste
+ouverte : le débit du stager de préfill, pas l'attention (risque **R54**).
+(`RADIANCE_AQL_STAMP=1` n'a rien écrit dans les runs de cette campagne :
+l'instrument est à vérifier avant de s'appuyer dessus.)
+
+**Validation** (build **neuf** `build-w42val`, gfx1100, FFmpeg, cache de tune) :
+suite complète verte aux compteurs du §5.5 au chiffre près (sauf les cas ajoutés à `attn_paged`, plus bas) — sched_test
+548 964/213, engine_e2e_test 1 087/52 (3 skips), fixture_test 109 671/59,
+config_test 2 952/71, iqr 76/11, ple_hc 76/10, moe_iqr 15/15, vision_rows
+66/10, **attn_paged 36/11**, logits_bf16 8/4, gather_rows_u8 33/3, mtp_enter
+22/3, logit_rerank 36/5, act_i8g 103/6, tp2 12/2, dflash_conv 37/3, selftest
+**196 rows, 0 échec, 16 skips**. `rad-kbench --op attn_paged --bench` :
+Flash-Next **132/132**, 27B **156/156**, 0 échec, 0 divergence (pires rel_l2
+1,168e-04 / 1,499e-04) ; `--bench` complet du conteneur Flash-Next
+**4 786/4 786** (1 442 skipped, 0 échec, 0 divergence, pire rel_l2 1,520e-02,
+2 276 s de mur). Rejoué sur le **build final** (compte de tuiles pris à
+`gridDim.x`) : même suite, mêmes compteurs ; noyau 2 048/2 048 **11 919 µs**,
+3 252/1 204 **19 175**, 3 252/180 **4 032** — à ±1 % des chiffres ci-dessus.
+
+Les frontières que la revue a listées comme non couvertes le sont maintenant par
+sept cas de plus : dernière page à **deux** et **trois** clés dans les deux bandes,
+et cache posé **quatre octets** hors de sa frontière 16 o (la bande de préfill ne
+lit plus que des dwords). `attn_paged_device_test` passe de 29/10 à **36/11**,
+le reste de la suite est inchangé, et `--op attn_paged` reste à 132/132.
+Gates servis sur ce build, mêmes payloads, `cache_n=0` : 3 252 `NS=0`/`NS=3`
+préfill **5 238 / 5 742 ms**, 972 **2 053 / 2 337 ms**, textes **identiques
+octet pour octet** aux références `fn-ns0.txt`/`fn-ns3.txt` (313 octets, sha
+`960a2212e059f981`). La dispersion d'un run à l'autre est de **±30 ms (±0,6 %)** :
+c'est l'ordre des gains servis mesurés ici.

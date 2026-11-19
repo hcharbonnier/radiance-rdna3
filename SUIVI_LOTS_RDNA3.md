@@ -629,6 +629,13 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
 - **R51** — *règle* : pour paralléliser une attention bit-exacte, découper la
   **dimension de sortie**, jamais les clés (la réduction sur les clés est
   l'ordre de sommation).
+- **R54** — *constat (W42b)* : l'attention h256 de préfill gagne **1,3–1,7×**
+  au noyau mais **~1 % servi** à 3 252 tokens. Une invite qui tient en **un**
+  chunk encaisse le gain prédit (2 067 tokens : préfill 3 269 → 3 199 ms) ; le
+  **second chunk** d'un préfill découpé n'en rend rien — le mover re-stream
+  **36,45 Gio h2d** par préfill (48 couches routées à chaque chunk), donc
+  l'attention n'y est plus le chemin critique. Avant d'optimiser l'attention de
+  préfill, mesurer le chemin critique du chunk court : c'est le stager.
 - **W41c** (92722381) : staging KV préchargé 4 pages en avance (85 % du coût
   d'attention h256 était du staging sérialisé), hc_norm vectorisé,
   hc_up 32→64. Pas Flash-Next **−6,5 %** en NS=0 (11,29 → 12,07 tok/s) et
