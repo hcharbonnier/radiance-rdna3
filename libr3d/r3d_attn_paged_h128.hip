@@ -978,12 +978,14 @@ template <int GQA, int W> struct waves_ok {
 int tok_per_block(int gqa, int waves) { return waves * (32 / (gqa > 0 ? gqa : 1)); }
 
 /* The decode entry's `splits` when the caller asked for the widest legal: enough workgroups to fill
- * a 16-CU card (two workgroups a CU at four waves a SIMD) and no more, on a doubling ladder. */
+ * the card (two workgroups a CU at four waves a SIMD) and no more, on a doubling ladder. The target
+ * is the head_dim-256 rows' (128 workgroups): the old 32 left a 96-CU card at a third of its
+ * occupancy whenever the tile and KV-head counts were small, which is the decode band's shape. */
 int pick_splits(int tiles, int num_seqs, int kv_heads)
 {
     const long long blocks = (long long)tiles * num_seqs * kv_heads;
     int sp = 1;
-    while (sp < 8 && blocks * sp < 32) sp *= 2;
+    while (sp < 16 && blocks * sp < 128) sp *= 2;
     return sp;
 }
 
