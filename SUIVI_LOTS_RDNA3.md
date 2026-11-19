@@ -356,6 +356,14 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   un nouveau contrat de texte servi.
 - **Reste** : `moe_gemm_q` (56,5 % du préfill 972 tokens) via la continuation
   de trellis, puis `hc_read` (17,6 %).
+- **`hc_read`, W40b** : tuile down **2×2×64** au-delà de 256 rangées
+  (`a4ed7281`), oracle `M=257` ajouté (`8401e6fd`, 58 → **76 checks**),
+  **5,3–8,7 %** bit-exacts sur la plage servie 512–4 096 et TTFT −0,1 à
+  −0,9 %, textes identiques. Les plans f32 pré-décodés, le prefetch registre,
+  P2Q4/P4Q2 et WMMA/`v_dot2` sont **rejetés sur mesure** ; la marge de **1,7×**
+  n'est pas atteignable sous contrainte bit-exacte (dot à 2,75 instr/MAC
+  contre un plancher de 2,0, le reste est de la latence à 24 vagues). Ce n'est
+  plus un reste à faire.
 - **IQR — tuile 2×4 rejetée (W32)** : 1,94× réel à M=1626 (32,91 → 16,94 ms,
   34,2 TFLOP/s, 0 ulp) mais sur la grille **i8 signée**, gardée par
   `F::KIND == kSigned && F::B == 8` ; le 27B est **trellis u4/u5**

@@ -2076,3 +2076,38 @@ exact qui tient, ou un nouveau contrat de texte servi.
 Les diagnostics jetables qui donnent le plafond : supprimer le dot de la marche
 2 = **1,45×**, supprimer la marche 1 = **1,48×**, supprimer le staging K de la
 marche 2 = 2 %.
+
+## 2026-11-19 — W40b : `hc_read` gagne 5–9 % sur la plage servie, la marge 1,7× est hors contrat
+
+Profil (`rocprofv3 --kernel-trace`, `RAD_HC_BENCH_M=512`) : `down` 866 µs
+(46 %), `up` 707 µs (39 %), `norm` 218 µs (12 %), `quant` 49 µs — le levier est
+le down. Livré `a4ed7281` + `8401e6fd` (fusionnés) : tuile down **2×2×64**
+(`hc_down_kernel_p2q2c64`) au-delà de 256 rangées, la tuile 1×2×128 restant
+sous ce seuil ; deux cas d'oracle à `M=257` (E4M3 `lr=128`, bf16 `lr=20`)
+couvrent le stage partiel, `ple_hc_device_test` passe de 58 à **76 checks**.
+Bit-exact vs libref, textes servis identiques aux trois points.
+
+| M | avant 1×2×128 (µs) | après 2×2×64 (µs) | gain |
+|---:|---:|---:|---:|
+| 128 | 734 | 840 | tuile étroite conservée |
+| 512 | 1 953 | 1 849 | 5,3 % |
+| 896 | 3 589 | 3 292 | 8,3 % |
+| 2 048 | 7 197 | 6 610 | 8,2 % |
+| 4 096 | 13 576 | 12 396 | 8,7 % |
+
+Servi (NS=0, KV i8) : texte 3 252 tokens 5 443 → 5 397 ms (−0,85 %), image
+1 024² 3 193 → 3 182 ms, 2 048² 16 474 → 16 451 ms ; décodage 11,10 → 11,08
+tok/s (dans le bruit, chemin inchangé) ; textes identiques au bit à la
+référence W38.
+
+**Rejeté, sur mesure** : plans f32 pré-décodés (perdent 26–30 % à M=128–512,
+le gain VALU est annulé par 4× d'octets de poids relus en L2), prefetch des
+codes en registres (68→83 VGPR, 2 workgroups/CU au lieu de 3, neutre à −1 %),
+tuiles P2Q4/P4Q2 (occupation à 2 blocs pour ≤2 % d'instructions en moins),
+WMMA / `v_dot2` (ordre d'accumulation différent → interdit par le contrat),
+découpage du dot entre lanes (casserait la somme ascendante).
+
+**Conclusion** : le dot est à 2,75 instructions/MAC contre un plancher de 2,0 ;
+le reste est de la latence à 24 vagues. La marge de **1,7×** de §6.B n'est pas
+atteignable par vectorisation, largeur de lane ou staging sous contrainte
+bit-exacte : c'est un constat, pas un reste à faire.
