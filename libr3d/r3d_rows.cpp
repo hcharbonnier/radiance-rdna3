@@ -1671,22 +1671,31 @@ extern "C" void r3d_cfg_topk(const RadArgs* a, R3dTopkCfg* out) {
     out->nch = 0;
 }
 
+/* The rows an attention band can issue, from its frozen geometry alone. A scratch hook runs at
+ * declare with no tensors (rad_builder.cpp: RadArgs carries the band's params, never operands), so
+ * the shape has to come from `q_len` -- the band's collapsed upper bound -- times `max_seqs`: the Q
+ * plane holds one q_len-row block per sequence. Reading the operand's numel instead answers 0 here
+ * and silently leaves the split pass without an arena. */
+static long long attn_scratch_rows(const RadArgs* a) {
+    if (!a) return 0;
+    const long long q_len = rad_param_getdim(a->p, a->n_p, "q_len", 0);
+    long long max_seqs = rad_param_getdim(a->p, a->n_p, "max_seqs", 1);
+    if (q_len <= 0) return 0;
+    if (max_seqs <= 0) max_seqs = 1;
+    return q_len * max_seqs;
+}
+
 /* Split-KV partials: one record of 128 accumulator floats plus the running max and sum (132
  * floats) per (query row, head, slice). The shim takes the slice count from the bytes the engine
  * offers, halving it until they fit, so this is the request at the slice count the walk benefits
  * from, capped at 16 MiB. Attaching scratch makes the row non-concurrent (rad_kernel_concurrent is
  * `scratch == nullptr`), which is the cost of the split. */
 static int64_t attn_scratch(const RadArgs* a) {
-    /* Sized from the shape: a scratch hook runs at declare, when the operands' shapes are bound
-     * but every tensor's `data` is still null. A hook that required data would answer 0 and the
-     * split pass would find no buffer. gemm_scratch sizes from RadParam dims for the same reason. */
-    if (!a || a->n_t < 1 || a->t[0].rank == 0) return 0;
-    long long n_head = 0, head_dim = 0;
-    const int64_t nh = rad_args_geti(a, "n_head", &n_head) ? n_head : 0;
-    if (!rad_args_geti(a, "head_dim", &head_dim) || !head_dim || !nh) return 0;
-    const long long rows = rad_tensor_numel(&a->t[0]) / (nh * head_dim);
-    if (rows <= 0) return 0;
-    const long long want = rows * nh * 8 * 132 * (long long)sizeof(float);
+    if (!a) return 0;
+    const long long rows = attn_scratch_rows(a);
+    const long long nh = rad_param_getdim(a->p, a->n_p, "n_head", 0);
+    if (rows <= 0 || nh <= 0) return 0;
+    const long long want = rows * nh * 16 * 132 * (long long)sizeof(float);
     const long long cap = 16LL << 20;
     return want < cap ? want : cap;
 }
@@ -1695,17 +1704,17 @@ static int64_t attn_scratch(const RadArgs* a) {
  * and sum (260 floats) per (query row, head, slice), at the widest split the arena hint asks for
  * (16) and capped at 16 MiB. Both bands use the arena (decode at q_len 1, prefill for a short
  * chunk over a long context) and the shim halves the ladder until it fits, down to splits = 1.
- * Attaching scratch makes the row non-concurrent, as for the h128 decode. */
+ * Attaching scratch makes the row non-concurrent, as for the h128 decode.
+ *
+ * Deliberately no arena in service. A split is a reassociation, and the split's slice partition
+ * follows a workgroup's token range, so the one-row step and a verify step do not round alike: with
+ * the arena the 27B decode step drops 68 -> 39 ms (1.75x, measured) but its greedy text changes,
+ * even at NS = 0 where nothing else moved. The device test allocates its own arena and keeps
+ * exercising both ladders; the speculative path's determinism is carried by the GEMM bands instead
+ * (r3d_gemm_iqr_m16.hip's slice brackets). */
 static int64_t attn_h256_scratch(const RadArgs* a) {
-    if (!a || a->n_t < 1 || a->t[0].rank == 0) return 0;
-    long long n_head = 0, head_dim = 0;
-    const int64_t nh = rad_args_geti(a, "n_head", &n_head) ? n_head : 0;
-    if (!rad_args_geti(a, "head_dim", &head_dim) || !head_dim || !nh) return 0;
-    const long long rows = rad_tensor_numel(&a->t[0]) / (nh * head_dim);
-    if (rows <= 0) return 0;
-    const long long want = rows * nh * 16 * 260 * (long long)sizeof(float);
-    const long long cap = 16LL << 20;
-    return want < cap ? want : cap;
+    (void)a;
+    return 0;
 }
 
 /* The IQR GEMV's split-K partials (r3d_gemm_iqr_m16.hip): [splits][N] f32 for the narrow band, 0

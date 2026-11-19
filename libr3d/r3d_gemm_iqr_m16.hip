@@ -141,20 +141,57 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
 #pragma unroll
     for (int i = 0; i < NP; ++i) acc[i] = 0.0f;
 
-    for (uint32_t g = 0; g < ngrp; ++g) {
-        int sub[NP];
+    /* The GEMV band splits K at a narrow N (r3d_gemm_iqr_splitk.hip); a verify step's M rows must
+     * answer bit-for-bit what the one-row step answered, or a speculative row lands on a different
+     * side of a near-tie than the greedy walk it is supposed to reproduce. The split is a
+     * bracketing of the same group terms (slices of whole 128-K groups, summed in slice order, the
+     * row scale once), so the same brackets here make M > 1 identical to the split GEMV: the
+     * partial and the accumulator both start at 0, and 0 + p0 is p0. With one slice this is the
+     * flat chain it replaces, unchanged. Only the computed trellis has a split kernel, and only at
+     * group 128. The two loops are duplicated rather than one carrying a compile-time branch so
+     * that no other form pays the extra accumulator's registers. */
+    constexpr bool kSplitBrackets = (MT > 1 && F::KIND == kTrellisMad && GS == 1);
+    if constexpr (kSplitBrackets) {
+        uint32_t kg = ngrp;   /* groups a slice */
+        if (N <= 8192) {      /* kIqrSplitMaxN, the split band */
+            uint32_t s = 1;
+            if (nkb % 8u == 0u) s = 8;
+            else if (nkb % 4u == 0u) s = 4;
+            else if (nkb % 2u == 0u) s = 2;
+            kg = ngrp / s;
+        }
+        float part[NP];
 #pragma unroll
-        for (int i = 0; i < NP; ++i) sub[i] = 0;
-        for (int j = 0; j < GS; ++j) {
-            const uint32_t kb = g * GS + (uint32_t)j;
-            const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
-            uint32_t w[16];
-            Dec<F>::rows(r, c, 1.0f, w);
-            Dec<F>::unzero(c, rt, kb, w);
+        for (int i = 0; i < NP; ++i) part[i] = 0.0f;
+        for (uint32_t g = 0; g < ngrp; ++g) {
+            int sub[NP];
 #pragma unroll
-            for (int q = 0; q < 16; ++q) *(uint32_t*)(sW + q * 128 + 4u * lane) = w[q];
-            __syncthreads();
-
+            for (int i = 0; i < NP; ++i) sub[i] = 0;
+            for (int j = 0; j < GS; ++j) {
+                const uint32_t kb = g * GS + (uint32_t)j;
+                const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
+                uint32_t w[16];
+                Dec<F>::rows(r, c, 1.0f, w);
+                Dec<F>::unzero(c, rt, kb, w);
+#pragma unroll
+                for (int q = 0; q < 16; ++q) *(uint32_t*)(sW + q * 128 + 4u * lane) = w[q];
+                __syncthreads();
+#pragma unroll
+                for (int i = 0; i < NP; ++i) {
+                    const int p = (int)lane + kIqrWave * i;
+                    if constexpr (MT * 16 < kIqrWave) {
+                        if (p >= MT * 16) continue;
+                    }
+                    const int m = p / 16, q = p % 16;
+                    if (m >= M) continue;
+                    const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
+                    const uint32_t* wp = (const uint32_t*)(sW + q * 128);
+#pragma unroll
+                    for (int c4 = 0; c4 < 32; ++c4)
+                        sub[i] = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub[i]);
+                }
+                __syncthreads();
+            }
 #pragma unroll
             for (int i = 0; i < NP; ++i) {
                 const int p = (int)lane + kIqrWave * i;
@@ -163,25 +200,57 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
                 }
                 const int m = p / 16, q = p % 16;
                 if (m >= M) continue;
-                const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
-                const uint32_t* wp = (const uint32_t*)(sW + q * 128);
-#pragma unroll
-                for (int c4 = 0; c4 < 32; ++c4)
-                    sub[i] = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub[i]);
+                const float sa = as[m * (int)ngrp + (int)g];
+                const float sb = fold_f32<F>(c, row0 + q, g * GS);
+                part[i] += (float)sub[i] * sa * sb;
+                if ((g + 1u) % kg == 0u) {
+                    acc[i] += part[i];
+                    part[i] = 0.0f;
+                }
             }
-            __syncthreads();
         }
+    } else {
+        for (uint32_t g = 0; g < ngrp; ++g) {
+            int sub[NP];
 #pragma unroll
-        for (int i = 0; i < NP; ++i) {
-            const int p = (int)lane + kIqrWave * i;
-            if constexpr (MT * 16 < kIqrWave) {
-                if (p >= MT * 16) continue;
+            for (int i = 0; i < NP; ++i) sub[i] = 0;
+            for (int j = 0; j < GS; ++j) {
+                const uint32_t kb = g * GS + (uint32_t)j;
+                const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
+                uint32_t w[16];
+                Dec<F>::rows(r, c, 1.0f, w);
+                Dec<F>::unzero(c, rt, kb, w);
+#pragma unroll
+                for (int q = 0; q < 16; ++q) *(uint32_t*)(sW + q * 128 + 4u * lane) = w[q];
+                __syncthreads();
+#pragma unroll
+                for (int i = 0; i < NP; ++i) {
+                    const int p = (int)lane + kIqrWave * i;
+                    if constexpr (MT * 16 < kIqrWave) {
+                        if (p >= MT * 16) continue;
+                    }
+                    const int m = p / 16, q = p % 16;
+                    if (m >= M) continue;
+                    const int8_t* ap = a + (long long)m * a_ld + (long long)kb * 128;
+                    const uint32_t* wp = (const uint32_t*)(sW + q * 128);
+#pragma unroll
+                    for (int c4 = 0; c4 < 32; ++c4)
+                        sub[i] = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub[i]);
+                }
+                __syncthreads();
             }
-            const int m = p / 16, q = p % 16;
-            if (m >= M) continue;
-            const float sa = as[m * (int)ngrp + (int)g];
-            const float sb = fold_f32<F>(c, row0 + q, g * GS);
-            acc[i] += (float)sub[i] * sa * sb;
+#pragma unroll
+            for (int i = 0; i < NP; ++i) {
+                const int p = (int)lane + kIqrWave * i;
+                if constexpr (MT * 16 < kIqrWave) {
+                    if (p >= MT * 16) continue;
+                }
+                const int m = p / 16, q = p % 16;
+                if (m >= M) continue;
+                const float sa = as[m * (int)ngrp + (int)g];
+                const float sb = fold_f32<F>(c, row0 + q, g * GS);
+                acc[i] += (float)sub[i] * sa * sb;
+            }
         }
     }
 
