@@ -212,7 +212,11 @@ projection de coefficients comprises ; kbench laisse ses 112 cas du 27B en
 « skipped » (la déclaration porte la plane entière, le site d'issue la tranche
 par `wrow_slice`). Sur `w40f` (W40), la suite complète reste verte avec
 `config_test` **2 952**, `ple_hc_device_test` **76** et `fixture_test`
-**109 671** (à lancer avec `RADIANCE_HOME`, sinon 7 cas sont sautés).
+**109 671** (à lancer avec `RADIANCE_HOME`, sinon 7 cas sont sautés). Sur
+`w41f` (W41), `attn_paged_device_test` passe à **29 checks / 10 cas** (les
+21 cas h128 de la bande de têtes sont comparés **au bit** au noyau large) et
+le tronc h128 de MiniCPM sert 11× plus vite à contexte égal, sans changer un
+texte (R51 : on découpe la dimension de sortie, jamais les clés).
 Test de contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
 `gather_rows_u8_device_test` couvre les rows u8 du tier KV (fragment 4 128 octets,
 octets opaques, pitches larges) ; `mtp_enter_e4m3_device_test` et
@@ -276,19 +280,20 @@ agrégés » est un chiffre de **contexte court** (256 tokens : 51–61 tok/s) :
 moins qu'un seul flux (15,4), et `NS=3` les remonte à 15,1–15,6 (W40e). Le
 drafter sert depuis W38c (`dflash_conv` sur la carte, cache
 du drafter en bf16) et depuis W40d son attention prend le split-KV (aréna
-dimensionnée) : `--num-speculative-tokens 3` donne **1,74×** à 2 047 tokens
-(26,9 contre 15,4 tok/s, acceptation 70 %) et **1,44×** à 139 (39,3 contre
+dimensionnée) : `--num-speculative-tokens 3` donne **1,77×** à 2 047 tokens
+(27,5 contre 15,5 tok/s, acceptation 70 %) et **1,44×** à 139 (39,3 contre
 27,3, 72 %) ; texte glouton identique, préfill +2 à +9 %. `NS=2` est refusé par
 l'arch (bloc entraîné = 4). **`NS=3` est le défaut** aux deux longueurs.
 
 Recette MiniCPM5-2B (IQ8R, groupe 256) : `--tp 1` en **KV bf16** (les rows
 `attn_paged`/`kv_store` de cet arch refusent i8 à `head_dim=128`) ; 523 ops /
-423 poids. Le drafter DSpark est entraîné à **bloc 7** : `NS=3` est **refusé
-par l'arch**, c'est `--num-speculative-tokens 7` qui sert (58,9 tok/s à
-969 tokens contre 28,1 en `NS=0`, acceptation 27 % ; 73,2 contre 62,7 au
-prompt court, texte identique au bit). Attention au **tronc h128 causal** :
-sans aréna de split il plafonne à ~2,5 tok/s à 1 k de contexte (R49) ; le
-« 40,2 tok/s à 60 tokens » d'avant n'est pas reproduit (22,2 mesuré).
+423 poids ; le tronc h128 causal passe par la **bande de têtes** (W41b,
+bit-exacte, 14× au noyau). Le drafter DSpark est entraîné à **bloc 7** :
+`NS=3` est **refusé par l'arch**, c'est `--num-speculative-tokens 7` qui sert.
+Servi mesuré (`w41f`, 60 tokens, textes identiques au bit) : `NS=0`
+**92,0 / 33,9 / 33,2 tok/s** aux prompts 59 / 781 / 804, `NS=7`
+72,1 / 23,8 / 27,8. À ~1 k de contexte la bande est ce qui rend le modèle
+utilisable (2,99 tok/s avant ; R49 clos).
 
 ## Pièges connus
 
@@ -328,9 +333,10 @@ sans aréna de split il plafonne à ~2,5 tok/s à 1 k de contexte (R49) ; le
   Inversement, une op déclarée peut replier des cas élémentaires (27B :
   30 cas `sigmoid`/`mul`/`quant_act_fp8`), d'où un compte kbench qui baisse
   sans échec : comparer les textes servis, pas seulement les compteurs.
-- **MTP** : Flash-Next se sert à `NS=3` (1,82× le décodage, texte identique,
-  acceptation ~40 %) ; le 27B sert `NS=3` depuis W38c et en **gagne 1,74×** à
-  2 047 et 1,44× à 139 depuis W40d (R48 caduc), texte identique. Un poids
+- **MTP** : Flash-Next se sert à `NS=3` (**1,65×** le décodage depuis W41c,
+  texte identique, acceptation 54 %) ; le 27B sert `NS=3` depuis W38c et en
+  **gagne 1,77×** à 2 047 et 1,44× à 139 depuis W40d (R48 caduc), texte
+  identique. Un poids
   joint `rad.planes` d'une row device peut vivre en VRAM : un shim ne doit pas
   lire son en-tête sur l'hôte (SIGSEGV, corrigé dans `gemm_nt_q_w2a8_m16`),
   et le MT du bras `w2a8` doit avoir un chunk qui divise K (M=1/K=2560 → MT=4).
