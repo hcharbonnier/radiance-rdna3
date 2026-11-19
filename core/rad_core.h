@@ -1237,6 +1237,14 @@ struct Config {
      * share, keeping them resident: heat never demotes them. 0 is off. */
     float   expert_pin_top = 0.0f;
     bool    expert_pin_top_given = false;
+    /* --expert-moves N: swaps the heat engine may propose per slab class each step, N from the
+     * first step. 0 (the default) follows the plan: 16 once a broad pass has shaped the resident
+     * set and at least 60% of the movable expert bytes stay on the card, where extra swaps are
+     * churn, and RAD_PLACE_MOVES_PER_STEP otherwise; the full budget comes back after 512 steps
+     * without a broad pass. A thin history (a short prompt's decode) keeps the full budget either
+     * way (heat_params_for, kHeatDenseSelections). */
+    int     expert_moves = 0;
+    bool    expert_moves_given = false;
     /* --draft-expert-placement auto|host. `host` pins a draft head's (MTP/DSpark) routed experts
      * in the host pool before any strategy runs, read in place like a pooled expert, so they fit
      * beside a trunk that already fills the card. `auto` (the default) leaves them to the

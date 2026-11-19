@@ -151,8 +151,12 @@ struct SlabClass {
 #define RAD_PLACE_FILE_WINDOWS 4
 #define RAD_PLACE_FILE_WINDOW_BYTES ((int64_t)32 << 20)
 
-/* Heat engine move budget: swaps per step per slab class. HeatParams::moves_per_step defaults to
- * it and the free slots below are sized from it, since a swap without a free slot does not happen.
+/* Heat engine move budget: swaps per step per slab class. It is the budget's ceiling and the free
+ * slots below are sized from it, since a swap without a free slot does not happen.
+ * HeatParams::moves_per_step asks for it only when the plan leaves enough experts off the card
+ * for swaps to raise the hit rate; heat_params_for lowers it to kHeatChurnMoves on a plan that
+ * keeps 60% or more resident, once a broad pass has shaped the set (a short prompt's decode keeps
+ * it), where the extra swaps re-copy experts the next steps would hit.
  * The engine proposes once a step (Engine::tiering_dispatch) for every layer. Replaying a mixed
  * workload on Qwen3.8-Flash-Next TP1 with 40% of experts resident, the decode hit rate is 63.8% at
  * 8, 74.1% at 32, 77.1% at 64 and 77.8% at 128; an oracle held to 64 reaches 78.0%, so past 64

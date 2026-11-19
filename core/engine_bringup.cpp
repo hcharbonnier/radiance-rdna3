@@ -3742,8 +3742,9 @@ int Engine::load_weights() {
                  humanb(r->pools.weights().used() + r->pools.weights().avail()).c_str());
 
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
-         * returns RAD_OK with `enabled() == false`. */
-        RAD_TRY(r->heat.init(r->plan, HeatParams{}));
+         * returns RAD_OK with `enabled() == false`. The move budget follows the plan's residency
+         * unless --expert-moves names one (heat_params_for). */
+        RAD_TRY(r->heat.init(r->plan, heat_params_for(r->plan, cfg_.expert_moves)));
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory
          * the process does not own, which on this driver does not fault: the copy never completes

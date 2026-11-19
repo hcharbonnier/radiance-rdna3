@@ -395,6 +395,13 @@ static const Flag g_flags[] = {
     { "--expert-pin-top",     "F",      "pin the hottest fraction F of the routed experts (0 < F <= 1) by\n"
     "                                    --expert-profile's share: heat never demotes them, so the decode-hot\n"
     "                                    set stays resident while the rest streams. 0 is off" },
+    { "--expert-moves",       "N",      "heat-engine swaps per slab class each step: N from the first\n"
+    "                                    step, or 0 to follow the plan (the default). Following the plan:\n"
+    "                                    16 once a broad pass (a routing histogram of about 410 rows at\n"
+    "                                    top_k 10) has shaped the resident set and 60% or more of the\n"
+    "                                    movable expert bytes stay on the card, where further swaps only\n"
+    "                                    re-copy experts the steps would hit; 64 otherwise, and 64 again\n"
+    "                                    after 512 steps without such a pass" },
     { "--draft-expert-placement", "PLACEMENT", "where a draft head's (MTP/DSpark) routed experts live.\n"
     "                                    `host` pins them in the host pool before any strategy runs, read in\n"
     "                                    place like a pooled expert: the drafter's experts fit beside a trunk\n"
@@ -1217,6 +1224,17 @@ int config_parse(int argc, char** argv, Config* c) {
             c->expert_pin_top = (float)d;
             c->expert_pin_top_given = true;
         }
+        else if (S("--expert-moves"))          {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            char* e = nullptr;
+            const long n = strtol(v, &e, 10);
+            if (e == v || *e != '\0' || n < 0 || n > 1024) {
+                RAD_ERR("--expert-moves: '%s' is not a count in [0, 1024]", v);
+                return RAD_E_INVAL;
+            }
+            c->expert_moves = (int)n;
+            c->expert_moves_given = true;
+        }
         else if (S("--draft-expert-placement")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (std::strcmp(v, "auto") != 0 && std::strcmp(v, "host") != 0) {
@@ -1664,6 +1682,8 @@ const ShowRow kShow[] = {
     { "--expert-stats",       [](const Config& c) { return or_none(c.expert_stats, "off"); } },
     { "--expert-profile",     [](const Config& c) { return or_none(c.expert_profile, "off"); } },
     { "--expert-pin-top",     [](const Config& c) { return fmt("%.4g", c.expert_pin_top); } },
+    { "--expert-moves",       [](const Config& c) {
+        return c.expert_moves_given ? fmt("%d", c.expert_moves) : std::string("auto"); } },
     { "--draft-expert-placement", [](const Config& c) { return c.draft_expert_placement; } },
     { "--live",               [](const Config& c) { return onoff(c.live_view); } },
     { "-v",                   [](const Config& c) { return onoff(c.given.count("-v") > 0); } },
