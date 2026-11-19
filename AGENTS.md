@@ -3,8 +3,8 @@
 ## Contexte
 
 - Branche de travail : `rdna3-iqr`.
-- Tout travail GPU (tests, serveur, benchmark) se fait sous
-  `flock -w 7200 /tmp/radiance-gpu.lock -c '...'`, un seul processus à la fois.
+- Tout travail GPU passe par l'hôte `ai` sous son verrou : voir
+  `.kilo/rules/remote-machine-ai.md`.
 - Builds : `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
   -DRAD_GPU_TARGETS=gfx1100 -DRAD_WITH_FFMPEG=ON` puis
   `cmake --build build -j 16`.
@@ -16,32 +16,13 @@
 
 ## Consignes de travail
 
-- **Autonomie** : continuer jusqu'à un jalon (si vraiment important), une décision à prendre ou une
-  autorisation à obtenir. Ne pas s'arrêter pour un progrès routinier, et ne pas
-  demander confirmation d'une action déjà autorisée.
-- **Outils** : pour lire, éditer ou créer des fichiers **locaux**, utiliser les
-  outils natifs (`read`, `edit`, `write`, `glob`, `grep`) plutôt que le shell.
-  Le shell sert aux builds, tests, git, SSH et au GPU. Les scripts temporaires
-  vont dans `%TEMP%\kilo` (Windows) ou `/tmp` (hôte), pas dans le dépôt.
-- **Sous-agents et parallélisme** :
-  - **Implémentation de code parallélisable** → **Agent Manager**
-    (`agent_manager`, mode `worktree`), à privilégier. **Aucune limite** sur le
-    nombre d'agents : découper selon les zones de code indépendantes (pas de
-    plafond à 3 ou 4).
-  - **Tout travail parallélisable qui n'est pas de l'implémentation** (validation,
-    campagnes de tests, mesures, exploration, doc) **sur la branche courante** →
-    outil `task` uniquement, **jamais** Agent Manager.
-  - **Chaque agent Agent Manager relit son propre travail** (`/review worktree`)
-    avant de conclure, puis **corrige lui-même** les bugs qu'il a trouvés et
-    revérifie. Un agent qui délègue sans relecture n'a pas terminé.
-  - **Fusion** : l'agent principal est **responsable de la fusion** du code dans
-    la branche courante dès que le travail des sous-agents est terminé, validé
-    et corrigé (build + tests + kbench, cf. `## Validation`). Ne pas laisser un
-    worktree validé non fusionné.
-  - Ne pas créer de session Agent Manager pour du non-code ; une réponse à un
-    message inter-agents se fait via `agent_manager` avec le `replyTo` fourni.
-  - Un seul travail GPU à la fois sur l'hôte (voir `flock`) : le parallélisme
-    porte sur le code et les tests hôte, pas sur des runs carte concurrents.
+- **Sous-agents** : le cycle délégation → relecture → fusion est dans
+  `.kilo/rules/agent-workflow.md`. Propre au dépôt : la validation, les
+  campagnes de tests, les mesures, l'exploration et la doc parallélisables
+  passent par `task` sur la branche courante, jamais par Agent Manager ; une
+  réponse à un message inter-agents passe par `agent_manager` avec le
+  `replyTo` fourni ; un worktree validé (build + tests + kbench, cf.
+  `## Validation`) ne reste pas non fusionné.
 - **Décisions de contrat** : avant de durcir ou d'assouplir le contrat d'une row,
   lire l'implémentation de référence RDNA4 (`libr4d/`) : c'est elle qui a servi
   à fabriquer les conteneurs. Un contrôle qui n'est pas dans le schéma de la row
@@ -299,14 +280,12 @@ utilisable (2,99 tok/s avant ; R49 clos).
 
 ## Pièges connus
 
-- Builds périmés après `rsync -a` (mtimes) → répertoire de build neuf pour tout A/B.
-- Un `.so` remplacé pendant qu'un serveur tourne : tuer le serveur avant de reconstruire.
 - Vérifier que le processus qui répond sur le port est bien le binaire visé
   (`readlink /proc/<pid>/exe`).
 - Un build sans `-DRAD_WITH_FFMPEG=ON` refuse toute image
   (`capabilities.image=false`) ; l'hôte exige les paquets `libav*-dev` et
-  `pkg-config --modversion libavformat` doit répondre. `<gpu-user>` n'a pas
-  `sudo` : l'installation des paquets est une action administrateur.
+  `pkg-config --modversion libavformat` doit répondre. Sur `ai`, `sudo` n'est
+  ouvert qu'à `/usr/bin/apt` (NOPASSWD).
 - **Passes média** : une image au-delà de `image-max-pixels` (4 194 304 px) est
   redimensionnée à 2048², pas refusée ; le watchdog peut journaliser
   « nothing has been logged for 20/40 s » (`core/engine.cpp:1307`) pendant une
@@ -372,4 +351,3 @@ utilisable (2,99 tok/s avant ; R49 clos).
   `nearest`) ; un prompt répété reste exact et, au-delà de l'intervalle,
   `exact` reste strict. Ne pas « corriger » cette ancre sans relire R22
   (`core/sched/scheduler.cpp`, `ChunkGeometry`).
-- Ne pas lancer deux benchmarks ou un benchmark pendant qu'un agent teste.
