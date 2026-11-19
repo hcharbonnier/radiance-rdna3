@@ -2316,3 +2316,79 @@ capte déjà la localité).
   supérieur à ~1,06× sur le GEMM ; les 34 ms d'attention ne se déplacent qu'en
   changeant l'arithmétique (le split-KV du tronc, refusé pour le texte). Ne pas
   rouvrir un chantier GEMM de décodage 27B sans accepter ce constat.
+
+## 2026-11-19 — W41b : le tronc h128 de MiniCPM par bande de têtes — 11× bit-exact, R49 clos
+
+**Diagnostic** (ablations sur le noyau large, 969 clés) : la marche KV est
+**gratuite** (chargements sur adresse chaude : 9,0 ms inchangé) ; score_of en
+passe 1 = 310 µs/couche ; **PV = 8,25 ms des 9,0 ms**, dont 7,65 ms pour le
+seul 16_to_f32 de V. Cause : cc[128] + qf[64] saturent les 256 VGPR, le
+widening spille, et les broadcasts LDS se scalarisent en _readlane. Le
+split-KV ne faisait que paralléliser ce coût — d'où son 28,15 tok/s
+non bit-identique.
+
+**Solution** (9e701396, fusionné) : découper la **dimension de sortie**, pas
+les clés. Un workgroup = une tuile de R lignes × une tête, 32 lanes sur les
+lignes, un lane possède 128/(32/R) dims. La marche, l'ordre dot2 du QK, la
+chaîne cc[d] += w·v[d] sur j croissant, mx, sum += exp(sc−mx) et
+f16x2_rne sont **inchangés** ; seule la lane qui porte un élément change. À
+R=1 le score est calculé une fois et gardé en LDS (plan dynamique 4·jcap,
+jusqu'à 12 288 clés). 	ests/attn_paged_device_test.cpp passe à **29 checks /
+21 cas h128** (q_len 1→16, causal et non causal, fenêtres, gqa 1/4/8, 1→5
+séquences, rectangulaire et cu_seqlens) comparés **au bit** au noyau large.
+
+| noyau (µs/couche, 1 séquence) | large splits=1 | bande | × |
+|---|---:|---:|---:|
+| ctx 969, q=1 | 9 011 | **637** | 14,1 |
+| ctx 8 208 / 12 288, q=1 | 77 001 / 115 988 | **5 489 / 8 070** | 14,0 / 14,4 |
+| q=4 (verify) | 8 938 | 1 508 | 5,9 |
+| q=8 (verify NS=7) | 9 014 | 2 104 | 4,3 |
+
+**Servi MiniCPM5-2B** (tp1, KV bf16, 60 tokens, w40f → w41f, textes
+**identiques au bit** partout) :
+
+| prompt | NS=0 | NS=7 |
+|---|---:|---:|
+| 59 | 22,6 → **92,0** (4,1×) | 34,1 → 72,1 (2,1×) |
+| 781 | 3,08 → **33,9** (11,0×) | 6,86 → 23,8 (3,5×) |
+| 804 | 2,99 → **33,2** (11,1×) | 7,99 → 27,8 (3,5×) |
+| 7 694 (agent) | 0,3 → **4,5** (15×) | — |
+
+- **R49 clos sans re-baseline** : le split-KV n'était pas la seule voie, et il
+  est même **dominé** (28,15 tok/s, non bit-identique) par une découpe qui ne
+  touche à aucune parenthèse. Le plafond bit-exact est la chaîne de 64 dot2
+  (~310 µs/couche et par passe) ; la bande tient 637 µs/couche à 969 clés,
+  soit ~15 ms/token d'attention et **~44 tok/s de plafond servi** pour ce
+  modèle à 969 clés.
+- **R51** — *règle (W41b)* : pour paralléliser une attention **bit-exacte**,
+  découper la **dimension de sortie** (une tuile de lignes × une tête par
+  workgroup, un lane par dims) et jamais les **clés** : la réduction sur les
+  clés est l'ordre de sommation, la découper change les parenthèses.
+
+## 2026-11-19 — W41c : pas Flash-Next — staging KV préchargé, −6,5 %
+
+Mesure (RADIANCE_AQL_STAMP, 1 589 dispatchs par pas, 6,6 % d'inactivité) :
+l'attention h256 coûtait 2,08 ms/couche dont **85 % de staging KV sérialisé**
+(318 µs sans staging) ; hc_read 27,2 ms dont hc_norm 10,3 ms pour
+96 lancements.
+
+Livré (92722381, fusionné) : le run de page de 16 o est préchargé **quatre
+pages en avance** dans des registres (une page par lane) puis rangé par
+put_page_run — mêmes clés, mêmes octets, même ordre ; hc_norm lit sa
+somme double par vecteurs de 16 o (16 en vol) ; hc_up passe de 32 à 64 avec
+des additions LDS par 8.
+
+| point servi (même payload) | avant | après | Δ |
+|---|---:|---:|---:|
+| 3 252 NS=0 | 11,29 tok/s | **12,07** | **+6,5 %** (le journal a mesuré 11,98 après fusion) |
+| 3 252 NS=3 | 18,95 | **19,79** | +4,2 % |
+| 972 NS=0 | 4 904,1 ms | 4 639,5 ms | −5,4 % |
+| 972 NS=3 | 2 986,8 ms | 2 889,4 ms | −3,3 % |
+| préfill 3 252 / 972 | 5 412 / 2 100 ms | 5 409 / 2 093 ms | neutre |
+| TTFT vision 1 024² / 2 048² | 3 309 / 16 400 ms | 3 276 / 16 316 ms | −1,0 / −0,5 % |
+
+Par noyau : ttn 2 082 → 1 855 µs/couche, hc_norm 107 → 91, hc_up
+45 → 28, hc_down 126 → 125. Textes identiques aux références W40 partout ;
+kbench Flash-Next 4 786/4 786. **Écarté** : split-KV causal h256 (texte),
+batch de 4 pages via stage_i8 (tableaux indexés partis en mémoire locale,
+plus lent), batching des dots down/attn (neutre).
