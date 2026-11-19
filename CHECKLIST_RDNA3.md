@@ -1,5 +1,15 @@
 # Checklist de clôture — RDNA3 / Qwen3.8 Flash-Next IQR-V4
 
+> **Document historique.** Son état de référence date du 2026-11-17
+> (`a8bc412`, 190 rows, kbench 948/384/653). Le suivi vivant est
+> `SUIVI_LOTS_RDNA3.md` (lots, jalons, risques R1–R51) et les mesures sont dans
+> `JOURNAL_RDNA3.md` ; la vue chiffrée est dans
+> `TABLEAU_REEL_IDEAL_RDNA3.md`. État au HEAD `e42a7d89` (2026-11-19) :
+> **196 rows**, 0 échec, 16 skips ; `sched_test` **548 964**,
+> `engine_e2e_test` **1 087** (3 skips) ; kbench **27B 3 181/3 181**,
+> **MiniCPM 1 802/1 802**, **Flash-Next 4 786/4 786**, 0 divergence. Les cases
+> ci-dessous restent la trace de l'avancement, pas l'état courant.
+
 État au 2026-11-17, branche `rdna3-iqr`, état code `a8bc412` : **R21** (tier
 KV actif), **R22** (snapshots courts), **R23** (tables MoE dans kbench),
 **R25** (MTP servi), **R26** (vision servie), **W27** (IQ8R groupe 256) et
