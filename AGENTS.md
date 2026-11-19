@@ -210,7 +210,9 @@ Sur `build-w39` (W38c), `r3d_selftest` passe à **196 rows, 0 échec, 16 skips**
 la compare au bit à libref sur huit géométries, les deux moitiés de la
 projection de coefficients comprises ; kbench laisse ses 112 cas du 27B en
 « skipped » (la déclaration porte la plane entière, le site d'issue la tranche
-par `wrow_slice`).
+par `wrow_slice`). Sur `w40f` (W40), la suite complète reste verte avec
+`config_test` **2 952**, `ple_hc_device_test` **76** et `fixture_test`
+**109 671** (à lancer avec `RADIANCE_HOME`, sinon 7 cas sont sautés).
 Test de contrat : `iqr_device_test` → `iqr_vocab_head_accepts_a_narrow_step_in_a_wide_band` ;
 `gather_rows_u8_device_test` couvre les rows u8 du tier KV (fragment 4 128 octets,
 octets opaques, pitches larges) ; `mtp_enter_e4m3_device_test` et
@@ -270,17 +272,20 @@ détails dans `RAPPORT_REBASE_V2_1_0.md`.
 Recette 27B (dense, IQR) : `--kv-cache-dtype i8`, `--max-num-seqs 4` — le
 multi-séquence est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill
 ≈ 318 tok/s). Le drafter sert depuis W38c (`dflash_conv` sur la carte, cache
-du drafter en bf16) : `--num-speculative-tokens 3` donne **1,23×** à 135 tokens
-de contexte (34,2 contre 27,8 tok/s, acceptation 64 %) mais **1,03×** à 2 047
-(15,8 contre 15,4, 70 %) ; texte glouton identique. `NS=2` est refusé par
-l'arch (bloc entraîné = 4). Défaut `NS=0` en contexte long, `NS=3` en contexte
-court (R48).
+du drafter en bf16) et depuis W40d son attention prend le split-KV (aréna
+dimensionnée) : `--num-speculative-tokens 3` donne **1,74×** à 2 047 tokens
+(26,9 contre 15,4 tok/s, acceptation 70 %) et **1,44×** à 139 (39,3 contre
+27,3, 72 %) ; texte glouton identique, préfill +2 à +9 %. `NS=2` est refusé par
+l'arch (bloc entraîné = 4). **`NS=3` est le défaut** aux deux longueurs.
 
-Recette MiniCPM5-2B (IQ8R, groupe 256) : `--tp 1 --num-speculative-tokens 0`
-en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
-`head_dim=128`) ; 523 ops / 423 poids, décodage 40,2 tok/s à 60 tokens. À
-`--num-speculative-tokens 3` (drafter DSpark) : **32,2 tok/s contre 20,6**
-(1,56×), texte identique au bit, 33 drafts acceptés sur 210 (15,7 %).
+Recette MiniCPM5-2B (IQ8R, groupe 256) : `--tp 1` en **KV bf16** (les rows
+`attn_paged`/`kv_store` de cet arch refusent i8 à `head_dim=128`) ; 523 ops /
+423 poids. Le drafter DSpark est entraîné à **bloc 7** : `NS=3` est **refusé
+par l'arch**, c'est `--num-speculative-tokens 7` qui sert (58,9 tok/s à
+969 tokens contre 28,1 en `NS=0`, acceptation 27 % ; 73,2 contre 62,7 au
+prompt court, texte identique au bit). Attention au **tronc h128 causal** :
+sans aréna de split il plafonne à ~2,5 tok/s à 1 k de contexte (R49) ; le
+« 40,2 tok/s à 60 tokens » d'avant n'est pas reproduit (22,2 mesuré).
 
 ## Pièges connus
 
@@ -321,9 +326,8 @@ en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
   30 cas `sigmoid`/`mul`/`quant_act_fp8`), d'où un compte kbench qui baisse
   sans échec : comparer les textes servis, pas seulement les compteurs.
 - **MTP** : Flash-Next se sert à `NS=3` (1,82× le décodage, texte identique,
-  acceptation ~40 %) ; le 27B sert `NS=3` depuis W38c, mais n'y gagne que
-  1,23× en contexte court et 1,03× à 2 k (R48) — d'où `NS=0` par défaut au-delà
-  de ~1 k tokens. Un poids
+  acceptation ~40 %) ; le 27B sert `NS=3` depuis W38c et en **gagne 1,74×** à
+  2 047 et 1,44× à 139 depuis W40d (R48 caduc), texte identique. Un poids
   joint `rad.planes` d'une row device peut vivre en VRAM : un shim ne doit pas
   lire son en-tête sur l'hôte (SIGSEGV, corrigé dans `gemm_nt_q_w2a8_m16`),
   et le MT du bras `w2a8` doit avoir un chunk qui divise K (M=1/K=2560 → MT=4).
@@ -335,13 +339,17 @@ en **KV bf16** (les rows `attn_paged`/`kv_store` de cet arch refusent i8 à
   élémentaires) ; restent sans oracle libref des cas `gemm_nt_q_gated` i8a8h,
   `gate_had_quant_i8g`/`gated_had_quant_i8g` (couverts par les tests device) et
   8 `ngram_hint`.
-- **27B en `NS>0`** : servi depuis W38c. Le blocage était double, et les deux
-  pièces sont livrées : le drafter h128 prend sa **propre** dtype de cache
-  (bf16 sous tronc i8, `ee291d2`), et `dflash_conv` a une **row device**
-  (`f63dffd`) — sans elle le groupe de poids du drafter restait épinglé sur le
-  *mapped tier* et ses normes élargies échouaient (« widened at load »).
-  `NS=3` rend 1,23× à 135 tokens et 1,03× à 2 047 (R48) ; `NS=2` est refusé par
-  l'arch.
+- **27B en `NS>0`** : servi depuis W38c, et **payant depuis W40d**. Trois pièces
+  le débloquent : le drafter h128 prend sa **propre** dtype de cache (bf16 sous
+  tronc i8, `ee291d2`), `dflash_conv` a une **row device** (`f63dffd`) — sans
+  elle le groupe de poids du drafter restait épinglé sur le *mapped tier* et
+  ses normes élargies échouaient (« widened at load ») — et l'**aréna de
+  scratch** h128 est dimensionnée (`1943d0a2`) : les deux hooks de scratch
+  lisaient `a->t[0]` que le builder ne passe jamais, donc le split-KV du
+  drafter était silencieusement désactivé (88 ms par pas). `NS=3` rend
+  **1,74×** à 2 047 et 1,44× à 139, texte identique (R48 est caduc) ; `NS=2`
+  est refusé par l'arch. La garde `causal == 0` réserve le split aux blocs
+  spéculatifs : un tronc causal reste bit-identique par construction.
 - Le paramètre rangé d'une row (`M`) est un **plafond de bande**, jamais le
   nombre de lignes du pas : l'étendue est sur les tenseurs. Une row qui compare
   les deux casse le multi-séquence du moteur (bug R24, corrigé en W20) ;

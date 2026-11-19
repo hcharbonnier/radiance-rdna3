@@ -2156,3 +2156,60 @@ changement de précision d'un plan de poids (texte).
 NS=3). Les octets du MoE ne sont plus le levier : −21 % d'octets de promotion
 ne rendent que 1,75 %. Ne pas rouvrir un chantier « octets/token » sans
 profiler d'abord.
+
+## 2026-11-19 — W40d : l'aréna de scratch n'était jamais allouée — 27B `NS=3` à 1,74×
+
+Le profil du pas à 4 rangées (2 047 tokens) désigne le coupable : `NS=0` passe
+68,0 ms dont `attn_paged` h256 34,1 ; `NS=3` passe 194,6 ms dont **88,2 ms dans
+l'attention du drafter** (5 couches × 17,6 ms), à `splits=1`. Cause :
+`attn_scratch` (h128) et `attn_h256_scratch` lisaient `a->t[0]`, or le builder
+ne passe **jamais** de tenseurs à un hook de scratch
+(`core/build/rad_builder.cpp:583`) : les deux hooks répondaient 0 et le
+split-KV était **silencieusement désactivé en service** depuis toujours.
+
+Livré (`1943d0a2`, garde `276348c2`, fusionnés `b81e6269`) :
+
+- `attn_scratch` (h128) dimensionne l'aréna depuis la géométrie gelée
+  (`q_len × max_seqs`), 16 tranches ; `pick_splits` vise **128 workgroups**
+  (le drafter a 8 têtes KV et 1 tuile, 32 workgroups laissaient 96 CU au
+  tiers d'occupation) : **17,6 → 1,7 ms** par couche, **88 → 8,5 ms** par pas.
+- Le noyau m16 reproduit, au-delà de M=1, le **bracketing par tranches** du
+  GEMV split-K (mêmes tranches de 128-K, même ordre, une seule échelle) : les
+  rangées du verify sont **bit-identiques** au pas à une rangée.
+- **Garde `causal == 0`** : seuls les blocs spéculatifs prennent le split. Un
+  tronc causal (`causal == 1`) répond 0, reste à `splits=1`, et sa sortie est
+  bit-identique **par construction** — un texte servi qui bouge est un refus,
+  même dans la tolérance documentée de 1 bf16 ULP.
+
+Mesures servies (`build-w40f`, KV i8, 64 tokens générés, serveur neuf par point) :
+
+| modèle / prompt | NS=0 | NS=3 | gain | acceptation | texte |
+|---|---:|---:|---:|---:|---|
+| 27B, 2 047 | 15,44 | **26,94** | **1,74×** | 70 % | identique |
+| 27B, 139 | 27,3 | **39,3** | **1,44×** | 72 % | identique |
+| Flash-Next, 3 252 | 11,31 | **18,99** | 1,68× | 54 % | identique |
+
+Préfill : 27B 4 612 → 4 712 ms (+2,2 %), Flash-Next 5 360 → 5 876 ms
+(+9,6 %, la passe de contexte du drafter, cohérent avec W38).
+
+**R48 est caduc** : le « verify M=4 à 2,3× » n'était pas la cause — le coût
+était l'attention du drafter privée de split. À 2 047, `NS=3` vaut 1,74×, et le
+verify bracketté est bit-identique.
+
+**Écarté, sur mesure** : le split-KV du **tronc h256** en service. Corriger
+l'aréna fait passer le pas `NS=0` de 68 à **39 ms (1,73×)** et `NS=3` à
+35,7 tok/s, mais le texte glouton de `NS=0` change sur ce prompt
+(réassociation à 1 ulp bf16). Refusé : `NS=0` doit rester identique.
+
+**R49 — le tronc h128 de MiniCPM était lent, et c'est un bug préexistant.**
+Mesuré (même binaire, `libr3d` pristine de `fa7e2823` contre le nouveau) :
+prompt 969 tokens, 60 générés, `NS=0` — pristine **2,48 tok/s**, nouveau
+28,15 ; prompt 999 — 2,41 contre 25,82 ; prompt 59 — 22,18 contre 63,01. La
+cause est la même (aréna à 0, `splits=1` sur une seule tuile). Le « 40,2 tok/s »
+d'`AGENTS.md` n'est pas reproduit au point documenté (22,18 en pristine,
+63,01 avec le split). Avec la garde, le tronc reste à `splits=1` et les textes
+sont **identiques au pristine** aux trois prompts (`NS=0` et `NS=7`,
+`prompt_n` 59/781/804) : **porte PASS**. Décision produit à prendre : accepter
+le re-baseline du texte MiniCPM (tolérance 1 bf16 ULP documentée) pour gagner
+10–11× sur son tronc, ou garder le texte actuel et traiter sa lenteur
+autrement. Rien n'est changé en attendant.

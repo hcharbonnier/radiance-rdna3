@@ -589,7 +589,15 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   verify à 4 rangées vers 2,3× un pas à une rangée et le drafter vers 45 ms :
   le « 1,5× » de W37 supposait un verify quasi gratuit, faux sur un tronc
   dense compute-bound. Contexte long → `NS=0`, contexte court → `NS=3` (texte
-  glouton inchangé).
+  glouton inchangé). **Caduc en W40d** : la cause était l'attention du drafter
+  privée de split-KV (aréna jamais allouée) ; à 2 047, `NS=3` vaut **1,74×**.
+- **R49** — *constat (W40d)* : le tronc **h128 causal** de MiniCPM tournait à
+  `splits=1` depuis toujours (même aréna à 0) : **2,48 tok/s à 969 tokens**
+  contre 28,15 quand le split est actif, et 22,18 contre 63,01 au prompt de 59.
+  Le « 40,2 tok/s » d'`AGENTS.md` n'est pas reproduit au point documenté. Avec
+  la garde `causal == 0`, les textes restent identiques au pristine et le
+  tronc reste lent : **décision produit** — accepter un re-baseline du texte
+  (tolérance 1 bf16 ULP) pour 10–11×, ou traiter la lenteur autrement.
 - **Couverture** : kbench laisse les 112 cas `dflash_conv` du 27B en
   « skipped » (la déclaration porte la plane entière, le site d'issue la
   tranche par `wrow_slice`), mais le sweep reste 3 181/3 181, 0 échec,
