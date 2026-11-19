@@ -2392,3 +2392,15 @@ Par noyau : ttn 2 082 → 1 855 µs/couche, hc_norm 107 → 91, hc_up
 kbench Flash-Next 4 786/4 786. **Écarté** : split-KV causal h256 (texte),
 batch de 4 pages via stage_i8 (tableaux indexés partis en mémoire locale,
 plus lent), batching des dots down/attn (neutre).
+
+**Validation du build fusionné W41** (w41f = 651d0bfc + 92722381 +
+9e701396, merges d77bff28/7c9dab0f) : suite complète verte — sched_test
+548 964, engine_e2e_test 1 087 (3 skips), ixture_test 109 671,
+config_test 2 952, ttn_paged_device_test **29/10** (21 cas h128 au bit),
+ple_hc_device_test 76, dflash_conv_device_test 37, selftest **196/0/16** —
+et kbench **27B 3 181/3 181** (3,619e-03), **MiniCPM 1 802/1 802**
+(3,485e-03), **Flash-Next 4 786/4 786** (1,520e-02), 0 échec, 0 divergence.
+Gates servis sur w41f : 27B NS=3 **27,45 vs 15,48 tok/s (1,77×)**,
+Flash-Next **19,77 vs 11,98 (1,65×)**, MiniCPM textes identiques à w40f aux
+trois prompts et deux NS (débits 92,0/33,9/33,2 en NS=0).
+Artefacts : <work-root>/work/w41-results/.
