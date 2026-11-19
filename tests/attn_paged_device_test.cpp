@@ -176,7 +176,7 @@ bool close_bf16(const std::vector<uint16_t>& a, const std::vector<uint16_t>& b, 
 
 /* One case: q [M, n_head, hd] bf16, an int8 cache [blocks, kv_heads, block, 2*hd+4]. */
 bool case_ok(const char* name, int n_head, int gqa, int hd, int block_size, int q_len,
-             int seq_len, bool exact) {
+             int seq_len, bool exact, int kv_off = 0) {
     char prefix[64];
     std::snprintf(prefix, sizeof prefix, "attn_paged_i8_h256_gqa%d_%s", gqa,
                   q_len <= 16 ? "decode" : "prefill");
@@ -211,10 +211,10 @@ bool case_ok(const char* name, int n_head, int gqa, int hd, int block_size, int 
     std::vector<int32_t> suh = { seq_len };
     std::vector<int32_t> cuh = { 0, q_len };
 
-    Dev dq(qn * 2), dkv(kvn), dbt(btn * 4), dsu(4), dcu(8);
+    Dev dq(qn * 2), dkv(kvn + 16), dbt(btn * 4), dsu(4), dcu(8);
     Dev dout0(outn * 2), dout1(outn * 2);
     up(dq, qh.data(), dq.bytes);
-    up(dkv, kvh.data(), dkv.bytes);
+    up(dkv, kvh.data(), kvn);   /* `kv_off` shifts the cache off a 16-byte boundary */
     up(dbt, bth.data(), dbt.bytes);
     up(dsu, suh.data(), dsu.bytes);
     up(dcu, cuh.data(), dcu.bytes);
@@ -230,7 +230,7 @@ bool case_ok(const char* name, int n_head, int gqa, int hd, int block_size, int 
         Dev& out = which ? dout1 : dout0;
         std::vector<RadTensor> t = {
             ten(dq.p, RAD_BF16, { q_len, n_head, hd }),
-            ten(dkv.p, RAD_I8, { blocks, kv_heads, block_size, row_bytes }),
+            ten((int8_t*)dkv.p + kv_off, RAD_I8, { blocks, kv_heads, block_size, row_bytes }),
             ten(dbt.p, RAD_I32, { 1, blocks }),
             ten(dsu.p, RAD_I32, { 1 }),
             ten(nullptr, RAD_F32, { 0 }),
@@ -353,6 +353,20 @@ TEST(attn_paged_h256_gqa6_block16_decode_short_matches_libref_within_bf16) {
 TEST(attn_paged_h256_gqa6_block16_prefill_short_matches_libref_within_bf16) {
     if (!ready()) return;
     CHECK(case_ok("h256/gqa6/bs16 prefill short", 24, 6, 256, 16, 17, 17, false));
+}
+
+/* The staging a partial page and an unaligned cache reach: the last page of a range that is not a
+ * whole number of pages (two and three slots), and a cache based four bytes off its 16-byte
+ * boundary (the prefill band no longer reads 16 bytes at a time, so it must not care). */
+TEST(attn_paged_h256_gqa12_block4_partial_page_and_unaligned_cache_match_libref) {
+    if (!ready()) return;
+    CHECK(case_ok("h256/gqa12/bs4 prefill two-slot page", 24, 12, 256, 4, 18, 18, false));
+    CHECK(case_ok("h256/gqa12/bs4 prefill three-slot page", 24, 12, 256, 4, 19, 19, false));
+    CHECK(case_ok("h256/gqa12/bs4 decode two-slot page", 24, 12, 256, 4, 1, 18, false));
+    CHECK(case_ok("h256/gqa12/bs4 decode three-slot page", 24, 12, 256, 4, 1, 19, false));
+    CHECK(case_ok("h256/gqa12/bs4 prefill cache off 16", 24, 12, 256, 4, 18, 18, false, 4));
+    CHECK(case_ok("h256/gqa12/bs4 decode cache off 16", 24, 12, 256, 4, 1, 18, false, 4));
+    CHECK(case_ok("h256/gqa6/bs16 prefill cache off 16", 24, 6, 256, 16, 20, 20, false, 4));
 }
 
 TEST(attn_paged_h256_gqa12_block4_decode_short_matches_libref_within_bf16) {
@@ -528,6 +542,20 @@ TEST(attn_paged_h256_bench) {
     bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 17, 32768);
     bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 128, 2048);
     bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 128, 8192);
+    /* The served shapes: a full first chunk, a second chunk over the prefix, the 972-token
+     * prefill point, and a short chunk over a long context. */
+    bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 972, 972);
+    bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 2048, 2048);
+    bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 1204, 3252);
+    bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 17, 3252);
+    bench_case("gqa6/bs16 prefill", 24, 6, 256, 16, 2048, 2048);
+    bench_case("gqa6/bs16 prefill", 24, 6, 256, 16, 1204, 3252);
+    /* The short shapes a chunked prefill leaves: a 1,024-token chunk over a 3,072-token prefix and
+     * a 180-token tail over 3,252. */
+    bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 1024, 3072);
+    bench_case("gqa12/bs4 prefill", 24, 12, 256, 4, 180, 3252);
+    bench_case("gqa6/bs16 prefill", 24, 6, 256, 16, 1024, 3072);
+    bench_case("gqa6/bs16 prefill", 24, 6, 256, 16, 180, 3252);
 }
 
 RAD_TEST_MAIN()
