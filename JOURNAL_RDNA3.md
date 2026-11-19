@@ -2439,7 +2439,7 @@ seuls), miroir `w29-rebase` resynchronisé, build **neuf** `build-w42`
 - Artefacts : `/tmp/w42-kbench/`, `/tmp/w42-strict.log`,
   `<work-root>/work/w41-results/w42-gate/`.
 
-## 2026-11-19 — W42 : gemm_nt_bias vision hors du tanh double, tuile haute (bit-exact)
+## 2026-11-19 — W42g : gemm_nt_bias vision hors du tanh double, tuile haute (bit-exact)
 
 Reprise au HEAD **b1f95704**, worktree `w42-gemm-vision`, arbre hôte **neuf**
 `<work-root>/work/w42a` (build `build-w42a`, gfx1100 + FFmpeg, cache de tune
@@ -2535,3 +2535,97 @@ Reste ouvert : la tuile haute ne couvre que M ≥ 1 024 (kbench ne teste que
 ≤ 512, d'où les cas device dédiés) ; R52 est le seul risque nouveau. Artefacts :
 `<work-root>/work/w42a/`, `/tmp/w42a-suite.log`, `/tmp/w42a-final-kb.md`,
 `/tmp/w42a-fn.md`, `<work-root>/work/w42a-gate/`.
+
+## 2026-11-19 — W42m : préfill MoE de Flash-Next — deux murs mesurés (instruction, lien), `v_dot4` rejeté
+
+Reprise au HEAD **b1f95704**, arbre hôte **neuf** `<work-root>/work/w42m`,
+build **neuf** `build-w42m` (gfx1100, FFmpeg, cache de tune 36 rows copié de
+`w29-rebase/build-clean`). Carte W7900 `gfx1100`, PCIe **4.0 ×16**
+(`current_link_speed` 16.0 GT/s, largeur 16 → 31,5 GB/s théoriques), 38 °C et
+62 W au repos avant les runs, aucun throttler signalé par `amd-smi`.
+
+- **Mesure d'abord** (`RADIANCE_AQL_STAMP=1`, `--profile-ops`, payloads
+  inchangés, serveurs neufs, `cache_n=0`). Flash-Next 972 tokens :
+  **2 087 ms** (stamp) puis 2 003 et 2 043 ms (deux autres runs), décodage
+  14,27 tok/s. Flash-Next 3 252, deux serveurs neufs : NS=0 **5 320 et
+  5 323 ms / 11,65 et 11,83 tok/s**, NS=3 **5 983 et 5 842 ms / 19,46 et
+  19,52 tok/s** (référence W41 11,98 / 19,77 : 97–99 %, écart de mesure, code
+  inchangé ; W42 indépendant mesure 11,82 / 19,49). Textes **identiques au bit**
+  à `<work-root>/work/w41-results/fn-ns0.txt` et `fn-ns3.txt`
+  (sha256 `960a2212…`, `cmp` silencieux, NS0 = NS3).
+- Profil par op (972, `--profile-ops`) : total **2 009 ms** dont
+  **`moe_gemm_q` 1 175,5 ms (58,5 %)**, `hc_read` 330,1 (16,4 %),
+  `gemm_nt_q` 259,8 (12,9 %), `gemm_nt` 87,7, `attn_paged` 77,8,
+  `moe_gather` 18,1. Les 192 appels = 2 chunks × 48 couches × 2 plans
+  (`down` w4nl ≈ 7,5 ms, `gate_up` iqr ≈ 4,7 ms). À 3 252 tokens : MoE
+  **2 186,6 ms** des 5 263,6 ms (41,5 %), 192 appels aussi.
+- **Le lien, mesuré.** `current_link_speed` **16,0 GT/s × largeur 16** =
+  PCIe 4.0 ×16 (31,5 GB/s théoriques) ; un `hipMemcpy` h2d épinglé de
+  256 MiB × 20 donne **28,5 GB/s** (28,6 en d2h, 188 ms) : c'est le plafond
+  pratique retenu ci-dessous.
+- **Le pas est compute-bound : 98 % du mur est dans les noyaux** (même
+  protocole `profile-ops` des deux côtés, barrières comprises). 972 tokens :
+  somme des ops **2 009 ms** pour 2 043 ms ; au témoin `--tail-anchor off`
+  (un chunk) 1 388 ms d'ops pour 1 409 ms. Les copies sont donc masquées dans
+  le cas par défaut.
+- **Deux murs différents dans le même poste** (MoE 1 175,5 ms = 674,4 + 501,1).
+  - **Tête, 896 rangées : plafond d'instruction, pas le lien.** 674,4 ms pour
+    58,5 GiB de poids lus dans VRAM (93 GB/s) et 2 107 G MAC = 3,1 T MAC/s,
+    soit la forme du noyau (ISA : 2 360 `v_mad_i32_i24` contre 5 760
+    `v_bfe_i32`/`v_ashrrev` d'extraction du tile int16, ≈ 3,5 op/MAC). Sa
+    copie (19,73 GiB à 28,5 GB/s = 743 ms) tient sous les 1 409 ms du pas :
+    elle est masquée.
+  - **Queue, 76 rangées : plafond du lien, en place.** 501,1 ms = 0,68 ×
+    19,73 GiB (13,4 GiB) lus **en place** à **28,7 GB/s**, soit le plafond
+    mesuré (28,5) ; 8,5 % des rangées pour 74 % du temps de la tête.
+- **Les deux leviers d'octets, mesurés, aucun retenu.** (a) *Résidence* :
+  `max-num-seqs 1` donne 650 MiB de plus à la dalle (experts 37,32 → 37,97 GiB,
+  KV 852 → 213 MiB, ring 806 → 779), soit −3,3 % de pool → 972 profilé
+  **2 031 → 2 011 ms (−1,0 %)**, texte identique : la réponse est ≈ −3,3 % de
+  la **queue seule** (17 ms), la tête ne bouge pas. (b) *Queue stagée*
+  (`kStagerMinRows` 256 → 64) : les noyaux accélèrent (MoE 1 175,5 → 700,5 ms)
+  mais la copie devient exposée (74 % du mur en ops, ~525 ms hors noyau) et le
+  mur ne bouge pas (**2 047,6 contre 2 043 ms**) : neutre, rejeté. Textes
+  identiques dans les deux cas.
+- **Une tentative, rejetée.** Le `down` w4nl plafonne sur l'instruction (ISA :
+  2 360 `v_mad_i32_i24` contre 5 760 `v_bfe_i32`/`v_ashrrev`/`v_lshrrev` pour
+  extraire le tile int16, ≈ 3,5 op/MAC). Point exact réécrit en
+  `v_dot4_i32_i8` (`t8 = 16·hi + lo`, deux plans int8, deux chaînes puis
+  quatre chaînes indépendantes) : **bit-exact** (`moe_w4nl_device_test`
+  18 checks / 14 cas, « bf16 exact » ; `iqr_device_test` 76/11) mais préfill
+  972 **2 491 et 2 497 ms (+19–20 %)** et décodage 14,03 contre 14,27 tok/s.
+  `v_dot4` est à taux réduit sur gfx1100 et ne bat pas 64 `v_mad_i32_i24`.
+  Arbre rendu au bit à b1f95704.
+- **Conclusion (R53)** : le poste a **deux murs, aucun bit-exact ouvert par
+  l'arithmétique**. La tête est au plafond d'**instruction** de sa forme (dot4
+  mesuré plus lent ; seule piste non mesurée : un tile de poids int32 en LDS,
+  une valeur par dword, zéro extraction, 5 760 ops en moins — une mise en forme
+  du tile, **pas** le run à tuile étroite rejeté en R39). La queue est au
+  plafond du **lien mesuré** (28,5 GB/s) pour le pool qu'elle route en place ;
+  la stager coûte 43 % d'octets de plus et est neutre (mesuré). Les octets ne
+  déplacent que la queue (résidence : −3,3 % de pool → −1,0 % de préfill) et le
+  seul levier structurel est **un seul balayage** — pas de chunk de queue, ce
+  que R44/R45 réservent à `--tail-anchor off` (opt-in ; **1,42×** ici, 1 409
+  contre 2 003 ms).
+- Suite complète verte sur `build-w42m`, compteurs **identiques au chiffre
+  près** à W42 : sched 548 964/213, engine 1 087/52 (3 skips), fixture
+  109 671/59, config 2 952/71, iqr 76/11, moe_w4nl 18/14, moe_iqr 15/15,
+  attn_paged 29/10, ple_hc 76/10, dflash_conv 37/3, `r3d_selftest` **196 rows,
+  0 échec, 16 skips**.
+- `rad-kbench --op moe_gemm_q --bench --max-cases 1` : **110 cas vérifiés,
+  110 passés, 0 échec, 0 sauté**, 3 rows de 686, pire rel_l2 **3,162e-03** ;
+  le sweep complet Flash-Next (**4 786/4 786**) reste celui de W42 au même
+  code (seuls des commits de documentation depuis e2d51094).
+- Artefacts : `<work-root>/work/w42m/results/` (logs, JSON, texts, dont
+  `res-972-ms1/ms4` et `stag2-972`), `/tmp/w42m-kbmoe1.md`, `/tmp/h2d.cpp`.
+- **Commandes** : points servis par le harnais `onepoint.py` (serveur neuf à
+  chaque point, YAML : `placement: expert_tiered`, `host-pool-mib: 24576`,
+  `kv-cache-dtype: i8`, `max-num-seqs: 4`, `max-model-len: 8192`,
+  `num-speculative-tokens: 0|3`, `profile-ops: true` pour les profils) ;
+  `RADIANCE_AQL_STAMP=1` (+ `RADIANCE_AQL_STAMP_OUT`) pour les passes ;
+  `rad-kbench -m <work-root>/models/qwen3.8-next-flash-iqr-v4.rad --home
+  build-w42m/radiance_home --op moe_gemm_q --bench --max-cases 1 --report
+  /tmp/w42m-kbmoe1.md` ; lien : `hipcc --offload-arch=gfx1100 /tmp/h2d.cpp`
+  (256 MiB × 20 épinglé) ; résidence : `max-num-seqs: 1` dans le même YAML ;
+  queue stagée : `kStagerMinRows` 256 → 64 (`core/engine_bringup.cpp`), build
+  `build-w42s` ; tout sous `flock /tmp/radiance-gpu.lock`.

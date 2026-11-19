@@ -752,12 +752,32 @@ prompt sous le premier intervalle son dernier chunk entier : préfill Flash-Next
 3 252 tokens neutre. Prix : la reprise courte du tour suivant disparaît, d'où
 le défaut `on` (R45).
 
+**W42m — MoE au préfill : deux murs, l'un d'instruction, l'autre de lien (R53).**
+Profil servi sur build neuf (b1f95704) : 972 tokens = 2 043 ms (**98 % du mur
+dans les noyaux**) dont `moe_gemm_q` **1 175,5 ms (58,5 %)** ; 3 252 tokens =
+5 320 ms dont MoE **2 186,6 ms (41,5 %)**. Lien mesuré : PCIe 4.0 ×16 négocié
+(16,0 GT/s × 16, 31,5 GB/s théoriques) et `hipMemcpy` h2d épinglé à
+**28,5 GB/s**. Le poste se coupe en deux (674,4 + 501,1 ms) :
+- **tête** (896 rangées) au plafond d'**instruction** — 58,5 GiB de poids lus
+  dans VRAM à 93 GB/s, 2 107 G MAC à 3,1 T MAC/s, ≈ 3,5 op/MAC dans l'ISA
+  (2 360 mads + 5 760 extractions) ; la copie (743 ms) est masquée sous les
+  1 409 ms du pas ;
+- **queue** (76 rangées) au plafond du **lien**, en place — 0,68 × 19,73 GiB à
+  28,7 GB/s, 8,5 % des rangées pour 74 % du temps de la tête.
+
+Leviers d'octets mesurés et **non retenus** : résidence (`max-num-seqs 1`,
++650 MiB de dalle, −3,3 % de pool → **2 031 → 2 011 ms**, la queue seule) ;
+queue stagée (`kStagerMinRows` 64, MoE 700,5 ms mais copie exposée, mur
+inchangé à 2 047,6 ms). Rejeté, mesuré : `v_dot4_i32_i8` sur le `down` w4nl
+(bit-exact, 14/14 cas, **+19–20 %**). Il reste **un seul balayage**
+(`--tail-anchor off`, opt-in R45) ou plus de VRAM pour la dalle.
+
 ## État courant 2026-11-19 — W41 (HEAD e42a7d89)
 
 Vue chiffrée de référence après W38–W41. Tous les gains sont **bit-exacts**
 sauf mention ; les textes servis ont été comparés au bit à composition de lot
 fixe. Détail et protocoles : JOURNAL_RDNA3.md (2026-11-18/19) et
-SUIVI_LOTS_RDNA3.md (R39–R51).
+SUIVI_LOTS_RDNA3.md (registre des risques).
 
 ### Noyaux
 
@@ -804,8 +824,12 @@ SUIVI_LOTS_RDNA3.md (R39–R51).
 
 gemm_nt_bias vision (W42 : **9,10 TF/s** profilé sur la passe 2 048²,
 1,42× ; le reste est l'instruction mix du contrat ~2,6 instr/MAC, pas un
-levier bit-exact immédiat), puis
-les octets du MoE au préfill (81 % du lien), puis ttn_paged h256 au préfill
-(12,6 %). Aucun levier bit-exact n'est ouvert sur le décodage : hc_read est à
-son plancher, le GEMM 27B à 76 % du plafond, l'attention h256 et la vision
-bloquées par le contrat de texte.
+levier bit-exact immédiat), puis `attn_paged` h256 au préfill (12,6 %). Le
+**MoE au préfill est clos (W42m, R53)** : la tête est au plafond
+d'**instruction** du `down` w4nl (`v_dot4` mesuré plus lent) et la queue au
+plafond du **lien mesuré** (28,5 GB/s) pour le
+pool qu'elle route en place ; les octets ne déplacent que la queue et le seul
+levier structurel est un seul balayage (`--tail-anchor off`, opt-in, R45) ou
+plus de VRAM pour la dalle. Aucun levier bit-exact n'est ouvert sur le
+décodage : hc_read est à son plancher, le GEMM 27B à 76 % du plafond,
+l'attention h256 et la vision bloquées par le contrat de texte.
