@@ -2467,12 +2467,14 @@ la valeur bf16 `f32_to_bf16(somme + biais)` (le référence stocke le produit
 biaisé en bf16 avant son épilogue), donc le domaine atteignable est l'ensemble
 des codes bf16. Sonde exhaustive sur la carte : `tanhf(z)` et
 `(float)tanh((double)z)` ne donnent pas les mêmes bits f32 sur **106** codes,
-mais **la même bf16 stockée sur les 65 536** (les 106 écarts ne traversent pas
-la frontière d'arrondi) ; en particulier la queue négative où `1+th` ne vaut
-que quelques ulp f32. Le cas device
-`gemm_nt_bias_gelu_tanh_covers_every_finite_bf16_input` rejoue tout le domaine
-fini (M=65 536, N=K=1, A = chaque code, B=1) contre libref, comparaison au bit :
-c'est le garde-fou d'une libm device qui déplacerait un arrondi (R52).
+mais **la même bf16 stockée sur les 65 536 encodages** (65 280 finis, plus 256
+non finis que la sonde a aussi comparés ; les 106 écarts ne traversent pas la
+frontière d'arrondi), en particulier la queue négative où `1+th` ne vaut que
+quelques ulp f32. Le cas device
+`gemm_nt_bias_gelu_tanh_covers_every_finite_bf16_input` rejoue les 65 280
+codes finis (M=65 536, N=K=1, A = chaque code, les 256 non finis remplacés
+par +0, B=1) contre libref, comparaison au bit : c'est le garde-fou d'une
+libm device qui déplacerait un arrondi (R52).
 
 **Changements.** (1) `bias_act(act==2)` évalue `tanhf(z)` ; l'erf exact reste
 en double. (2) tuile haute : un bloc porte **64 rangées** (8 par thread) à
@@ -2516,11 +2518,14 @@ tuile haute : `fc1` 19,245 → 17,639 ms/appel, `fc2` 19,758 → 18,024, qkv
   **4 786/4 786**, 0 échec, 0 divergence, pire `rel_l2` **1,520e-02**
   (référence W41), 1 442 skips inchangés, 2 350 s.
 - Gates servis (serveurs neufs, même payload, `cache_n=0`) : Flash-Next
-  3 252 tokens NS=0/NS=3 préfill **5 333,2 / 5 859,4 ms** (réf. 5,38/5,87 s),
-  textes identiques à `fn-ns0.txt` et `fn-ns3.txt` (sha `960a2212e059`) ;
-  vision 1 024² **TTFT 3 115,3 ms** (réf. w40a 3 192,9 ; W41 3,3 s), 2 048²
-  **15 760,0 ms** (réf. 16 474,1 ; W41 16,3 s), textes identiques aux sha
-  `8144ea1cf398` / `4b24fd7ee70f`.
+  3 252 tokens NS=0/NS=3 préfill **5 350,9 / 5 884,9 ms** (5 333,2 / 5 859,4
+  au run précédent ; réf. 5,38/5,87 s), textes identiques à `fn-ns0.txt` et
+  `fn-ns3.txt` (sha `960a2212e059`) ;
+  vision 1 024² **TTFT 3 121,3 ms** (3 115,3 au run précédent ; réf. w40a
+  3 192,9 ; W41 3,3 s), 2 048² **15 842,9 ms** (15 760,0 au run précédent ;
+  réf. 16 474,1 ; W41 16,3 s), textes identiques aux
+  références `w40a-results/serve/base-v1024.json` / `base-v2048.json`
+  (sha `8144ea1cf398e1ee` / `4b24fd7ee70fee2b`).
 - Relecture indépendante (task) : description de row périmée, domaine du cas
   exhaustif borné aux codes finis (les NaN ne sont pas au contrat), assert
   `RM` pair, cas de frontière — corrigés puis revalidés. La preuve du `tanhf`

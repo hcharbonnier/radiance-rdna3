@@ -639,13 +639,13 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
 
 - **W42g** : l'épilogue tanh-GELU évaluait `(float)std::tanh(double)` par
   sortie ; sur `fc1` (K=1 152, N=4 304) cela coûtait plus que le GEMM (f64 à
-  1/16 de débit). `tanhf` donne la **même bf16 stockée** sur les 65 536 codes
-  finis (106 valeurs f32 diffèrent, aucune ne traverse l'arrondi) ; tuile
-  **64 rangées** au-delà de 1 024 (32 en dessous). Passe 2 048² :
-  `gemm_nt_bias` **2 146 → 1 516 ms (1,42×)**, `fc1` 38,65 → 17,64 ms/appel
-  (2,19×), textes servis identiques ; TTFT vision 1 024²/2 048²
-  **3,12 / 15,76 s** (réf. 3,19 / 16,47). kbench ciblé 140/140, Flash-Next
-  4 786/4 786.
+  1/16 de débit). `tanhf` donne la **même bf16 stockée** sur les 65 280 codes
+  finis (65 536 encodages ; 106 valeurs f32 diffèrent, aucune ne traverse
+  l'arrondi) ; tuile **64 rangées** à partir de 1 024 (32 en dessous). Passe
+  2 048² : `gemm_nt_bias` **2 146 → 1 516 ms (1,42×)**, `fc1` 38,65 → 17,64
+  ms/appel (2,19×), textes servis identiques ; TTFT vision 1 024²/2 048²
+  **3,12 / 15,84 s** (3,12 / 15,76 au run précédent ; réf. 3,19 / 16,47).
+  kbench ciblé 140/140, Flash-Next 4 786/4 786.
 - **R52** — *constat* : l'équivalence `tanhf` ↔ `tanh(double)` au bf16 stocké
   dépend de la **libm device de ROCm**. Le cas device
   `gemm_nt_bias_gelu_tanh_covers_every_finite_bf16_input` (tout le domaine
