@@ -2228,6 +2228,41 @@ bit-exact sur la plage servie (TTFT −0,1 à −0,9 %, `f498bc06`) ; budget de
 chaleur **−21 % d'octets** sur le lien et décodage 3 252 **−1,75 %**
 (`d8a28952`) ; 27B `NS=3` **1,74×** à 2 047 et 1,44× à 139 (`b81e6269`) ;
 Flash-Next `NS=3` 18,99 contre 11,31 (1,68×) ; vision `attn_dense` **rejetée
-sur mesure** (1,46× au noyau, texte servi changé). Artefacts :
+sur mesure** (1,46× au noyau, texte servi changé).
+
+## 2026-11-19 — W40e : le « 52–67 tok/s agrégés » du 27B est un chiffre de contexte court
+
+Mesure du multi-séquence sur `w40f` (4 requêtes distinctes, 64 tokens générées
+chacune, KV i8, `max-num-seqs 4`), avec un second tour à préfixes cachés quand
+le cache mord :
+
+| point | agrégé | par flux | `cache_n` |
+|---|---:|---|---|
+| 4 flux, ~256 tokens (tour 2) | **51,3 tok/s** | 13,0–15,3 | 256 (chaud) |
+| 4 flux, ~256 tokens (tour 1, préfills entrelacés) | **61,2 tok/s** | — | — |
+| 4 flux, 2 047 tokens, `NS=0` | 8,5–10,8 tok/s | 4,8–15,1 (inégal) | 0 |
+| 4 flux, 2 047 tokens, `NS=3` | **15,1–15,6 tok/s** | 7,7–19,3 | 0 |
+| 1 flux, 2 047 tokens | 15,4 (`NS=0`) / 23,7–26,9 (`NS=3`) | — | — |
+
+Deux constats :
+
+1. Le chiffre documenté (§5.4, « 4 séquences ≈ 52,3 tok/s agrégés ») est un
+   chiffre de **contexte court** (256 tokens ici : 51–61 tok/s). Il ne se
+   transporte pas à 2 k.
+2. À 2 047 tokens, quatre flux **ne multiplient pas** le débit : 8,5–10,8 tok/s
+   agrégés en `NS=0`, soit **moins qu'un seul flux** (15,4), et le partage est
+   inégal (deux flux à ~13–15, deux à ~5–8). Le préfixe n'est pas réutilisé à
+   cette longueur (`cache_n = 0`), donc la fenêtre inclut les préfills des
+   autres flux : c'est un chiffre **de service**, pas un débit de décodage
+   pur. `NS=3` remonte l'agrégé à **15,1–15,6**, c'est-à-dire au niveau du
+   simple flux.
+3. Conséquence pratique : sur le 27B à contexte long, la spéculation est le
+   levier qui rend le multi-flux supportable ; augmenter `max-num-seqs` ne
+   l'est pas. À contexte court, l'inverse (quatre flux à 51–61 tok/s pour des
+   flux à 13–15 chacun).
+
+Limite de la mesure : à 2 k, `cache_n = 0` au second tour, donc l'agrégat mêle
+préfill et décodage ; ne pas comparer ces chiffres à un débit de décodage pur.
+Artefacts : `<work-root>/work/w40-results-b/{multiseq,batch}/`. Artefacts :
 <work-root>/work/w40-results-b/{27b,minicpm,flashnext}.{md,log} et les
 textes/gates servis du même dossier.
