@@ -2411,3 +2411,30 @@ kbench_ref) : **1 134/1 134**, 0 échec, 0 stale, 0 divergence, 211 capped,
 pire 
 el_l2 3,442e-03 — la référence de W38 tient après les fusions.
 Artefacts : <work-root>/work/w41-results/.
+
+## 2026-11-19 — W42 : reproduction indépendante sur un build neuf
+
+Reprise au HEAD **e2d51094** (e42a7d89 + quatre commits de documentation
+seuls), miroir `w29-rebase` resynchronisé, build **neuf** `build-w42`
+(gfx1100, FFmpeg, cache de tune 36 rows copié depuis `build-clean`).
+
+- Suite complète : compteurs **identiques au chiffre près** au handover
+  W41 — sched_test 548 964/213, engine_e2e_test 1 087/52 (3 skips),
+  fixture_test 109 671/59, config_test 2 952/71, iqr 76/11, ple_hc 76/10,
+  moe_iqr 15/15, vision_rows 66/10, attn_paged 29/10, logits_bf16 8/4,
+  gather_rows_u8 33/3, mtp_enter 22/3, logit_rerank 36/5, act_i8g 103/6,
+  tp2 12/2, dflash_conv 37/3, r3d_selftest **196 rows, 0 échec, 16 skips**.
+- `rad-kbench --bench`, un conteneur à la fois : **27B 3 181/3 181**
+  (3,619e-03, 549 s), **MiniCPM 1 802/1 802** (3,485e-03, 329 s),
+  **Flash-Next 4 786/4 786** (1,520e-02, 2 295 s) ; 0 échec, 0 divergence.
+- Replay strict `libref` : **1 134/1 134**, 0 échec, 0 stale, 0 divergence,
+  211 capped, pire rel_l2 3,442e-03.
+- Gates servis (payload inchangé, serveur neuf, `cache_n=0`) : 27B 2 047
+  NS=0/NS=3 **15,25/26,98 tok/s**, texte identique à w41-results et NS0=NS3
+  (sha `d7cf7a3b`) ; Flash-Next 3 252 **11,82/19,49**, texte identique
+  (sha `960a2212`) ; MiniCPM 781 NS=0 **33,13** contre 33,10 sur w41f, texte
+  identique au bit (sha `8833d699`).
+- 27B et Flash-Next sortent **1,3–1,8 % sous** les débits W41, carte à 38 °C,
+  aucun signe de throttling : écart de mesure, code inchangé depuis e42a7d89.
+- Artefacts : `/tmp/w42-kbench/`, `/tmp/w42-strict.log`,
+  `<work-root>/work/w41-results/w42-gate/`.
