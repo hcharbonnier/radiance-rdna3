@@ -194,7 +194,8 @@ flock -w 7200 /tmp/radiance-gpu.lock -c 'cd <work-root>/work/<tree> && \
   ./build/bin/r3d_selftest ./build/radiance_home/kernels/libr3d.so'
 ```
 
-État de référence de la branche (R21 + R22 + R23 + R25 + R26 + W27 + W28) :
+État de référence de la branche **en W28** (R21 + R22 + R23 + R25 + R26 + W27 +
+W28 ; les compteurs courants sont plus bas) :
 **190 rows, 0 échec, 16 skips** ; `sched_test` **548 782 checks, 0 échec** et
 `engine_e2e_test` **909 checks, 0 échec** (3 skips) ; `kbench` Flash-Next
 **948/948** (4 946/4 946 en `--bench` dans les deux modes, W24), MiniCPM5-2B
@@ -204,7 +205,8 @@ couverture. **Sweep complet rejoué en W38** sur un build neuf (`build-w38`,
 `6d9084b`) : 27B **3 181/3 181**, Flash-Next **4 786/4 786**, MiniCPM
 **1 802/1 802**, 0 échec, 0 divergence, mêmes pires `rel_l2` ; replay
 `--strict` des fixtures (`rad-kbench --kernels libref`, forme du ctest
-`kbench_ref`) **1 134/1 134** — `fixture_test` n'a pas d'option `--strict`.
+`kbench_ref`) **1 134/1 134** (rejoué au HEAD W41) — `fixture_test` n'a pas
+d'option `--strict`.
 Sur `build-w39` (W38c), `r3d_selftest` passe à **196 rows, 0 échec, 16 skips**
 (row `dflash_conv` ajoutée) et `dflash_conv_device_test` **37 checks / 3 cas**
 la compare au bit à libref sur huit géométries, les deux moitiés de la
