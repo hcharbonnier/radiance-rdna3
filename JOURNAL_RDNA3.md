@@ -2228,4 +2228,6 @@ bit-exact sur la plage servie (TTFT −0,1 à −0,9 %, `f498bc06`) ; budget de
 chaleur **−21 % d'octets** sur le lien et décodage 3 252 **−1,75 %**
 (`d8a28952`) ; 27B `NS=3` **1,74×** à 2 047 et 1,44× à 139 (`b81e6269`) ;
 Flash-Next `NS=3` 18,99 contre 11,31 (1,68×) ; vision `attn_dense` **rejetée
-sur mesure** (1,46× au noyau, texte servi changé).
+sur mesure** (1,46× au noyau, texte servi changé). Artefacts :
+<work-root>/work/w40-results-b/{27b,minicpm,flashnext}.{md,log} et les
+textes/gates servis du même dossier.
