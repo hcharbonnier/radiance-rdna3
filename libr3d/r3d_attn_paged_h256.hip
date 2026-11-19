@@ -279,6 +279,36 @@ __device__ __forceinline__ void stage_i8(const Args& A, int blk, int kh, int nu,
     }
 }
 
+/* One 16-byte run of a cache page: load it (the whole page is 129 runs at a 4-key page) and route
+ * its four words to the staged K, V and scale homes. `stage_i8` does the same work; these two let a
+ * loop issue the next page's run into its own register before it stores the current page's, which
+ * is what hides the page walk's global latency. */
+__device__ __forceinline__ r3d_u32x4 load_page_run(const Args& A, int blk, int kh, int tid)
+{
+    const uint8_t* src = A.kv + (long long)blk * A.sb + (long long)kh * A.sh;
+    return *(const __attribute__((address_space(1))) r3d_u32x4*)(const void*)(src + (long long)tid * 16);
+}
+
+template <bool STAGE_K, bool STAGE_V>
+__device__ __forceinline__ void put_page_run(int c, r3d_u32x4 v,
+                                             r3d_lds_i8* __restrict__ sK,
+                                             r3d_lds_i8* __restrict__ sV,
+                                             r3d_lds_f32* __restrict__ sks,
+                                             r3d_lds_f32* __restrict__ svs)
+{
+    constexpr int kWordsSlot = kHeadDim / 2 + 1;
+    int idx = c * 4;
+    int slot = idx / kWordsSlot;
+    int r = idx - slot * kWordsSlot;
+    put_slot_word<STAGE_K, STAGE_V>(slot, r, v[0], sK, sV, sks, svs);
+    if (++r == kWordsSlot) { r = 0; ++slot; }
+    put_slot_word<STAGE_K, STAGE_V>(slot, r, v[1], sK, sV, sks, svs);
+    if (++r == kWordsSlot) { r = 0; ++slot; }
+    put_slot_word<STAGE_K, STAGE_V>(slot, r, v[2], sK, sV, sks, svs);
+    if (++r == kWordsSlot) { r = 0; ++slot; }
+    put_slot_word<STAGE_K, STAGE_V>(slot, r, v[3], sK, sV, sks, svs);
+}
+
 /* One visible key's score. The four lanes of a row group each sum their own 64 dims (ascending)
  * and then the partials are added in d-block order. All lanes call this, including lanes whose
  * row is padding: only the shuffle is unconditional, the caller applies the visibility. */
@@ -446,13 +476,44 @@ void attn_kernel(const Args A)
      * so the score a key gets here is the score it gets there. This pass reads K and K's scale
      * only, so it stages no V (pass two stages the block's V rows anyway). When the scores fit,
      * lane 0 of each row group keeps each visible key's score for pass two. */
+    /* Issue page `PB`'s run into register R, when that page is a full, 16-aligned page of a 4-key
+     * cache and this lane owns a run. A page is 129 runs and a workgroup has at least 192 threads
+     * (384 at prefill), so one register a lane stages the page. */
+#define R3D_ATTN_PF(PB, R)                                                                        \
+    do {                                                                                          \
+        const int _pb = (PB);                                                                     \
+        if (pf && _pb < b1) {                                                                     \
+            const int _blk = ld_ix(A.bt, (size_t)M.s * A.bt_rs + (size_t)_pb * A.bt_cs);           \
+            const int _j0 = _pb * BLOCK;                                                          \
+            const int _nu = jend_all - _j0 < BLOCK ? jend_all - _j0 : BLOCK;                       \
+            if (_blk >= 0 && _nu == BLOCK && A.kv16 && tid < 129)                                 \
+                (R) = load_page_run(A, _blk, kh, tid);                                            \
+        }                                                                                         \
+    } while (0)
+
+    r3d_u32x4 p0 = {0u, 0u, 0u, 0u}, p1 = p0, p2 = p0, p3 = p0;
+    const bool pf = (BLOCK == 4);
+    R3D_ATTN_PF(b0 + 0, p0);
+    R3D_ATTN_PF(b0 + 1, p1);
+    R3D_ATTN_PF(b0 + 2, p2);
+    R3D_ATTN_PF(b0 + 3, p3);
     for (int b = b0; b < b1; ++b) {
         const int blk = ld_ix(A.bt, (size_t)M.s * A.bt_rs + (size_t)b * A.bt_cs);
         const int j0 = b * BLOCK;
         const int nu = jend_all - j0 < BLOCK ? jend_all - j0 : BLOCK;
         group_barrier();
-        if (blk >= 0) stage_i8<NTH, true, false>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+        if (blk >= 0) {
+            if (pf && nu == BLOCK && A.kv16 && tid < 129)
+                put_page_run<true, false>(tid, p0, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV,
+                                          (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+            else
+                stage_i8<NTH, true, false>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+        }
         group_barrier();
+        if (pf) {
+            p0 = p1; p1 = p2; p2 = p3;
+            R3D_ATTN_PF(b + 4, p3);
+        }
         if (blk < 0) continue;
         int u = 0;
         for (; u + 1 < nu; u += 2) {
@@ -500,16 +561,30 @@ void attn_kernel(const Args A)
     /* Pass two: exponentiate and accumulate in ascending key order. With the scores cached it
      * stages V only and reads the max pass's score; otherwise it restages K too and recomputes
      * the dot with the same operands and the same order. */
+    r3d_u32x4 q0 = {0u, 0u, 0u, 0u}, q1 = q0, q2 = q0, q3 = q0;
+    R3D_ATTN_PF(b0 + 0, q0);
+    R3D_ATTN_PF(b0 + 1, q1);
+    R3D_ATTN_PF(b0 + 2, q2);
+    R3D_ATTN_PF(b0 + 3, q3);
     for (int b = b0; b < b1; ++b) {
         const int blk = ld_ix(A.bt, (size_t)M.s * A.bt_rs + (size_t)b * A.bt_cs);
         const int j0 = b * BLOCK;
         const int nu = jend_all - j0 < BLOCK ? jend_all - j0 : BLOCK;
         group_barrier();
         if (blk >= 0) {
-            if (cache) stage_i8<NTH, false, true>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
-            else       stage_i8<NTH, true,  true>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+            if (pf && nu == BLOCK && A.kv16 && tid < 129) {
+                if (cache) put_page_run<false, true>(tid, q0, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+                else       put_page_run<true,  true>(tid, q0, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+            } else {
+                if (cache) stage_i8<NTH, false, true>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+                else       stage_i8<NTH, true,  true>(A, blk, kh, nu, tid, (r3d_lds_i8*)sK, (r3d_lds_i8*)sV, (r3d_lds_f32*)sks, (r3d_lds_f32*)svs);
+            }
         }
         group_barrier();
+        if (pf) {
+            q0 = q1; q1 = q2; q2 = q3;
+            R3D_ATTN_PF(b + 4, q3);
+        }
         if (blk < 0) continue;
         for (int u = 0; u < nu; ++u) {
             const int j = j0 + u;
@@ -532,6 +607,8 @@ void attn_kernel(const Args A)
             }
         }
     }
+
+#undef R3D_ATTN_PF
 
     /* Padding slots clamp to a real row; an unguarded partial store would add a writer to that
      * row's arena record. Store nothing for them (their lanes' sums/accs are duplicates anyway). */

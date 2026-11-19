@@ -76,11 +76,20 @@ constexpr int kHcDownTileWide = 32 * 2;
 /* A launch narrower than a row tile keeps the W28 kernels, which are one row a block: no row of
  * the tile is an empty lane, and a one-row call keeps the latency it was measured at. */
 constexpr int kHcW28DownTile = 16;
+/* The decode band's slice. It stays 256 so the stage plus N's tile fits the 64 KiB LDS for every
+ * declared width: at 512 the 16-row stage alone is 32.8 KiB and N's tile is two bytes an element,
+ * so a 16,384-wide stream would need 65.6 KiB and such a model would be refused. The slice changes
+ * no value: a column's sum stays ascending in i across the boundary. */
 constexpr int kHcW28DownChunk = 256;
 constexpr int kHcW28DownPitch = kHcW28DownChunk + 1;
 constexpr int kHcW28DownStage = kHcW28DownTile * kHcW28DownPitch;
 constexpr int kHcW28UpCols = 64;
-constexpr int kHcW28UpChunk = 32;
+/* The decode slice over the low rank. Each column's sum stays ascending in k across the slice
+ * boundary, so 64 keeps the arithmetic of 32 exactly and halves the load/dot ladder (five rounds
+ * for lr = 320) at 17.5 KiB of LDS. */
+constexpr int kHcW28UpChunk = 64;
+static_assert(kHcW28UpCols * (kHcW28UpChunk / 16) <= kHcThreads,
+              "the vector staging path must cover every column of a block");
 constexpr int kHcW28UpStage = kHcW28UpCols * (kHcW28UpChunk + 1);
 constexpr int kHcQuantScratch = 256;   /* the deepest rotated group the quantiser transforms */
 
@@ -109,12 +118,40 @@ __device__ __forceinline__ float mix_get(const MixW& w, long long row, int i) {
     return e4m3_to_f32(r[i]) * ((const float*)(r + w.K))[i / w.G];
 }
 
+/* The reference's sum: `acc += a[i] * b[i]`, i ascending, f32, one chain. The two staged slices
+ * are read into registers eight at a time before the adds, so the LDS round trip of a slice is
+ * paid once every eight elements instead of on every add; the adds themselves keep their order and
+ * the carry `acc` crosses the slice boundary exactly as the unbatched walk did. */
+__device__ __forceinline__ float hc_dot_asc_f(float acc, const float* a, const float* b, int n) {
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        float x[8], y[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) x[u] = a[i + u];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) y[u] = b[i + u];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) acc += x[u] * y[u];
+    }
+    for (; i < n; ++i) acc += a[i] * b[i];
+    return acc;
+}
+
 /* ---- the per-stream norm scale ------------------------------------------------------------- */
 /* One workgroup covers as many rows as its threads divide by hc, so every lane is an active
  * chain: the sum is a dependent double accumulation and exposes its latency, and one row a
  * workgroup left 252 of 256 lanes idle. Eight loads are issued before their adds, which leaves
- * the ascending double sum (the reference's) untouched. */
+ * the ascending double sum (the reference's) untouched.
+ *
+ * At decode there is one row and only `hc` lanes are active (four at Flash-Next's hc = 4), so the
+ * scalar walk is a stream of 2,560 dependent 2-byte loads a lane: 107 us a launch, 96 launches a
+ * step, 10.3 ms of the 92.4 ms step (measured, RADIANCE_AQL_STAMP). The same ascending double sum
+ * read through 16-byte vectors, sixteen vectors in flight, leaves the order and every rounding
+ * untouched while it turns 2,560 round trips into 20. A 16-byte vector is 8 bf16 on a boundary the
+ * row start keeps (n and h_ld are multiples of 8 at every served geometry); the tail and a
+ * misaligned row keep the scalar walk. */
 constexpr int kHcNormBatch = 8;
+constexpr int kHcNormVec    = 16;   /* 16-byte loads in flight (128 bf16 a round) */
 
 __global__ __launch_bounds__(kHcThreads) void hc_norm_kernel(
     const uint16_t* __restrict__ h, const float* __restrict__ w, float* __restrict__ sc, int M,
@@ -130,6 +167,28 @@ __global__ __launch_bounds__(kHcThreads) void hc_norm_kernel(
     const uint16_t* hp = h + (long long)row * h_ld + (long long)c * n;
     double ss = 0.0;
     int i = 0;
+    if (((uintptr_t)hp & 15) == 0) {
+        const int step = kHcNormVec * 8;
+        for (; i + step <= n; i += step) {
+            r3d_u32x4 v[kHcNormVec];
+#pragma unroll
+            for (int u = 0; u < kHcNormVec; ++u)
+                v[u] = *(const r3d_u32x4*)(hp + i + u * 8);
+#pragma unroll
+            for (int u = 0; u < kHcNormVec; ++u) {
+                /* Extract from the vector's words: taking the address of v[u] would spill the
+                 * array to scratch and turn the walk back into dependent local-memory loads. */
+                const uint32_t wv[4] = {v[u][0], v[u][1], v[u][2], v[u][3]};
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const float lo = bf16_to_f32((uint16_t)(wv[q] & 0xffffu));
+                    const float hi = bf16_to_f32((uint16_t)(wv[q] >> 16));
+                    ss += (double)lo * (double)lo;
+                    ss += (double)hi * (double)hi;
+                }
+            }
+        }
+    }
     for (; i + kHcNormBatch <= n; i += kHcNormBatch) {
         float v[kHcNormBatch];
 #pragma unroll
@@ -673,8 +732,9 @@ __global__ __launch_bounds__(kHcThreads) void hc_up_kernel_w28(R3D_HC_UP_ARGS) {
         for (int k0 = 0; k0 < lr; k0 += kHcW28UpChunk) {
             const int kn = min(kHcW28UpChunk, lr - k0);
             if (f8 && kn == kHcW28UpChunk && up_G > 0 && up_G % 16 == 0) {
-                if (t < ni * 2) {
-                    const int r = t >> 1, kk0 = (t & 1) * 16;
+                const int vpr = kHcW28UpChunk / 16;   /* 16-code vectors a row */
+                if (t < ni * vpr) {
+                    const int r = t / vpr, kk0 = (t - r * vpr) * 16;
                     const uint8_t* wr =
                         (const uint8_t*)up + (long long)((long long)c * n + i0 + r) * up_stride;
                     const uint4 codes = *(const uint4*)(wr + k0 + kk0);
@@ -697,17 +757,7 @@ __global__ __launch_bounds__(kHcThreads) void hc_up_kernel_w28(R3D_HC_UP_ARGS) {
                 }
             }
             __syncthreads();
-            if (t < ni) {
-                float g = gv;
-                const float* st = stage + t * (kHcW28UpChunk + 1);
-                if (kn == kHcW28UpChunk) {
-                    #pragma unroll 8
-                    for (int kk = 0; kk < kHcW28UpChunk; ++kk) g += dsh[k0 + kk] * st[kk];
-                } else {
-                    for (int kk = 0; kk < kn; ++kk) g += dsh[k0 + kk] * st[kk];
-                }
-                gv = g;
-            }
+            if (t < ni) gv = hc_dot_asc_f(gv, dsh + k0, stage + t * (kHcW28UpChunk + 1), kn);
             __syncthreads();
         }
         if (t < ni) {
