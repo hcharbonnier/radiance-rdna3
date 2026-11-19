@@ -345,10 +345,15 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   **M ≈ 1024–2048** (la géométrie réelle) et, si possible, sur le TTFT servi ;
   une variante qui perd à cette géométrie ne rentre pas, même si elle gagne
   ailleurs.
-- **R40** — *clos (W32)* : `attn_dense` hd72 sous contrat bit-exact est à son
-  plancher d'issue (~5,3 TFLOP/s, 53–70 % de l'issue VALU). Ne pas rouvrir un
-  chantier de scheduling ; les seules sorties sont le FMA, un tampon de scores
-  (changement de schéma) ou une softmax en une passe — décisions de contrat.
+- **R40** — *clos (W32), confirmé par la mesure (W40a)* : `attn_dense` hd72
+  sous contrat bit-exact est à son plancher d'issue (~5,3 TFLOP/s). Le poste
+  est borné par la **latence** de la chaîne du dot, pas par les slots :
+  **FMA = 3,3 % plus lent** (437 → 221 VALU/clé, 241,3 contre 233,6 ms à
+  16 384 × 16). Une **softmax en une passe** avec scores de tuile en LDS donne
+  **1,46× au noyau et 1,15× au TTFT 2048²** (14,63 contre 16,79 s), mais le
+  texte servi change sur les deux images → **rejeté par le gate** (`9577eda3`
+  ne livre que la documentation). Rouvrir demande un store exact qui tient, ou
+  un nouveau contrat de texte servi.
 - **Reste** : `moe_gemm_q` (56,5 % du préfill 972 tokens) via la continuation
   de trellis, puis `hc_read` (17,6 %).
 - **IQR — tuile 2×4 rejetée (W32)** : 1,94× réel à M=1626 (32,91 → 16,94 ms,

@@ -2038,3 +2038,41 @@ reconstituer depuis la déclaration — il refuse d'inventer la moitié plutôt 
 de vérifier contre la mauvaise. La row est couverte par
 `dflash_conv_device_test` (les deux moitiés, pas de projection compris), et le
 service la valide par le texte glouton identique à `NS=0`.
+
+## 2026-11-19 — W40a : `attn_dense` vision, les deux sorties essayées et rejetées
+
+Le poste était dit « 53 % de sa borne VALU » (§6.B) : **faux**, et c'est la
+première chose que la mesure a corrigée. Le noyau est borné par la **latence**
+de la chaîne de 72 ops du dot, que 4 clés en parallèle ne masquent pas.
+
+**FMA** (437 → 221 VALU/clé, 2 339 → 1 238 instructions flottantes, VGPR et
+LDS inchangés) : **241,3 ms au lieu de 233,6 ms** à 16 384 patches × 16 têtes
+(3 runs entrelacés, 5 127 contre 5 296 GFLOP/s) — **3,3 % plus lent**, aucun
+écart numérique à mesurer puisqu'il perd sur la vitesse.
+
+**Softmax en une passe, scores de tuile en LDS** (8 KiB transposés, max courant
+par tuile, rescale de `sum` et des 72 `acc[d]` par `exp(m_old − m_new)`) :
+
+| forme | avant | une passe |
+|---|---:|---:|
+| 16 384 × 16 têtes | 237,1 ms | **162,9 ms (1,46×)** |
+| 4 096 × 16 | 17,07 ms | 12,05 ms (1,42×) |
+| 512 × 16 | 397,9 µs | 285,7 µs (1,39×) |
+| TTFT 1 024² (1 045 tokens) | 3,33 s | 3,19 s |
+| TTFT 2 048² (4 117 tokens) | 16,79 s | **14,63 s (1,15×)** |
+
+Écart numérique (16 384 × 16, q/k/v aléatoires) : 24 197 / 18 874 368 codes
+bf16 diffèrent (0,128 %, dont 92,8 % d'un seul code), `rel_l2 = 8,84e-5`,
+`max |a−b| = 1,22e-4` ; kbench reste à `rel_l2 ≤ 4,47e-6` vs libref (40/40) et
+le cas uniforme d'`iqr_device_test` reste exact au bit.
+
+**Mais le texte servi change** sur les deux images (1 024² et 2 048², deux runs
+par variante): la variante est **rejetée par le gate**. Livré `9577eda3` :
+commentaire seul dans `libr3d/r3d_vision_bf16.hip`, avec la preuve que le flux
+d'instructions device du `.so` reconstruit est **identique** aux 7 278
+instructions de référence. **R40 reste valide** ; rouvrir demande un store
+exact qui tient, ou un nouveau contrat de texte servi.
+
+Les diagnostics jetables qui donnent le plafond : supprimer le dot de la marche
+2 = **1,45×**, supprimer la marche 1 = **1,48×**, supprimer le staging K de la
+marche 2 = 2 %.
