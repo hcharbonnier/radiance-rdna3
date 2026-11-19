@@ -69,6 +69,8 @@ constexpr int kKT  = 64;        /* k one staged tile covers */
 constexpr int kRN  = 4;         /* columns one thread accumulates */
 constexpr int kSB  = kNT + 4;   /* halfwords a staged weight k row: 34 dwords */
 constexpr int kTallMin = 1024;  /* rows from which the 64-row tile takes over */
+constexpr int kShortMT = 32;    /* rows a block carries below kTallMin */
+constexpr int kTallMT  = 64;    /* rows a block carries from kTallMin */
 
 /* The tile map, pinned: four warps stage two k a lane over a 64-wide tile, and eight row groups by
  * sixteen 4-column groups fill the 128 threads; a row group is MT / 8 rows a thread. */
@@ -236,19 +238,19 @@ extern "C" int r3d_gemm_nt_bias_bf16(long a, long b, long bias, long res, long y
     if (M < 1 || N < 1 || K < 1 || act < 0 || act > 2) return -2;
     if (a_ld < K || b_ld < K || y_ld < N || (res && res_ld < N)) return -3;
     const bool tall = M >= kTallMin;
-    const int mt = tall ? 64 : 32;
+    const int mt = tall ? kTallMT : kShortMT;
     const long long tiles_m = ((long long)M + mt - 1) / mt;
     const long long tiles_n = ((long long)N + kNT - 1) / kNT;
     /* gfx11 caps grid y and z at 65535; x is 2^31. */
     if (tiles_n > 0x7fffffffLL || tiles_m > 65535LL) return -2;
     if (tall)
-        R3D_KLAUNCH(gemm_nt_bias_kernel<64>, dim3((uint32_t)tiles_n, (uint32_t)tiles_m),
+        R3D_KLAUNCH(gemm_nt_bias_kernel<kTallMT>, dim3((uint32_t)tiles_n, (uint32_t)tiles_m),
                     dim3(kThr), (hipStream_t)(uintptr_t)stream, (const uint16_t*)(uintptr_t)a,
                     (const uint16_t*)(uintptr_t)b, (const uint16_t*)(uintptr_t)bias,
                     (const uint16_t*)(uintptr_t)res, (uint16_t*)(uintptr_t)y, M, N, K, a_ld, b_ld,
                     res_ld, y_ld, act);
     else
-        R3D_KLAUNCH(gemm_nt_bias_kernel<32>, dim3((uint32_t)tiles_n, (uint32_t)tiles_m),
+        R3D_KLAUNCH(gemm_nt_bias_kernel<kShortMT>, dim3((uint32_t)tiles_n, (uint32_t)tiles_m),
                     dim3(kThr), (hipStream_t)(uintptr_t)stream, (const uint16_t*)(uintptr_t)a,
                     (const uint16_t*)(uintptr_t)b, (const uint16_t*)(uintptr_t)bias,
                     (const uint16_t*)(uintptr_t)res, (uint16_t*)(uintptr_t)y, M, N, K, a_ld, b_ld,

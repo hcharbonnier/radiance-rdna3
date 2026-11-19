@@ -9,7 +9,8 @@
  *                 residual stream in the epilogue. Cases cover the tower's geometries (hidden
  *                 width, 3x qkv, the ffn, the merger and the patch projection), a variable M
  *                 including tails, both activations, the residual present and absent, zero and
- *                 non-zero biases, row pitches and unaligned bases.
+ *                 non-zero biases, row pitches and unaligned bases, the finite bf16 domain of the
+ *                 tanh GELU exhaustively, and both tile heights around their dispatch boundary.
  *
  *   grid_embed    the learned position table added before the first block. Cases cover the
  *                 48 x 48 table of the 27B resampled to patch grids (including 1-wide and
