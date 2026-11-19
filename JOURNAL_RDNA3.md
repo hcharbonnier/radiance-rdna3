@@ -2221,7 +2221,9 @@ autrement. Rien n'est changé en attendant.
 (3,619e-03), **MiniCPM 1 802/1 802** (3,485e-03), **Flash-Next 4 786/4 786**
 (1,520e-02), 0 échec, 0 divergence — pires `rel_l2` identiques à W38. Gates
 servis : 27B **1,74×** et Flash-Next **1,68×** texte identique, MiniCPM textes
-identiques au pristine à 59/781/804 en `NS=0` et `NS=7`.
+identiques au pristine à 59/781/804 en `NS=0` et `NS=7`. Artefacts :
+`<work-root>/work/w40-results-b/{27b,minicpm,flashnext}.{md,log}` et les
+textes/gates servis du même dossier.
 
 **Bilan de la vague W40, pour le tableau des gains** : `hc_read` **+5,3–8,7 %**
 bit-exact sur la plage servie (TTFT −0,1 à −0,9 %, `f498bc06`) ; budget de
@@ -2263,6 +2265,54 @@ Deux constats :
 
 Limite de la mesure : à 2 k, `cache_n = 0` au second tour, donc l'agrégat mêle
 préfill et décodage ; ne pas comparer ces chiffres à un débit de décodage pur.
-Artefacts : `<work-root>/work/w40-results-b/{multiseq,batch}/`. Artefacts :
-<work-root>/work/w40-results-b/{27b,minicpm,flashnext}.{md,log} et les
-textes/gates servis du même dossier.
+Artefacts : `<work-root>/work/w40-results-b/{multiseq,batch}/`.
+
+## 2026-11-19 — W41a : décodage 27B — l'attention est la moitié du pas, le GEMM à 76 % du plafond
+
+Profil par op du pas servi (delta entre deux blocs consécutifs, 68,2 ms
+cumulés ≈ 65 ms réels, 2 047 tokens, NS=0, une rangée) :
+
+| op | ms | part | appels |
+|---|---:|---:|---:|
+| ttn_paged h256 | 34,42 | **50,5 %** | 16 |
+| gemm_nt_q + gemm_nt_q_gated | 27,52 | **40,4 %** | 288 |
+| msnorm_had_quant_i8g | 2,21 | 3,2 % | 128 |
+| logits_gemm_vocab, gdn_conv, gemm_nt | 2,80 | 4,1 % | 97 |
+
+Le « 267 Go/s » de W40e décrivait le **pas entier** ; le GEMM seul lit
+**15,25 Gio à ~555 Go/s**, contre un plafond pratique mesuré de **726–734 Go/s**
+(eadbw) et 611–676 Go/s sur le motif de tuile réel. Le noyau trellis n'est
+pas le problème : décodage des codes 4–8 % du temps, barrières ~0, les charges
+seules 90–96 %. Sur les 34,4 ms d'attention, le split-KV h256 est **interdit en
+service** par le contrat de texte (W40d) : c'est la moitié du pas qui n'est pas
+déplaçable sans changer l'arithmétique.
+
+Livré (651d0bfc, fusionné) : à M ∈ {2,4}, le dot i32 de 128 K est coupé en
+**quatre chaînes indépendantes** (somme i32 exacte, bracket et ordre f32
+inchangés), et la grille split-K passe **tranche-major** (lockIdx.x =
+tranche) pour la localité des poids. Bit-exact.
+
+| point servi (A/B alterné, 3 paires) | avant | après | gain |
+|---|---:|---:|---:|
+| NS=0, 2 047 | 4 192,3 ms / 15,03 tok/s | 4 163,3 / 15,13 | +0,7 % |
+| NS=3, 2 047 | 2 419,4 ms / 26,45 tok/s | 2 398,0 / 26,69 | +0,9 % |
+| NS=0, 139 | 2 330,3 ms / 27,04 tok/s | 2 298,5 / 27,41 | +1,4 % |
+| NS=3, 139 | 2 041,8 ms / 30,85 tok/s | 1 994,2 / 31,59 | +2,3 % |
+
+kbench : gemm_nt_q **1,044×** à M=1 et **1,058×** à M=2/4 en moyenne, cible
+5 120×6 144 M=1 **47,96 → 40,28 µs (1,19×)**, aucune row > 2 % plus lente ;
+27B **3 181/3 181**, 0 divergence, pire el_l2 3,619e-03 ; suite complète
+verte, iqr_device_test 76 (split-K down : 0 ulp bf16). Textes identiques au
+bit aux références W40 (2 047, NS=0/NS=3) et à 139.
+
+**Écarté, mesuré** : continuation coalescée (neutre), __syncwarp dans le fold
+(neutre), MAD trellis simplifié (4–8 %, pas un levier), split-KV h256 en
+service (1,73× mais texte changé), regroupement des tranches (le swap de grille
+capte déjà la localité).
+
+- **R50** — *constat (W41a)* : le pas de décodage du 27B est à **50,5 %
+  d'attention** et 40,4 % de GEMM, ce dernier à **76 % du plafond de bande
+  passante de la carte**. Sous contrat bit-exact, il n'y a plus de levier
+  supérieur à ~1,06× sur le GEMM ; les 34 ms d'attention ne se déplacent qu'en
+  changeant l'arithmétique (le split-KV du tronc, refusé pour le texte). Ne pas
+  rouvrir un chantier GEMM de décodage 27B sans accepter ce constat.
