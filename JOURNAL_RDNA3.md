@@ -2276,12 +2276,14 @@ cumulés ≈ 65 ms réels, 2 047 tokens, NS=0, une rangée) :
 |---|---:|---:|---:|
 | ttn_paged h256 | 34,42 | **50,5 %** | 16 |
 | gemm_nt_q + gemm_nt_q_gated | 27,52 | **40,4 %** | 288 |
-| msnorm_had_quant_i8g | 2,21 | 3,2 % | 128 |
+| 
+msnorm_had_quant_i8g | 2,21 | 3,2 % | 128 |
 | logits_gemm_vocab, gdn_conv, gemm_nt | 2,80 | 4,1 % | 97 |
 
 Le « 267 Go/s » de W40e décrivait le **pas entier** ; le GEMM seul lit
 **15,25 Gio à ~555 Go/s**, contre un plafond pratique mesuré de **726–734 Go/s**
-(eadbw) et 611–676 Go/s sur le motif de tuile réel. Le noyau trellis n'est
+(
+eadbw) et 611–676 Go/s sur le motif de tuile réel. Le noyau trellis n'est
 pas le problème : décodage des codes 4–8 % du temps, barrières ~0, les charges
 seules 90–96 %. Sur les 34,4 ms d'attention, le split-KV h256 est **interdit en
 service** par le contrat de texte (W40d) : c'est la moitié du pas qui n'est pas
@@ -2301,7 +2303,8 @@ tranche) pour la localité des poids. Bit-exact.
 
 kbench : gemm_nt_q **1,044×** à M=1 et **1,058×** à M=2/4 en moyenne, cible
 5 120×6 144 M=1 **47,96 → 40,28 µs (1,19×)**, aucune row > 2 % plus lente ;
-27B **3 181/3 181**, 0 divergence, pire el_l2 3,619e-03 ; suite complète
+27B **3 181/3 181**, 0 divergence, pire 
+el_l2 3,619e-03 ; suite complète
 verte, iqr_device_test 76 (split-K down : 0 ulp bf16). Textes identiques au
 bit aux références W40 (2 047, NS=0/NS=3) et à 139.
 
@@ -2403,4 +2406,8 @@ et kbench **27B 3 181/3 181** (3,619e-03), **MiniCPM 1 802/1 802**
 Gates servis sur w41f : 27B NS=3 **27,45 vs 15,48 tok/s (1,77×)**,
 Flash-Next **19,77 vs 11,98 (1,65×)**, MiniCPM textes identiques à w40f aux
 trois prompts et deux NS (débits 92,0/33,9/33,2 en NS=0).
+**Replay strict des fixtures rejoué au HEAD** (libref seul, forme du ctest
+kbench_ref) : **1 134/1 134**, 0 échec, 0 stale, 0 divergence, 211 capped,
+pire 
+el_l2 3,442e-03 — la référence de W38 tient après les fusions.
 Artefacts : <work-root>/work/w41-results/.
