@@ -615,3 +615,22 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   est interdit par le contrat de texte ; le GEMM est à 76 % du plafond. Sous
   contrat bit-exact, plus de levier > 1,06× sur ce GEMM. Ne pas rouvrir sans
   accepter un changement d'arithmétique.
+
+## W41b/W41c — bande h128 bit-exacte et pas Flash-Next (2026-11-19)
+
+- **W41b** (9e701396) : le noyau h128 decode est découpé par **dimension de
+  sortie** (tuile de lignes × tête, un lane par dims) au lieu des clés ; la
+  marche, l'ordre dot2 et les réductions sont inchangés → **bit-identique**.
+  Noyau **14×** à 969 clés, **11×** servi sur MiniCPM à 781/804 tokens
+  (3,0 → 33,9 tok/s), 4,1× à 59 ; NS=7 2,1–3,5×. ttn_paged_device_test
+  passe à **29 checks / 21 cas h128** comparés au bit au noyau large.
+- **R49 clos** : le split-KV n'était pas la seule voie et il est dominé
+  (28,15 tok/s non bit-identique). Plafond bit-exact ~44 tok/s à 969 clés.
+- **R51** — *règle* : pour paralléliser une attention bit-exacte, découper la
+  **dimension de sortie**, jamais les clés (la réduction sur les clés est
+  l'ordre de sommation).
+- **W41c** (92722381) : staging KV préchargé 4 pages en avance (85 % du coût
+  d'attention h256 était du staging sérialisé), hc_norm vectorisé,
+  hc_up 32→64. Pas Flash-Next **−6,5 %** en NS=0 (11,29 → 12,07 tok/s) et
+  **−4,2 %** en NS=3 (18,95 → 19,79), textes identiques, vision −1 %.
+  Écartés : split-KV causal h256 (texte), batch stage_i8 (mémoire locale).
