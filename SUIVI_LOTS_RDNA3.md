@@ -635,7 +635,7 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   **−4,2 %** en NS=3 (18,95 → 19,79), textes identiques, vision −1 %.
   Écartés : split-KV causal h256 (texte), batch stage_i8 (mémoire locale).
 
-## W42m — préfill MoE de Flash-Next : poste clos au plafond PCIe (2026-11-19)
+## W42m — préfill MoE de Flash-Next : deux murs mesurés, poste clos (2026-11-19)
 
 - **Mesuré d'abord** (`RADIANCE_AQL_STAMP=1`, `--profile-ops`, `--tail-anchor
   off` en témoin) : à 972 tokens, préfill **2 087 / 2 003 / 2 043 ms** et
@@ -643,29 +643,39 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   (41,5 %)**. Décodage 3 252, deux serveurs neufs : **11,65 et 11,83 tok/s**
   NS=0, **19,46 et 19,52** NS=3 (référence W41 11,98 / 19,77, soit 97–99 % :
   écart de mesure, code inchangé — W42 indépendant : 11,82 / 19,49).
-- **Le chunk de queue est le coût** : 972 = 896 + 76 (ancre `--prefix-resume
-  exact`) ; au témoin `--tail-anchor off` le même prompt fait 1 409 ms et le
-  MoE 674,4 ms → la queue de 76 rangées coûte **501 ms de MoE** et 621 ms de
-  préfill pour 7,8 % des rangées.
-- **Les deux chunks sont bornés par les octets, au plafond du lien** : tête
-  434 MiB/couche remisés (20,82 GiB h2d mesurés) en 14,0 ms/couche (31 GB/s) ;
-  queue 0,70 × 434 MiB lus en place en 10,4 ms (29 GB/s). Le temps du poste
-  suit les octets (76 rangées = 8,5 % des rangées, 74 % du temps de la tête).
-  Carte : PCIe 4.0 ×16 (`16.0 GT/s`, largeur 16), 31,5 GB/s théoriques.
-- **Rejeté, mesuré : le point exact en `v_dot4_i32_i8`.** Le `down` w4nl
-  plafonne sur l'**instruction** (ISA : 2 360 `v_mad_i32_i24` contre 5 760
-  `v_bfe_i32`/`v_ashrrev`/`v_lshrrev` d'extraction du tile int16, ≈ 3,5 op/MAC).
-  Deux variantes bit-exactes (`t8 = 16·hi + lo`, deux plans int8 ; puis quatre
-  chaînes indépendantes par plan) : `moe_w4nl_device_test` **18 checks / 14 cas,
+- **Le lien, mesuré** : `current_link_speed` **16,0 GT/s × largeur 16**
+  (PCIe 4.0 ×16, 31,5 GB/s théoriques) et un `hipMemcpy` h2d épinglé de
+  256 MiB × 20 à **28,5 GB/s** (28,6 en d2h) — le plafond pratique.
+- **Le pas est compute-bound (98 % du mur dans les noyaux)** : 2 009 ms d'ops
+  pour 2 043 ms (profilé) ; un chunk seul (témoin `--tail-anchor off`) :
+  1 388 ms d'ops pour 1 409 ms.
+- **Deux murs différents** (MoE 1 175,5 = 674,4 + 501,1) : la **tête**
+  (896 rangées) est au plafond d'**instruction** (58,5 GiB de poids lus dans
+  VRAM à 93 GB/s, 3,1 T MAC/s, ≈ 3,5 op/MAC ; copie de 743 ms masquée sous les
+  1 409 ms du pas) ; la **queue** (76 rangées) est au plafond du **lien**, en
+  place (501,1 ms = 0,68 × 19,73 GiB à 28,7 GB/s).
+- **Les deux leviers d'octets, mesurés, aucun retenu.** *Résidence* :
+  `max-num-seqs 1` (+650 MiB de dalle, experts 37,32 → 37,97 GiB) = −3,3 % de
+  pool → **2 031 → 2 011 ms (−1,0 %)**, soit la queue seule. *Queue stagée*
+  (`kStagerMinRows` 64) : MoE 1 175,5 → 700,5 ms mais ~525 ms de copie exposée
+  → **2 047,6 contre 2 043 ms**, neutre. Textes identiques dans les deux cas.
+- **Rejeté, mesuré : le point exact en `v_dot4_i32_i8`.** Deux variantes
+  bit-exactes (`t8 = 16·hi + lo`, deux plans int8 ; puis quatre chaînes
+  indépendantes par plan) : `moe_w4nl_device_test` **18 checks / 14 cas,
   « bf16 exact »**, mais préfill 972 **2 491 et 2 497 ms (+19–20 %)** et
   décodage 14,03 contre 14,27 tok/s. `v_dot4` est à taux réduit sur gfx1100 et
   ne bat pas 64 `v_mad_i32_i24`. Arbre rendu au bit à b1f95704.
-- **R52** — *règle* : le préfill MoE de Flash-Next est borné par les **octets
-  du pool hôte** relus à chaque balayage (PCIe 4.0 ×16), pas par le noyau ;
-  ne pas y chercher de gain dans l'arithmétique (le `down` w4nl est au plafond
-  d'instructions, `v_dot4` est plus lent) mais dans le **nombre de balayages**
-  (chunking, R22/R44/R45) ou la **taille du pool** (résidence : dalle pleine à
-  37,32 GiB de 57 GiB, quantification déjà 4 bits sur les deux plans).
+- **R53** — *règle* : le préfill MoE de Flash-Next a **deux murs** et aucun
+  n'est ouvert par l'arithmétique : la tête (896 rangées) est au plafond
+  d'**instruction** du `down` w4nl (`v_dot4` mesuré plus lent ; seule piste non
+  mesurée, un tile de poids int32 en LDS — une valeur par dword, sans
+  extraction —, qui est une mise en forme du tile et **pas** le run à tuile
+  étroite rejeté en R39), la queue (76 rangées) au
+  plafond du **lien** (28,5 GB/s) pour le pool qu'elle route en place. Les
+  octets ne déplacent que la queue (−3,3 % de pool → −1,0 %) ; ne pas chercher
+  de gain dans la quantification (les deux plans sont déjà 4 bits) ni dans le
+  staging de la queue (neutre, mesuré). Leviers restants : **un seul balayage**
+  (chunking, R22/R44/R45) ou plus de VRAM pour la dalle (pleine, 37,32 GiB).
 - Suite complète verte sur `build-w42m`, compteurs identiques au chiffre près
   à W42 : sched 548 964/213, engine 1 087/52 (3 skips), fixture 109 671/59,
   config 2 952/71, moe_w4nl 18/14, iqr 76/11, `r3d_selftest` 196 rows /
