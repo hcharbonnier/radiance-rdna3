@@ -148,8 +148,9 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
      * row scale once), so the same brackets here make M > 1 identical to the split GEMV: the
      * partial and the accumulator both start at 0, and 0 + p0 is p0. With one slice this is the
      * flat chain it replaces, unchanged. Only the computed trellis has a split kernel, and only at
-     * group 128. The two loops are duplicated rather than one carrying a compile-time branch so
-     * that no other form pays the extra accumulator's registers. */
+     * group 128; the loops are duplicated so the bracket lives only in that branch. At M in {2,4}
+     * both branches also split the i32 dot into four chains: the sum is exact, so this only adds
+     * independent chains, and the bracket and the f32 group terms are unchanged. */
     constexpr bool kSplitBrackets = (MT > 1 && F::KIND == kTrellisMad && GS == 1);
     if constexpr (kSplitBrackets) {
         uint32_t kg = ngrp;   /* groups a slice */
@@ -160,13 +161,16 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
             else if (nkb % 2u == 0u) s = 2;
             kg = ngrp / s;
         }
+        constexpr int kChains = NP <= 2 ? 4 : 1;   /* independent i32 chains: the sum is exact */
         float part[NP];
 #pragma unroll
         for (int i = 0; i < NP; ++i) part[i] = 0.0f;
         for (uint32_t g = 0; g < ngrp; ++g) {
-            int sub[NP];
+            int sub[NP][kChains];
 #pragma unroll
-            for (int i = 0; i < NP; ++i) sub[i] = 0;
+            for (int i = 0; i < NP; ++i)
+#pragma unroll
+                for (int k = 0; k < kChains; ++k) sub[i][k] = 0;
             for (int j = 0; j < GS; ++j) {
                 const uint32_t kb = g * GS + (uint32_t)j;
                 const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
@@ -188,7 +192,9 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
                     const uint32_t* wp = (const uint32_t*)(sW + q * 128);
 #pragma unroll
                     for (int c4 = 0; c4 < 32; ++c4)
-                        sub[i] = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub[i]);
+                        sub[i][c4 & (kChains - 1)] =
+                            dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4],
+                                    sub[i][c4 & (kChains - 1)]);
                 }
                 __syncthreads();
             }
@@ -200,9 +206,11 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
                 }
                 const int m = p / 16, q = p % 16;
                 if (m >= M) continue;
+                int sum = sub[i][0];
+                if constexpr (kChains == 4) sum = (sum + sub[i][1]) + (sub[i][2] + sub[i][3]);
                 const float sa = as[m * (int)ngrp + (int)g];
                 const float sb = fold_f32<F>(c, row0 + q, g * GS);
-                part[i] += (float)sub[i] * sa * sb;
+                part[i] += (float)sum * sa * sb;
                 if ((g + 1u) % kg == 0u) {
                     acc[i] += part[i];
                     part[i] = 0.0f;
@@ -210,10 +218,13 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
             }
         }
     } else {
+        constexpr int kChains = NP <= 2 ? 4 : 1;
         for (uint32_t g = 0; g < ngrp; ++g) {
-            int sub[NP];
+            int sub[NP][kChains];
 #pragma unroll
-            for (int i = 0; i < NP; ++i) sub[i] = 0;
+            for (int i = 0; i < NP; ++i)
+#pragma unroll
+                for (int k = 0; k < kChains; ++k) sub[i][k] = 0;
             for (int j = 0; j < GS; ++j) {
                 const uint32_t kb = g * GS + (uint32_t)j;
                 const typename Dec<F>::Raw r = Dec<F>::fetch(c, rt, kb, lane, true);
@@ -235,7 +246,9 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
                     const uint32_t* wp = (const uint32_t*)(sW + q * 128);
 #pragma unroll
                     for (int c4 = 0; c4 < 32; ++c4)
-                        sub[i] = dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4], sub[i]);
+                        sub[i][c4 & (kChains - 1)] =
+                            dot4_i8(*(const uint32_t*)(ap + 4 * c4), wp[c4],
+                                    sub[i][c4 & (kChains - 1)]);
                 }
                 __syncthreads();
             }
@@ -247,9 +260,11 @@ gemm_iqr_m16_kernel(const int8_t* __restrict__ a, const float* __restrict__ as,
                 }
                 const int m = p / 16, q = p % 16;
                 if (m >= M) continue;
+                int sum = sub[i][0];
+                if constexpr (kChains == 4) sum = (sum + sub[i][1]) + (sub[i][2] + sub[i][3]);
                 const float sa = as[m * (int)ngrp + (int)g];
                 const float sb = fold_f32<F>(c, row0 + q, g * GS);
-                acc[i] += (float)sub[i] * sa * sb;
+                acc[i] += (float)sum * sa * sb;
             }
         }
     }

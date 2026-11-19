@@ -6,7 +6,8 @@
  * (N = 12288, 768 workgroups) reaches 86 %, so the limit is parallelism, not the decoder.
  *
  * This unit adds a split over K for that band only. `S` contiguous slices of whole 128-K groups run
- * as blockIdx.y; each slice writes one f32 partial per output column into the row's scratch arena
+ * as blockIdx.x (the tile is blockIdx.y, so the resident blocks cover every slice of a few tiles);
+ * each slice writes one f32 partial per output column into the row's scratch arena
  * ([S][N] floats, split-major), and a second kernel adds the partials in ascending split order and
  * applies the row scale once, as the unsplit epilogue does.
  *
@@ -50,10 +51,10 @@ gemm_iqr_m16_split_kernel(const int8_t* __restrict__ a, const float* __restrict_
                           const uint8_t* __restrict__ b, const uint8_t* __restrict__ bs,
                           float* __restrict__ part, int N, int K, uint32_t run_tiles) {
     const uint32_t lane = threadIdx.x & (kIqrWave - 1);
-    const uint32_t rt = blockIdx.x;
+    const uint32_t rt = blockIdx.y;
     const uint32_t nkb = (uint32_t)(K / 128);
-    const uint32_t kg = nkb / gridDim.y;          /* whole groups a slice: K % (S * 128) == 0 */
-    const uint32_t kbeg = blockIdx.y * kg;
+    const uint32_t kg = nkb / gridDim.x;          /* whole groups a slice: K % (S * 128) == 0 */
+    const uint32_t kbeg = blockIdx.x * kg;
     const uint32_t kend = kbeg + kg;
     Ctx c;
     c.W = b;
@@ -87,7 +88,7 @@ gemm_iqr_m16_split_kernel(const int8_t* __restrict__ a, const float* __restrict_
         }
         __syncthreads();
     }
-    if (lane < 16) part[(size_t)blockIdx.y * N + row0 + lane] = acc;
+    if (lane < 16) part[(size_t)blockIdx.x * N + row0 + lane] = acc;
 }
 
 /* The partials, ascending split, then the row scale once: one output column a thread. */
@@ -108,7 +109,9 @@ gemm_iqr_m16_split_reduce_kernel(const float* __restrict__ part, const uint8_t* 
 template <class F>
 static int launch_split(const uint8_t* b, const uint8_t* bs, long a, long as, long y, int N, int K,
                         uint32_t run_tiles, int splits, long scratch, long stream) {
-    const dim3 grid((unsigned)(N / 16), (unsigned)splits), block(kIqrWave);
+    /* Slices vary fastest, then the tile: the resident blocks cover every slice of a few tiles, so a
+     * tile's K run is walked by concurrent waves, not one slice after another. */
+    const dim3 grid((unsigned)splits, (unsigned)(N / 16)), block(kIqrWave);
     R3D_KLAUNCH(R3D_KNAME((gemm_iqr_m16_split_kernel<F>)), grid, block, (hipStream_t)stream,
                 (const int8_t*)a, (const float*)as, b, bs, (float*)scratch, N, K, run_tiles);
     if (hipGetLastError() != hipSuccess) return -4;
