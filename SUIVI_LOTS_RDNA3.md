@@ -634,3 +634,41 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   hc_up 32→64. Pas Flash-Next **−6,5 %** en NS=0 (11,29 → 12,07 tok/s) et
   **−4,2 %** en NS=3 (18,95 → 19,79), textes identiques, vision −1 %.
   Écartés : split-KV causal h256 (texte), batch stage_i8 (mémoire locale).
+
+## W42m — préfill MoE de Flash-Next : poste clos au plafond PCIe (2026-11-19)
+
+- **Mesuré d'abord** (`RADIANCE_AQL_STAMP=1`, `--profile-ops`, `--tail-anchor
+  off` en témoin) : à 972 tokens, préfill **2 087 / 2 003 / 2 043 ms** et
+  `moe_gemm_q` **1 175,5 ms (58,5 %)** ; à 3 252 tokens, MoE **2 186,6 ms
+  (41,5 %)**. Décodage 3 252, deux serveurs neufs : **11,65 et 11,83 tok/s**
+  NS=0, **19,46 et 19,52** NS=3 (référence W41 11,98 / 19,77, soit 97–99 % :
+  écart de mesure, code inchangé — W42 indépendant : 11,82 / 19,49).
+- **Le chunk de queue est le coût** : 972 = 896 + 76 (ancre `--prefix-resume
+  exact`) ; au témoin `--tail-anchor off` le même prompt fait 1 409 ms et le
+  MoE 674,4 ms → la queue de 76 rangées coûte **501 ms de MoE** et 621 ms de
+  préfill pour 7,8 % des rangées.
+- **Les deux chunks sont bornés par les octets, au plafond du lien** : tête
+  434 MiB/couche remisés (20,82 GiB h2d mesurés) en 14,0 ms/couche (31 GB/s) ;
+  queue 0,70 × 434 MiB lus en place en 10,4 ms (29 GB/s). Le temps du poste
+  suit les octets (76 rangées = 8,5 % des rangées, 74 % du temps de la tête).
+  Carte : PCIe 4.0 ×16 (`16.0 GT/s`, largeur 16), 31,5 GB/s théoriques.
+- **Rejeté, mesuré : le point exact en `v_dot4_i32_i8`.** Le `down` w4nl
+  plafonne sur l'**instruction** (ISA : 2 360 `v_mad_i32_i24` contre 5 760
+  `v_bfe_i32`/`v_ashrrev`/`v_lshrrev` d'extraction du tile int16, ≈ 3,5 op/MAC).
+  Deux variantes bit-exactes (`t8 = 16·hi + lo`, deux plans int8 ; puis quatre
+  chaînes indépendantes par plan) : `moe_w4nl_device_test` **18 checks / 14 cas,
+  « bf16 exact »**, mais préfill 972 **2 491 et 2 497 ms (+19–20 %)** et
+  décodage 14,03 contre 14,27 tok/s. `v_dot4` est à taux réduit sur gfx1100 et
+  ne bat pas 64 `v_mad_i32_i24`. Arbre rendu au bit à b1f95704.
+- **R52** — *règle* : le préfill MoE de Flash-Next est borné par les **octets
+  du pool hôte** relus à chaque balayage (PCIe 4.0 ×16), pas par le noyau ;
+  ne pas y chercher de gain dans l'arithmétique (le `down` w4nl est au plafond
+  d'instructions, `v_dot4` est plus lent) mais dans le **nombre de balayages**
+  (chunking, R22/R44/R45) ou la **taille du pool** (résidence : dalle pleine à
+  37,32 GiB de 57 GiB, quantification déjà 4 bits sur les deux plans).
+- Suite complète verte sur `build-w42m`, compteurs identiques au chiffre près
+  à W42 : sched 548 964/213, engine 1 087/52 (3 skips), fixture 109 671/59,
+  config 2 952/71, moe_w4nl 18/14, iqr 76/11, `r3d_selftest` 196 rows /
+  0 échec / 16 skips. `rad-kbench --op moe_gemm_q` : **110/110**, 0 échec,
+  pire rel_l2 3,162e-03.
+

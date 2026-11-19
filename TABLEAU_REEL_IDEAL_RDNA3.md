@@ -752,6 +752,20 @@ prompt sous le premier intervalle son dernier chunk entier : préfill Flash-Next
 3 252 tokens neutre. Prix : la reprise courte du tour suivant disparaît, d'où
 le défaut `on` (R45).
 
+**W42m — les octets du MoE au préfill sont le lien, poste clos (R52).**
+Profil servi sur build neuf (b1f95704) : 972 tokens = **2 087 ms** dont
+`moe_gemm_q` **1 175,5 ms (58,5 %)** ; 3 252 tokens = 5 320 ms dont MoE
+**2 186,6 ms (41,5 %)**. Le MoE suit les **octets**, pas les rangées : au
+témoin `--tail-anchor off` le même prompt fait 1 409 ms et le MoE 674,4 ms,
+donc le chunk de queue de **76 rangées coûte 501 ms de MoE** (70 % du pool
+relu en place). Tête : le pool (19,73 GiB, 421 MiB/couche) remisé en
+14,05 ms/couche = **31 GB/s**, soit le plafond PCIe 4.0 ×16 ; queue en place :
+30 GB/s. Le pool hôte (19,73 GiB, la dalle d'experts est pleine à 37,32 GiB de
+57) et le nombre de balayages (deux ici) fixent donc le poste. Rejeté,
+mesuré : `v_dot4_i32_i8` sur le `down` w4nl (bit-exact, 14/14 cas, mais
+**+19–20 %** car `v_dot4` est à taux réduit). Le levier restant n'est pas le
+noyau mais le chunking (R22/R44/R45).
+
 ## État courant 2026-11-19 — W41 (HEAD e42a7d89)
 
 Vue chiffrée de référence après W38–W41. Tous les gains sont **bit-exacts**
@@ -803,7 +817,9 @@ SUIVI_LOTS_RDNA3.md (R39–R51).
 ### Ordre de valeur restant
 
 gemm_nt_bias vision (7,20 TF/s pour un plafond bit-exact ~11 → ~1,5×), puis
-les octets du MoE au préfill (81 % du lien), puis ttn_paged h256 au préfill
-(12,6 %). Aucun levier bit-exact n'est ouvert sur le décodage : hc_read est à
-son plancher, le GEMM 27B à 76 % du plafond, l'attention h256 et la vision
-bloquées par le contrat de texte.
+`attn_paged` h256 au préfill (12,6 %). Les **octets du MoE au préfill sont clos
+(W42m, R52)** : le poste est au plafond PCIe pour le pool qu'il relit à chaque
+balayage, et le gain ne peut venir que du chunking (`--tail-anchor off`,
+opt-in, R45) ou de la résidence. Aucun levier bit-exact n'est ouvert sur le
+décodage : hc_read est à son plancher, le GEMM 27B à 76 % du plafond,
+l'attention h256 et la vision bloquées par le contrat de texte.

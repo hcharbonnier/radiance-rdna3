@@ -2438,3 +2438,72 @@ seuls), miroir `w29-rebase` resynchronisé, build **neuf** `build-w42`
   aucun signe de throttling : écart de mesure, code inchangé depuis e42a7d89.
 - Artefacts : `/tmp/w42-kbench/`, `/tmp/w42-strict.log`,
   `<work-root>/work/w41-results/w42-gate/`.
+
+## 2026-11-19 — W42m : préfill MoE de Flash-Next — poste clos au plafond PCIe, `v_dot4` rejeté
+
+Reprise au HEAD **b1f95704**, arbre hôte **neuf** `<work-root>/work/w42m`,
+build **neuf** `build-w42m` (gfx1100, FFmpeg, cache de tune 36 rows copié de
+`w29-rebase/build-clean`). Carte W7900 `gfx1100`, PCIe **4.0 ×16**
+(`current_link_speed` 16.0 GT/s, largeur 16 → 31,5 GB/s théoriques), 38 °C et
+62 W au repos avant les runs, aucun throttler signalé par `amd-smi`.
+
+- **Mesure d'abord** (`RADIANCE_AQL_STAMP=1`, `--profile-ops`, payloads
+  inchangés, serveurs neufs, `cache_n=0`). Flash-Next 972 tokens :
+  **2 087 ms** (stamp) puis 2 003 et 2 043 ms (deux autres runs), décodage
+  14,27 tok/s. Flash-Next 3 252, deux serveurs neufs : NS=0 **5 320 et
+  5 323 ms / 11,65 et 11,83 tok/s**, NS=3 **5 983 et 5 842 ms / 19,46 et
+  19,52 tok/s** (référence W41 11,98 / 19,77 : 97–99 %, écart de mesure, code
+  inchangé ; W42 indépendant mesure 11,82 / 19,49). Textes **identiques au bit**
+  à `<work-root>/work/w41-results/fn-ns0.txt` et `fn-ns3.txt`
+  (sha256 `960a2212…`, `cmp` silencieux, NS0 = NS3).
+- Profil par op (972, `--profile-ops`) : total **2 009 ms** dont
+  **`moe_gemm_q` 1 175,5 ms (58,5 %)**, `hc_read` 330,1 (16,4 %),
+  `gemm_nt_q` 259,8 (12,9 %), `gemm_nt` 87,7, `attn_paged` 77,8,
+  `moe_gather` 18,1. Les 192 appels = 2 chunks × 48 couches × 2 plans
+  (`down` w4nl ≈ 7,5 ms, `gate_up` iqr ≈ 4,7 ms). À 3 252 tokens : MoE
+  **2 186,6 ms** des 5 263,6 ms (41,5 %), 192 appels aussi.
+- **Le chunk de queue est le coût, et il est en octets.** Au témoin
+  `--tail-anchor off` le même prompt 972 fait **1 409 ms** dont MoE
+  **674,4 ms** : le chunk de 76 rangées (ancre `--prefix-resume exact`, R22)
+  coûte **501 ms de MoE** et 621 ms de préfill, pour 7,8 % des rangées. Le
+  temps du poste suit les octets et non les rangées : tête, le pool de
+  19,73 GiB (421 MiB/couche) remisé en 14,05 ms/couche = **31 GB/s** (20,82 GiB
+  h2d mesurés pour le run, promotions comprises) ; queue, 0,70 × 421 MiB lus
+  **en place** en 10,4 ms/couche = 30 GB/s. Les deux chunks sont donc **au
+  plafond du lien**.
+- **Une tentative, rejetée.** Le `down` w4nl plafonne sur l'instruction (ISA :
+  2 360 `v_mad_i32_i24` contre 5 760 `v_bfe_i32`/`v_ashrrev`/`v_lshrrev` pour
+  extraire le tile int16, ≈ 3,5 op/MAC). Point exact réécrit en
+  `v_dot4_i32_i8` (`t8 = 16·hi + lo`, deux plans int8, deux chaînes puis
+  quatre chaînes indépendantes) : **bit-exact** (`moe_w4nl_device_test`
+  18 checks / 14 cas, « bf16 exact » ; `iqr_device_test` 76/11) mais préfill
+  972 **2 491 et 2 497 ms (+19–20 %)** et décodage 14,03 contre 14,27 tok/s.
+  `v_dot4` est à taux réduit sur gfx1100 et ne bat pas 64 `v_mad_i32_i24`.
+  Arbre rendu au bit à b1f95704.
+- **Conclusion (R52)** : le préfill MoE de Flash-Next est borné par les
+  **octets du pool hôte** relus à chaque balayage. Réduire ces octets exige
+  plus de VRAM pour la dalle (pleine : 37,32 GiB de 57 GiB d'experts, 19,73 GiB
+  de pool), une quantification plus dense (les deux plans sont déjà 4 bits) ou
+  **un seul balayage** — c'est-à-dire pas de chunk de queue, ce que R44/R45
+  réservent à `--tail-anchor off` (opt-in ; **1,42×** ici, 1 409 contre
+  2 003 ms). Aucun gain bit-exact n'est disponible dans le noyau.
+- Suite complète verte sur `build-w42m`, compteurs **identiques au chiffre
+  près** à W42 : sched 548 964/213, engine 1 087/52 (3 skips), fixture
+  109 671/59, config 2 952/71, iqr 76/11, moe_w4nl 18/14, moe_iqr 15/15,
+  attn_paged 29/10, ple_hc 76/10, dflash_conv 37/3, `r3d_selftest` **196 rows,
+  0 échec, 16 skips**.
+- `rad-kbench --op moe_gemm_q --bench --max-cases 1` : **110 cas vérifiés,
+  110 passés, 0 échec, 0 sauté**, 3 rows de 686, pire rel_l2 **3,162e-03** ;
+  le sweep complet Flash-Next (**4 786/4 786**) reste celui de W42 au même
+  code (seuls des commits de documentation depuis e2d51094).
+- Artefacts : `<work-root>/work/w42m/results/` (logs, JSON, texts),
+  `/tmp/w42m-kbmoe1.md`.
+- **Commandes** : points servis par le harnais `onepoint.py` (serveur neuf à
+  chaque point, YAML : `placement: expert_tiered`, `host-pool-mib: 24576`,
+  `kv-cache-dtype: i8`, `max-num-seqs: 4`, `max-model-len: 8192`,
+  `num-speculative-tokens: 0|3`, `profile-ops: true` pour les profils) ;
+  `RADIANCE_AQL_STAMP=1` (+ `RADIANCE_AQL_STAMP_OUT`) pour les passes ;
+  `rad-kbench -m <work-root>/models/qwen3.8-next-flash-iqr-v4.rad --home
+  build-w42m/radiance_home --op moe_gemm_q --bench --max-cases 1 --report
+  /tmp/w42m-kbmoe1.md` ; tout sous `flock /tmp/radiance-gpu.lock`.
+
