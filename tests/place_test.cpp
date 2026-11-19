@@ -627,6 +627,118 @@ struct HeatFixture {
 
 }  /* namespace */
 
+/* The move budget: the full ceiling on a plan that leaves enough experts off the card for swaps
+ * to raise the hit rate, the churn budget once most of the plane is resident, and the caller's
+ * number when one is given. */
+TEST(heat_move_budget_follows_the_plan_unless_asked) {
+    HeatFixture hf;
+    int64_t movable = 0, resident = 0;
+    for (const MoveUnit& u : hf.plan.units)
+        if (u.movable) {
+            ++movable;
+            resident += u.tier == Tier::VRAM ? 1 : 0;
+        }
+    CHECK(movable > 0);
+    CHECK(resident * 5 < movable * 3);   /* the fixture keeps fewer than 60% on the card */
+    const HeatParams cold = heat_params_for(hf.plan, 0);
+    CHECK_EQ(cold.moves_per_step, (int)RAD_PLACE_MOVES_PER_STEP);
+    CHECK_EQ(cold.moves_full, (int)RAD_PLACE_MOVES_PER_STEP);
+    CHECK_EQ(heat_params_for(hf.plan, 5).moves_per_step, 5);
+    CHECK_EQ(heat_params_for(hf.plan, 5).moves_full, 5);
+
+    Plan dense = hf.plan;
+    for (MoveUnit& u : dense.units)
+        if (u.movable) u.tier = Tier::VRAM;
+    const HeatParams warm = heat_params_for(dense, 0);
+    CHECK_EQ(warm.moves_per_step, kHeatChurnMoves);
+    CHECK_EQ(warm.moves_full, (int)RAD_PLACE_MOVES_PER_STEP);
+
+    /* Only the routed experts count, and their bytes: 6 of 10 experts on the card is exactly 60%
+     * (churn), 40 resident non-expert units do not lift 5 of 10, and four pooled experts ten
+     * times larger than the six residents leave 13% of the bytes on the card. */
+    auto unit = [](int32_t expert, Tier tier, int64_t bytes) {
+        MoveUnit u;
+        u.layer = 0;
+        u.expert = expert;
+        u.movable = true;
+        u.tier = tier;
+        u.bytes = bytes;
+        return u;
+    };
+    Plan six;
+    for (int32_t e = 0; e < 10; ++e)
+        six.units.push_back(unit(e, e < 6 ? Tier::VRAM : Tier::HostPinned, 1 << 20));
+    CHECK_EQ(heat_params_for(six, 0).moves_per_step, kHeatChurnMoves);
+
+    Plan five = six;
+    five.units[5].tier = Tier::HostPinned;
+    for (int i = 0; i < 40; ++i) {
+        MoveUnit u;
+        u.layer = -1;
+        u.expert = -1;
+        u.movable = true;
+        u.tier = Tier::VRAM;
+        u.bytes = 1 << 20;
+        five.units.push_back(u);
+    }
+    CHECK_EQ(heat_params_for(five, 0).moves_per_step, (int)RAD_PLACE_MOVES_PER_STEP);
+
+    Plan heavy = six;
+    for (int32_t e = 0; e < 10; ++e)
+        heavy.units[(size_t)e].bytes = e < 6 ? (1 << 20) : (10 << 20);
+    CHECK_EQ(heat_params_for(heavy, 0).moves_per_step, (int)RAD_PLACE_MOVES_PER_STEP);
+}
+
+TEST(heat_churn_budget_waits_for_a_broad_pass) {
+    HeatFixture hf;
+    /* One dispatch on a fresh engine: every pooled expert routed `per` times, at most that many
+     * swaps come back. */
+    auto proposals = [&](int32_t per) {
+        HeatEngine h;
+        HeatParams hp;
+        hp.moves_per_step = 1;
+        hp.moves_full = 8;
+        CHECK_OK(h.init(hf.plan, hp));
+        CHECK(h.enabled());
+        int32_t ids[8], counts[8] = {0};
+        for (int32_t e = 0; e < 8; ++e) {
+            ids[e] = e;
+            if (h.tier(hf.unit_of_expert(e)) != Tier::VRAM) counts[e] = per;
+        }
+        h.observe_ids(0, ids, counts, 8);
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        return (int)sw.size();
+    };
+    /* Thin history: the full budget, so all four pooled experts can go. */
+    CHECK_EQ(proposals(2), 4);
+    /* 4 092 selections is still thin; 4 096 is the bar, and the step coasts on the churn budget. */
+    CHECK_EQ(proposals(1023), 4);
+    CHECK_EQ(proposals(1024), 1);
+
+    /* The latch expires after kHeatDenseSteps dispatches: the next one has the full budget back. */
+    HeatEngine h;
+    HeatParams hp;
+    hp.moves_per_step = 1;
+    hp.moves_full = 8;
+    CHECK_OK(h.init(hf.plan, hp));
+    int32_t ids[8], counts[8] = {0};
+    for (int32_t e = 0; e < 8; ++e) {
+        ids[e] = e;
+        if (h.tier(hf.unit_of_expert(e)) != Tier::VRAM) counts[e] = 1024;
+    }
+    h.observe_ids(0, ids, counts, 8);
+    for (int d = 0; d < kHeatDenseSteps; ++d) {
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        CHECK_EQ((int)sw.size(), 1);
+        for (const Swap& s : sw) h.abandon(s);
+    }
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    CHECK_EQ((int)sw.size(), 4);
+}
+
 TEST(heat_promotes_a_hot_pooled_expert) {
     HeatFixture hf;
     HeatEngine h;

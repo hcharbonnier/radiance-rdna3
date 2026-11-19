@@ -621,6 +621,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--max-source-pixels", { "1000000" } },
         { "--expert-stats", { "/s/experts.json" } },
         { "--expert-profile", { "/p.json" } }, { "--expert-pin-top", { "0.2" } },
+        { "--expert-moves", { "32" } },
         { "--draft-expert-placement", { "host" } },
         { "--kld-record", { "/r", "--kld-corpus", "/c.jsonl" } }, { "--kld-ref", { "/r" } },
         { "--kld-corpus", { "/c.jsonl", "--kld-record", "/r" } },

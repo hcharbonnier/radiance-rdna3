@@ -14,9 +14,29 @@ constexpr int32_t kLanes = 16;
 constexpr int32_t kBlock = 64;
 }  /* namespace */
 
+HeatParams heat_params_for(const Plan& plan, int moves) {
+    HeatParams p{};
+    if (moves > 0) {
+        p.moves_per_step = moves;
+        p.moves_full = moves;
+        return p;
+    }
+    int64_t movable = 0, resident = 0;
+    for (const MoveUnit& u : plan.units) {
+        if (!u.movable || u.expert < 0) continue;   /* the routed experts, not a dense weight */
+        movable += u.bytes;
+        if (u.tier == Tier::VRAM) resident += u.bytes;
+    }
+    const double share = movable > 0 ? (double)resident / (double)movable : 0.0;
+    p.moves_per_step = share >= kHeatChurnShare ? kHeatChurnMoves : RAD_PLACE_MOVES_PER_STEP;
+    p.moves_full = RAD_PLACE_MOVES_PER_STEP;
+    return p;
+}
+
 int HeatEngine::init(const Plan& plan, const HeatParams& params) {
     params_ = params;
     stats_ = HeatCounters{};
+    dense_steps_ = 0;
 
     const size_t n = plan.units.size();
     tier_.assign(n, Tier::VRAM);
@@ -147,10 +167,10 @@ int HeatEngine::init(const Plan& plan, const HeatParams& params) {
         return RAD_OK;
     }
     enabled_ = true;
-    RAD_INFO("heat engine: %lld movable units, %d move%s a step, "
-             "decay %.3f hysteresis %.2f min-gain %.2f credit cap %.0f admit-heat %.1f",
+    RAD_INFO("heat engine: %lld movable units, %d move%s a step after a broad pass (%d before "
+             "one), decay %.3f hysteresis %.2f min-gain %.2f credit cap %.0f admit-heat %.1f",
              (long long)movable, params_.moves_per_step,
-             params_.moves_per_step == 1 ? "" : "s",
+             params_.moves_per_step == 1 ? "" : "s", params_.full_budget(),
              (double)params_.decay, (double)params_.hysteresis, (double)params_.min_gain,
              (double)params_.credit_cap, (double)params_.admit_heat);
     return RAD_OK;
@@ -209,6 +229,10 @@ void HeatEngine::observe(int32_t layer, const int32_t* counts, int32_t n_expert,
      * Pricing ignores the cap. */
     int64_t total = 0;
     for (int32_t j = 0; j < n; ++j) total += counts[j] > 0 ? counts[j] : 0;
+    /* A histogram this wide came from a broad pass (a prompt, not a decode step): that pass has
+     * shaped the resident set, so the following steps may use the churn budget. A short prompt's
+     * few hundred selections do not, and its decode keeps discovering at the full rate. */
+    if (total >= kHeatDenseSelections) dense_steps_ = kHeatDenseSteps;
     const float cap = params_.credit_cap;
     const float w = cap > 0.0f && (float)total > cap ? weight * cap / (float)total : weight;
 
@@ -437,7 +461,8 @@ int HeatEngine::step(std::vector<Swap>* out) {
     if (!out) return RAD_E_INVAL;
     out->clear();
     if (!enabled_) return RAD_OK;
-    const int k = params_.moves_per_step;
+    const int k = dense_steps_ > 0 ? params_.moves_per_step : params_.full_budget();
+    if (dense_steps_ > 0) --dense_steps_;
     if (k <= 0) return RAD_OK;
 
     /* Test the best pair from the layers' ends first. If it fails the guard, every pair does,
