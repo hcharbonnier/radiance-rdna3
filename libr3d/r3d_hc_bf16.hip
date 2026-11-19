@@ -19,7 +19,10 @@
  *   norm    one block a row, hc threads: the hc double sums and their scales;
  *   down    one block a (8-row tile, 32-output tile), plus one a row tile for `inj`: every thread
  *           owns one (row, output) pair and accumulates it, so all 256 lanes are busy and the
- *           staged slice of 32 weight rows serves 8 rows. The block rebuilds N in LDS as bf16 one
+ *           staged slice of 32 weight rows serves 8 rows. From 256 rows the block instead owns a
+ *           16-row by 64-output tile, two outputs and two rows a lane: one staged weight feeds
+ *           two rows and the grid needs five output tiles instead of ten. The block rebuilds N
+ *           in LDS as bf16 one
  *           128-column chunk at a time (the normalisation is cheap beside the weight stream) and
  *           sums i ascending in f32 exactly as ref does. In the E4M3 form a lane reads one
  *           16-byte vector of codes beside its group's scale, so the slice is one load a lane
@@ -67,6 +70,9 @@ constexpr int kHcUpRows = 8;        /* stream rows a one-pair up workgroup owns 
  * ten. At 128 rows that leaves 48 workgroups and the narrow tile is faster; from 256 rows the
  * wider one measures equal and from 512 it is 5% ahead, reaching 8-9% at 2k and 4k rows. */
 constexpr int kHcDownWide = 256;
+/* The wide tile's output width, 32*P for the P=2 instantiation below (the kernel derives it from
+ * its template arguments; the launch's tile count must match). */
+constexpr int kHcDownTileWide = 32 * 2;
 /* A launch narrower than a row tile keeps the W28 kernels, which are one row a block: no row of
  * the tile is an empty lane, and a one-row call keeps the latency it was measured at. */
 constexpr int kHcW28DownTile = 16;
@@ -203,7 +209,8 @@ __device__ __forceinline__ void hc_down_body(
             stream_end += n;
         }
         /* N of the tile's rows, one chunk at a time: the whole-row fill's expression, narrowed
-         * once. Rows past M are held at zero and never stored. */
+         * once. Rows past `rv` (and so past M) are neither staged nor stored; the dot's lanes past
+         * them read whatever the stage holds and drop the value at the store guard. */
         if (whole) {
             const int c = cstream;
             for (int idx = t; idx < rv * CHUNK; idx += kHcThreads) {
@@ -893,9 +900,10 @@ int r3d_hc_read(long h, long w, long down, long up, long injw, long x, long inj,
                       inj ? inj_ld : 0, mix_e4m3, down_ld, down_stride, down_G, wadd);
     } else if (M >= kHcDownWide) {
         /* Two columns a lane over a 64-output tile: one staged weight feeds two rows and the
-         * slice is 64 deep, so the CU still holds three workgroups. From 256 rows this measures
-         * equal to the narrow tile and 5% ahead at 512, 8-9% at 2k and 4k. */
-        const int tiles = (lr + 63) / 64;
+         * slice is 64 deep, so LDS and the 80-VGPR allocation still hold three workgroups a CU.
+         * From 256 rows this measures equal to the narrow tile and 5% ahead at 512, 8-9% at 2k
+         * and 4k. */
+        const int tiles = (lr + kHcDownTileWide - 1) / kHcDownTileWide;
         R3D_KLAUNCH_S(hc_down_kernel_p2q2c64,
                       dim3((uint32_t)((M + 15) / 16), (uint32_t)(tiles + inj_y)),
                       dim3(kHcThreads), kHcDownLdsP2Q2C64, (hipStream_t)stream,

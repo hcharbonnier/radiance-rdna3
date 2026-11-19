@@ -413,10 +413,8 @@ TEST(hc_read_bf16_matches_libref) {
     CHECK(kd && kr && kd->scratch);
     if (!(kd && kr && kd->scratch)) return;
 
-    /* lr = 128 > n % 256 = 64: the last column tile's lanes 64..127 retire past `n`, so they
-     * must load the shared window and reach the barrier before they go. lr = 16 would not
-     * cover that staging. */
-    const int M = 2, n = 64, hc = 2, hn = hc * n, lr = 128, group = 16;
+    auto run_case = [&](int M, int n, int hc, int lr, int group) {
+    const int hn = hc * n;
     const int ngrp = n / group;
     auto hh = rand_bf16((size_t)M * hn, 41), dh = rand_bf16((size_t)lr * hn, 42),
          uh = rand_bf16((size_t)hn * lr, 43), ijh = rand_bf16((size_t)hc * hn, 44);
@@ -491,6 +489,15 @@ TEST(hc_read_bf16_matches_libref) {
             CHECK(same_f32(rrs, rs2, "hc_read rq scale"));
         }
     }
+    };
+
+    /* lr = 128 > n = 64: the last column tile's lanes 64..127 retire past `n`, so they must load
+     * the shared window and reach the barrier before they go. lr = 16 would not cover that
+     * staging. */
+    run_case(2, 64, 2, 128, 16);
+    /* 257 rows take the wide down tile (2x2x64) and lr = 20 leaves 20 of 64 columns in its one
+     * output tile, so the partial stage and the lanes past `nr` are covered too. */
+    run_case(257, 64, 2, 20, 16);
 }
 
 /* ================================================================== hc_read, E4M3 mixing rows */
@@ -561,8 +568,8 @@ TEST(hc_read_e4m3_matches_libref) {
     CHECK(kd && kr && kd->scratch);
     if (!(kd && kr && kd->scratch)) return;
 
-    /* 10 rows cross the 8-row tile boundary, so the partial tile is covered too. */
-    const int M = 10, n = 256, hc = 2, hn = hc * n, lr = 64, group = 128;
+    auto run_case = [&](int M, int n, int hc, int lr, int group) {
+    const int hn = hc * n;
     const int ngrp = n / group;
     auto hh = rand_bf16((size_t)M * hn, 81), ijh = rand_bf16((size_t)hc * hn, 82);
     auto wh = rand_f32(hn, 83, 0.5f, 1.5f);
@@ -636,6 +643,13 @@ TEST(hc_read_e4m3_matches_libref) {
     CHECK(std::memcmp(d0.data(), d1.data(), d0.size()) == 0);
     CHECK(same_f32(e0, e1, "hc_read_e4m3 q scale"));
     CHECK(same_f32(f0, f1, "hc_read_e4m3 rq scale"));
+    };
+
+    /* 10 rows cross the 8-row tile boundary, so the partial tile is covered too. */
+    run_case(10, 256, 2, 64, 128);
+    /* The wide down tile (2x2x64) takes over at 256 rows: 257 rows leave one row in the last
+     * 16-row block. lowrank is a multiple of 64, so the 64-output tiles are exact. */
+    run_case(257, 256, 2, 128, 128);
 }
 
 /* ================================================================== hc_read timing mode */
