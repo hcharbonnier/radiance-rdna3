@@ -1689,9 +1689,18 @@ static long long attn_scratch_rows(const RadArgs* a) {
  * floats) per (query row, head, slice). The shim takes the slice count from the bytes the engine
  * offers, halving it until they fit, so this is the request at the slice count the walk benefits
  * from, capped at 16 MiB. Attaching scratch makes the row non-concurrent (rad_kernel_concurrent is
- * `scratch == nullptr`), which is the cost of the split. */
+ * `scratch == nullptr`), which is the cost of the split.
+ *
+ * Only the speculative blocks get an arena: `causal == 0` is the drafter's block attention, whose
+ * proposals are re-checked by the trunk. A trunk row is `causal == 1` and answers 0, so it stays at
+ * `splits = 1` and its output is bit-identical by construction -- `splits > 1` is not bit-identical
+ * (r3d_attn_paged_h128.hip; attn_paged_device_test.cpp holds the split to the bf16 tolerance,
+ * never to the bytes). A served trunk's greedy text must not move with the split's parentheses.
+ * The slow h128 trunk at ~1 k of context (2.4 tok/s with no arena, measured) is a distinct
+ * pre-existing sizing bug and a product decision (R49), not something this row settles. */
 static int64_t attn_scratch(const RadArgs* a) {
     if (!a) return 0;
+    if (rad_param_getdim(a->p, a->n_p, "causal", 1) != 0) return 0;
     const long long rows = attn_scratch_rows(a);
     const long long nh = rad_param_getdim(a->p, a->n_p, "n_head", 0);
     if (rows <= 0 || nh <= 0) return 0;
