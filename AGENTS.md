@@ -270,8 +270,11 @@ l'arbre **W26** (ne pas l'utiliser comme baseline de perf sans rebuild) ;
 détails dans `RAPPORT_REBASE_V2_1_0.md`.
 
 Recette 27B (dense, IQR) : `--kv-cache-dtype i8`, `--max-num-seqs 4` — le
-multi-séquence est servi depuis W20 (4 requêtes ≈ 67 tok/s agrégés, préfill
-≈ 318 tok/s). Le drafter sert depuis W38c (`dflash_conv` sur la carte, cache
+multi-séquence est servi depuis W20, mais le « 4 requêtes ≈ 52–67 tok/s
+agrégés » est un chiffre de **contexte court** (256 tokens : 51–61 tok/s) :
+à 2 047 tokens, quatre flux ne donnent que 8,5–10,8 tok/s agrégés en `NS=0`,
+moins qu'un seul flux (15,4), et `NS=3` les remonte à 15,1–15,6 (W40e). Le
+drafter sert depuis W38c (`dflash_conv` sur la carte, cache
 du drafter en bf16) et depuis W40d son attention prend le split-KV (aréna
 dimensionnée) : `--num-speculative-tokens 3` donne **1,74×** à 2 047 tokens
 (26,9 contre 15,4 tok/s, acceptation 70 %) et **1,44×** à 139 (39,3 contre
