@@ -2111,3 +2111,48 @@ découpage du dot entre lanes (casserait la somme ascendante).
 le reste est de la latence à 24 vagues. La marge de **1,7×** de §6.B n'est pas
 atteignable par vectorisation, largeur de lane ou staging sous contrainte
 bit-exacte : c'est un constat, pas un reste à faire.
+
+## 2026-11-19 — W40c : budget d'échanges du moteur de chaleur — −21 % d'octets de promotion, −1,75 % de décodage
+
+Le « 63 Go/token » de §5.2 est la **taille du plan d'experts** (24 576 ×
+2,56 Mo), pas les octets lus : la mesure donne **1,20 Gio d'experts routés par
+token** à 3 252. Le lien réellement sollicité, lui, était dominé par les
+**promotions** : 64 échanges par étape et par classe recopiaient des experts que
+les étapes suivantes auraient touchés, sur un plan déjà résident à 66 %.
+
+Livré (`49f9317a`, `ab38e620`, fusionnés) : `heat_params_for(plan, moves)`
+abaisse le budget à **16** quand ≥ 60 % des **octets** d'experts mobiles sont en
+VRAM, **après un broad pass** (histogramme ≥ 4 096 sélections, ~410 rangées à
+top_k 10) et pour **512 étapes**, puis revient à 64 ; un prompt court garde 64
+dès la première étape ; `--expert-moves N` (0 = auto, plafond 1 024) force le
+budget et s'applique dès la première étape. Le partage est une décision
+**d'union sur les classes** (documentée) ; un prompt chunké sous ~410 rangées
+n'arme pas et retombe sur 64.
+
+| décodage 3 252, NS=0, 64 tokens | avant | après |
+|---|---:|---:|
+| lus en place (non résidents) | 376,9 Mio/token | 365,8 Mio/token |
+| promotions h2d | 160,4 Mio/token | **57,5 Mio/token** |
+| **total sur le lien** | **537 Mio/token** | **423 Mio/token (−21 %)** |
+| hit rate VRAM | 76,3 % | 77,0 % |
+
+| point servi | NS=0 | NS=3 |
+|---|---:|---:|
+| TTFT 972 (8 tok) | 2 108 → 2 091 ms | 2 318 → 2 306 ms |
+| TTFT 3 252 (8 tok) | 5 463 → 5 383 ms | 5 725 → 5 680 ms |
+| décodage 3 252 (64 tok) | 5 949 → **5 845 ms (−1,75 %)** | 3 771 → 3 745 ms (−0,7 %) |
+| décodage 972 (17 tok) | 1 285 → 1 274 ms | 541 → 535 ms |
+| décodage 92 (64 tok, 3 reps) | 4 192 → 4 192 ms | 1 740 → 1 740 ms |
+
+Textes identiques au bit partout ; suite complète verte (`config_test`
+2 952 checks, `place_test` 52 018/101 cas), kbench Flash-Next **4 786/4 786**,
+0 divergence. **Rejeté, sur mesure** : `kXpSlots 2→4` (décodage −1,4 %, bruit),
+budget 16 **global** (+6,3 % à 92 tokens, hit 75,2 → 70,6 %), budget 48 global
+(+0,85 % à 92), sans chaleur/XP (`--deterministic`, 6 746 contre 5 910 ms),
+changement de précision d'un plan de poids (texte).
+
+**Ce que ça dit** : à 3 252 le décodage est **latency-bound** (`hc_read`
+28,6 ms, `attn_paged` 25,4, `moe_gemm_q` 20,7 sur 92,4 ms ; lien à ~31 % à
+NS=3). Les octets du MoE ne sont plus le levier : −21 % d'octets de promotion
+ne rendent que 1,75 %. Ne pas rouvrir un chantier « octets/token » sans
+profiler d'abord.

@@ -364,6 +364,14 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   n'est pas atteignable sous contrainte bit-exacte (dot à 2,75 instr/MAC
   contre un plancher de 2,0, le reste est de la latence à 24 vagues). Ce n'est
   plus un reste à faire.
+- **MoE / chaleur, W40c** : budget d'échanges piloté par la résidence
+  (`49f9317a`) — 16 après un broad pass sur un plan ≥ 60 % résident, 64 sinon,
+  latch 512 étapes, `--expert-moves N`. **−21 % d'octets de promotion**
+  (160,4 → 57,5 Mio/token), décodage 3 252 **−1,75 %** (NS=0) et −0,7 % (NS=3),
+  TTFT −1,5 %, textes identiques, kbench Flash-Next 4 786/4 786. Rejetés :
+  `kXpSlots 4`, budget 16 ou 48 global, sans chaleur. Le décodage à 3 252 est
+  **latency-bound** (92,4 ms de pas : `hc_read` 28,6, `attn_paged` 25,4,
+  `moe_gemm_q` 20,7) : ne pas rouvrir « octets/token » sans profil.
 - **IQR — tuile 2×4 rejetée (W32)** : 1,94× réel à M=1626 (32,91 → 16,94 ms,
   34,2 TFLOP/s, 0 ulp) mais sur la grille **i8 signée**, gardée par
   `F::KIND == kSigned && F::B == 8` ; le 27B est **trellis u4/u5**
