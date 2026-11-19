@@ -17,6 +17,33 @@
  *     below the bf16 store's 1/256. The selftest states the bound (one bf16 code) and adds a
  *     uniform-score case where exp(0) is exactly 1 and the answer is bit-identical.
  *
+ *     W40 measured the two arithmetic exits R40 left open; this row keeps the reference's two
+ *     walks because one exit cost speed and the other the served text:
+ *       - a fused multiply-add for the dot and for `acc[d] += w * v[d]` halves the float
+ *         instructions (437 -> 221 VALU a key, a dot a walk and the value row each one op a key;
+ *         2 339 -> 1 238 static; the same 241 VGPRs), but the dot is latency-bound rather than
+ *         issue-bound: the fuse leaves a 72-op dependent chain with no independent multiplies to
+ *         fill it, and the served shape runs 3.3 % slower (16 384 patches x 16 heads:
+ *         233.6 -> 241.3 ms, 5 296 -> 5 127 GFLOP/s, three interleaved runs each). Not taken.
+ *       - an online (tile-max) softmax with the tile's scores kept in LDS (16 keys x 128 threads
+ *         x 4 B = 8 KiB, transposed so both accesses are conflict-free) forms the dot once a key
+ *         instead of once a walk and removes the first walk. The tile's maximum is the running one
+ *         and a tile that raises it scales `sum` and every acc[d] by `exp(m_old - m_new)`; the
+ *         first tile's rescale is `exp(-inf) = 0`, a clean zero without a branch, which is where
+ *         the bracketing first leaves the reference's. It is 1.46x at the served shape
+ *         (237.1 -> 162.9 ms; 512 rows 397.9 -> 285.7 us, 4 096 17.07 -> 12.05 ms), and the
+ *         served TTFT of a 2 048^2 image with 4 117 tokens falls 16.79 -> 14.63 s (1 024^2:
+ *         3.33 -> 3.19 s). But the rescale between tiles brackets the sums differently: 0.13 % of
+ *         the output bf16 codes differ from this kernel's at the served shape (92.8 % of those by
+ *         one code, rel_l2 8.8e-5, kbench still <= 4.5e-6 against libref), and the greedy text of
+ *         both served images changes (1 024^2: "likely from a Human Protein Atlas page ... on a
+ *         gradient" becomes "a gradient background transitioning from dark blue to orange ...";
+ *         2 048^2: "three colored squares" becomes "three colored squares (red, green, and blue)").
+ *         The current vision gate requires the served text to be identical, so the variant was not
+ *         merged. A later attempt needs either an exact score store that fits (64 KiB a row, 8 MiB
+ *         at a block's 128 rows, which is why the recompute exists) or a new accepted contract for
+ *         the tower's text.
+ *
  *     W12 gave the kernel the walk the cost at M = 16384 asks for: a workgroup carries a block of
  *     query rows (and the whole of a small GQA group), one thread a row, and sweeps the segment's
  *     keys in LDS tiles of K and V widened to f32 once a tile element. W13 runs four keys' dot
@@ -81,11 +108,13 @@ constexpr int kThr   = 128;      /* four wave32s: one thread a (row, head) or a 
  * one -- the f32 latency -- and the group's reads of a dword group are issued together. The group
  * changes no addend and no bracketing -- each dot still runs d ascending, and the scores, weights
  * and value rows are consumed in ascending key order -- and a tile whose tail is not a whole group
- * falls back to one key a step. At M = 16384 the walk is issue-bound, so what matters is the
- * instruction count: the four-row walk is ~7% leaner than the one-key walk it replaces, and the
- * remaining cost is the two dots and the accumulators the reference's bracketing requires. A
- * vector array would say the same thing more shortly, but LLVM spills it here (256 VGPRs, 900 B a
- * lane); the group is written out a row at a time instead.
+ * falls back to one key a step. The four-row walk is ~7% leaner than the one-key walk it replaces,
+ * and its four independent chains are what fill the f32 add latency: W40's fused multiply-add
+ * halves the float instructions and buys nothing (above), so the walk is latency-bound on the dot
+ * chain, not issue-bound on its instruction count. What remains is the two dots and the
+ * accumulators the reference's bracketing requires. A vector array would say the same thing more
+ * shortly, but LLVM spills it here (256 VGPRs, 900 B a lane); the group is written out a row at a
+ * time instead.
  *
  * ============================== the stage ==============================
  *
