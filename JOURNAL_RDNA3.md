@@ -2869,3 +2869,88 @@ dans la plage)** ; à 972, 18,197 contre 18,865 (**−0,67 Gio**) donnent
 43 °C / 23 W au repos avant la passe, drapeau `THROTTLED` levé (bruit connu) et
 aucun PPT signalé aux runs servis. Artefacts : `<work-root>/work/w44a/{build-w44a,results*,results-gate}`,
 `/tmp/w44-tests/`, `/tmp/w44-kbench-fn.md`.
+
+## 2026-11-20 — W43 : préfill 27B — tuile registre 4×4 et décodage trellis recouvert
+
+Branche `rdna3-iqr` à **197a239a**, aucun push, aucun merge. Arbre hôte
+**neuf** `<work-root>/work/w43a`, build **neuf** `build-w43c` (gfx1100,
+FFmpeg, cache de tune 36 rows recopié de `w29-rebase/build-clean`). Le profil
+du 27B (`--profile-ops`, payloads 972 et 3 252, `NS=0`) donne **89,1 % du
+préfill dans la row `gemm_nt_q` au format trellis calculé** (1 902 ms sur
+2 087) : `ffn_gate_up` N=34 816 K=5 120 827 ms, `ffn_down` N=5 120 K=17 408
+491 ms, N=16 384 298 ms, N=12 288 76 ms. Le conteneur est **dense**
+(`n_expert=0`) : il n'émet aucune row `moe_gemm_q` ; le « 56,5 % de
+`moe_gemm_q` » du handover §6.B est ce GEMM trellis dense, pas le GEMM groupé.
+`rad-info --recipe` confirme `u4/u5, scale bf16[1x128], trellis.mad u32{2x1}`,
+donc la famille `kTrellisMad, LRB=0, GS=1`.
+
+**Noyau.** Nouvelle tuile registre **4×4** (`gemm_iqr_resident_quad_kernel`) :
+chaque lane tient quatre tokens par quatre rangées, une vague couvre 32 tokens
+(huit quads de tokens, quatre quads de rangées) et un workgroup 128 tokens, la
+tuile de poids restant 16 rangées. Par pas c4 : 4 dwords d'activation et
+4 dwords de poids pour 16 `v_dot4`, soit **0,25 dword d'activation et 0,25 de
+poids par dot4** (2×4 : 0,25 et 0,50). L'ordre par (token, rangée) est
+inchangé — c4 croissant, `sub` i32 exact du `sudot4`, puis
+`acc += (float)sub * sa * sb` de gauche à droite, `row_scale` en épilogue — et
+aucun split-K : la sortie est **bit-identique** au 2×4. Le K est
+**double-bufferé** (`sW[2]`) : le décodage du bloc kb+1 est écrit dans l'autre
+tampon pendant que les dot4 consomment kb ; un seul `__syncthreads` par bloc K,
+le décodage (ablation : 8–22 % du noyau) est recouvert. Mesure ISA
+(`-Rpass-analysis=kernel-resource-usage`) : **124–126 VGPR, 0 spill** contre
+222 pour le 2×4 déroulé en entier ; c'est l'unroll 8 du c4 qui borne la fenêtre
+de chargement, pas les 16 sommes + 16 accumulateurs. Le 4×4 est pris à
+**M ≥ 256** ; en dessous le 2×4 (M ≥ 128), puis l'ancienne tuile. Les formes
+`kTrellisMad/LRB=0/GS=1` seules sont concernées.
+
+**Noyau, `rad-kbench --op gemm_nt_q --bench --max-cases 1`** sur `build-w43c` :
+**194/194**, 0 échec, 0 divergence, pire rel_l2 2,911e-03. Avant → après
+(µs device, même géométrie) :
+
+| géométrie | M | avant | après | gain |
+|---|---:|---:|---:|---:|
+| N=34 816 K=5 120 | 512 | 6 467,5 | 5 927,5 | 1,091× |
+| N=34 816 K=5 120 | 256 | 3 363,1 | 3 007,6 | 1,118× |
+| N=5 120 K=17 408 | 512 | 3 409,6 | 3 273,7 | 1,042× |
+| N=5 120 K=17 408 | 256 | 1 812,6 | 1 681,7 | 1,078× |
+| N=16 384 K=5 120 | 512 | 2 942,4 | 2 819,5 | 1,044× |
+| N=16 384 K=5 120 | 256 | 1 623,5 | 1 478,2 | 1,098× |
+| N=12 288 K=5 120 | 512 | 2 276,0 | 2 162,1 | 1,053× |
+| N=5 120 K=6 144 | 512 | 1 323,3 | 1 040,3 | 1,272× |
+| N=1 024 K=5 120 | 512 | 181,7 | 182,8 | 0,994× |
+
+Les hauteurs < 256 (tuile 2×4) sont inchangées à ±1,5 % ; N=1 024 perd 0,6 %
+(0,2 % du préfill). `rad-kbench --bench` complet du 27B : **3 181/3 181**,
+0 échec, 0 divergence, pire rel_l2 3,619e-03, 546 s, 2 793 MHz de moyenne,
+aucune ligne marquée throttlée. `--op moe_gemm_q` sur ce conteneur : **0 cas**
+(pas de MoE), donc aucun compte à comparer ; sur Flash-Next, où l'op existe,
+la même cible donne **110/110**, 0 échec, 0 divergence, pire rel_l2
+3,162e-03 (2 460 MHz de moyenne) : le GEMM groupé n'est pas touché.
+
+**Servi** (`build-w43c`, serveur neuf, `cache_n=0`, payloads W41) : préfill
+**972 tokens 2 006 ms / 484,5 tok/s** contre 2 104–2 154 ms / 451–462 tok/s
+sur `build-w43a` (**+4,7 à +7,4 %**), et **3 252 tokens 6 688 ms / 486,2
+tok/s** contre 6 950–7 004 ms / 464–468 (**+3,8 à +5,6 %**) ; profil
+`--profile-ops` 2 001 / 6 678 ms. p2047-64 : préfill 4 317–4 486 ms, décodage
+**NS=0 15,21–15,25 tok/s** (98,3–98,5 % de 15,48 ; 99,8–100 % du run W41
+15,24) et **NS=3 26,79–26,97 tok/s** sur cinq runs (26,93–26,97 à froid,
+soit 98,1–98,25 % de 27,45 ; 99,6–99,8 % du run W41 27,02), textes **identiques
+au bit** : sha256 `d7cf7a3b…` pour NS0 et NS3,
+comme `<work-root>/work/w41-results/d27-ns{0,3}.txt`. Les deux runs
+consécutifs sans pause donnent 26,97 puis 26,79 ; le run NS3 à froid
+(90 s d'arrêt) redonne **26,97**, au-dessus du plancher 26,90. Queue de tuile :
+un prompt de 2 022 tokens (un chunk, M=2 022, `M%4=2`, dernier bloc de 102
+tokens) donne le même texte que le 2×4 (`765d88a2…`), préfill 4 491 → 4 295 ms.
+
+**Validation** (build neuf `build-w43c`, `RADIANCE_HOME`) : sched **548 964/213**,
+engine **1 087/52** (3 skips), fixture **109 671/59**, config **2 952/71**,
+iqr **76/11**, ple_hc **76/10**, moe_iqr **15/15**, vision_rows **76/12**,
+attn_paged **36/11**, logits **8/4**, gather **33/3**, mtp **22/3**,
+logit_rerank **36/5**, act_i8g **103/6**, tp2 **12/2**, dflash **37/3**,
+`r3d_selftest` **196 rows, 0 échec, 16 skips**. Carte : 54–68 W au repos,
+GFX 1,1–1,2 GHz, MEM 96–456 MHz, `THROTTLE_STATUS=THROTTLED` au repos (le
+drapeau connu) ; kbench 2 793 MHz de moyenne et aucune ligne throttlée.
+Artefacts : `<work-root>/work/w43-results/` (`kb-gemm-base.md`,
+`kb-gemm-dbuf.md`, `kb-27b-final.md`, `suite-final.log`, `gate/`, `gate3/`,
+`tail/`). Risques : R39 (gain jugé à M ≥ 256 et au TTFT), R43 (décodage
+inchangé : le quad n'est pris qu'à M ≥ 256, le décodage reste sur le GEMV),
+R54 non touché. Aucun push, aucun merge dans `rdna3-iqr`.
