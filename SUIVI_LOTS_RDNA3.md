@@ -636,6 +636,12 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   **36,45 Gio h2d** par préfill (48 couches routées à chaque chunk), donc
   l'attention n'y est plus le chemin critique. Avant d'optimiser l'attention de
   préfill, mesurer le chemin critique du chunk court : c'est le stager.
+- **R55** — *règle* : un débit **mural** (Σ tokens / temps du lot) ne se
+  compare pas à un débit de **décodage**. À métrique égale, 4 flux 27B à 2 k
+  font **1,27×** un flux (W42e) ; leur plafond est le **préfill sérialisé**
+  (4 prompts = **3,99×** un, 433–466 tok/s quel que soit le lot), pas
+  `max-num-seqs` ni l'attention (2,9× à 4 séquences). Le levier est un préfill
+  plus rapide (W43), pas un regroupement de prompts.
 - **W41c** (92722381) : staging KV préchargé 4 pages en avance (85 % du coût
   d'attention h256 était du staging sérialisé), hc_norm vectorisé,
   hc_up 32→64. Pas Flash-Next **−6,5 %** en NS=0 (11,29 → 12,07 tok/s) et

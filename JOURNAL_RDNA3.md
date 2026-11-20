@@ -2749,3 +2749,30 @@ Arbre hôte **neuf** `<work-root>/work/w42int`, build **neuf** `build-w42int`
 - Carte à 40 °C, horloges nominales, aucun throttling. Artefacts :
   `<work-root>/work/w42int/`, `/tmp/w42int-tests/`, `/tmp/w42int-kbench/`,
   `<work-root>/work/w41-results/w42int-gate/`.
+
+## 2026-11-20 — W42e : multi-flux 27B — l'anomalie est une erreur de métrique, le plafond est le préfill
+
+Diagnostic (aucun code) sur `build-w42int` (HEAD `197a239a`), 27B IQR,
+quatre flux à 2 049 tokens, payloads à nonce distinct, `cache_n=0` partout,
+points appariés sur carte refroidie (36 °C).
+
+- Débits **muraux** : 1 flux NS=0 **7,33 tok/s** (8,74 s), NS=3 **9,07**
+  (7,06 s) ; 4 flux NS=0 **9,29** (27,6 s), NS=3 **10,15** (25,2 s). Débit de
+  **fenêtre** de décodage (la métrique des réf. W40f) : mono 15,59 / 28,23,
+  4 flux **17,87 / 15,72**.
+- Le « 8,5–10,8 < 15,4 » comparait un débit **mural** à un débit de
+  **décodage**. À métrique égale, 4 flux font **1,27×** un flux ; le plafond
+  du workload est **10,7 tok/s** (18,4 s de préfill + 5,6 s de décodage).
+- Contributions : **préfill sérialisé 18,43 s (67 %)** — 433–466 tok/s quel
+  que soit le nombre de prompts, 4 prompts = **3,99×** un (calcul, pas de
+  regroupement) ; **convoi de décodage 3,5 s (13 %)** ; lancements et
+  attention sans contribution propre (pas de décodage 65,7 ms à 1 séquence →
+  90,9–92,0 à 4, soit 44 tok/s et 2,9× un flux).
+- Contre-factuel mesuré : `prefill-interleave 0` 24,15 s ; NS=3 + interleave 0
+  **23,84 s → 10,74 tok/s**. Leviers : préfill 1,3× → 19,9 s (**12,9 tok/s,
+  +22 %**), c'est W43 ; génération 192 tokens **17,40 tok/s (2,4× mono)**.
+  `auto:4` inerte, `max-num-seqs` non contraignant.
+- Carte : 283–315 W (TBP 295), edge ≤ 75 °C, jonction ≤ 100 °C ; les points
+  4 flux tournent 10–15 % sous le sclk médian des points mono, les ratios
+  sont conservateurs. Rapport :
+  `<work-root>/work/w42int/results/multiflux/RAPPORT_MULTIFLUX_27B_2026-11-20.md`.
