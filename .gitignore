@@ -10,3 +10,12 @@ external
 external-docs/
 AGENTS.local.md
 API_DISTANTE.md
+
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+bun.lock
+yarn.lock
+radiance.code-workspace
+.kilo
+kilo.jsonc
