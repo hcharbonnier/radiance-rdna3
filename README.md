@@ -14,17 +14,16 @@ AVX-512/AVX2 kernels (`libavx`) serve every model here: the small ones (Embeddin
 Qwen3-ASR, the 0.8B-3B models) at interactive speed on a desktop CPU, the 27B and larger far more
 slowly than a card.
 
-A fork of this tree serves a single RDNA3 card; its scope, recipes and measured results are in
-[RDNA3 fork](#rdna3-fork-rdna3-iqr) below.
+RDNA3 (`gfx1100`) support on a single W7900 card is described in
+[RDNA3 support](#rdna3-gfx1100-support) below.
 
 To support the development of radiance: [Patreon](https://patreon.com/StillDeadCode).
 
-## RDNA3 fork (`rdna3-iqr`)
+## RDNA3 (`gfx1100`) support
 
-This branch serves a single RDNA3 card, a Radeon PRO W7900 (`gfx1100`, 48 GiB) under ROCm. It is
-based on v2.1.0 (`3045979`) and not pushed. The state described here was validated at `9f43983d`
-(2026-11-20); the working HEAD may be a later documentation commit. Only `libr3d` is built:
-`libr4d` (`gfx12xx`) and `libhalo` (`gfx1151`) are outside the build target.
+This tree serves a single RDNA3 card, a Radeon PRO W7900 (`gfx1100`, 48 GiB) under ROCm. Only
+`libr3d` is built for it: `libr4d` (`gfx12xx`) and `libhalo` (`gfx1151`) are outside that build
+target.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -49,7 +48,7 @@ untracked `HANDOVER_RDNA3_W43.md`):
 | Qwen3.8-Flash-Next | `placement: expert_tiered`, `host-pool-mib: 24576`, `kv-cache-dtype: i8`, `NS=3` |
 | MiniCPM5-2B | `kv-cache-dtype: bf16`, `NS=0` |
 
-Validation on this branch: `r3d_selftest` reports 196 rows, no failure and 16 skips, and
+Validation: `r3d_selftest` reports 196 rows, no failure and 16 skips, and
 `rad-kbench` replays 3 181/3 181 cases on the 27B, 4 786/4 786 on Flash-Next and 1 802/1 802 on
 MiniCPM5-2B with no failure and no divergence; the strict fixture replay is 1 134/1 134. Served
 texts are identical to the reference, bit for bit.
