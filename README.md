@@ -22,8 +22,9 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 ## RDNA3 fork (`rdna3-iqr`)
 
 This branch serves a single RDNA3 card, a Radeon PRO W7900 (`gfx1100`, 48 GiB) under ROCm. It is
-based on v2.1.0 (`3045979`), 261 commits ahead of it, at `9f43983d`; nothing is pushed. Only
-`libr3d` is built: `libr4d` (`gfx12xx`) and `libhalo` (`gfx1151`) are outside the build target.
+based on v2.1.0 (`3045979`) and not pushed. The state described here was validated at `9f43983d`
+(2026-11-20); the working HEAD may be a later documentation commit. Only `libr3d` is built:
+`libr4d` (`gfx12xx`) and `libhalo` (`gfx1151`) are outside the build target.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -39,8 +40,8 @@ Three containers are served and validated on this card, measured at temperature 
 | Qwen3.8-27B IQR dense (trellis u4/u5) | 15.3 tok/s, 26.9 with `NS=3` at 2 047 tokens | 484–486 tok/s at 972 and 3 252 tokens | `NS=3` is the served setting |
 | MiniCPM5-2B IQ8R (DSpark drafter) | 33.0 tok/s at 781 tokens, no speculation | — | `NS=7` for the drafter; `NS=3` is refused by the arch |
 
-`NS` is `num-speculative-tokens`. The serve recipes (the full YAML files are in
-[`HANDOVER_RDNA3_W43.md`](HANDOVER_RDNA3_W43.md)):
+`NS` is `num-speculative-tokens`. The serve recipes (the full YAML files are in the local,
+untracked `HANDOVER_RDNA3_W43.md`):
 
 | model | settings |
 |---|---|
@@ -57,7 +58,7 @@ Contract: a change is kept only if it leaves the served text bit-exact at temper
 remaining large wins — `attn_dense` in the vision tower and the 27B's h256 split-KV at decode —
 change the text and are refused.
 
-Details: [`HANDOVER_RDNA3_W43.md`](HANDOVER_RDNA3_W43.md),
+Details: local `HANDOVER_RDNA3_W43.md` (untracked),
 [`JOURNAL_RDNA3.md`](JOURNAL_RDNA3.md), [`SUIVI_LOTS_RDNA3.md`](SUIVI_LOTS_RDNA3.md) and
 [`AGENTS.md`](AGENTS.md).
 
