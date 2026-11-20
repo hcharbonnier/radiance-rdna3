@@ -778,3 +778,16 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   à la couche suivante. Mesurer `stage_need` avant de compter sur « 3 couches
   d'avance » ; ne pas toucher la règle du demi-anneau sans A/B servi, elle
   protège la couche qui arrive.
+
+## W43 — préfill 27B : tuile 4×4 du trellis (2026-11-20)
+
+- **W43** : `gemm_iqr_resident_quad_kernel`, quatre tokens par quatre rangées
+  par lane, un wave 32 tokens, un workgroup 128 ; 0,25 dword d'activation et
+  0,25 de poids par dot4 (2×4 : 0,25 / 0,50), K double-bufferé (un
+  `__syncthreads` par bloc), **124–126 VGPR, 0 spill**, bit-identique, pris à
+  **M ≥ 256**.
+- Noyau **1,04–1,27×** à M=256–512 ; servi préfill 972 **+4,7 à +7,4 %**
+  (484,5 tok/s), 3 252 **+3,8 à +5,6 %** (486,2) ; décodage 98,1–98,5 % des
+  références (bruit), textes identiques au bit.
+- Le « 56,5 % de `moe_gemm_q` » du handover est la row **`gemm_nt_q` trellis
+  dense** (89,1 % du préfill 972) ; le 27B n'émet pas de `moe_gemm_q`.

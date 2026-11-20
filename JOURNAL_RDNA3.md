@@ -2954,3 +2954,29 @@ Artefacts : `<work-root>/work/w43-results/` (`kb-gemm-base.md`,
 `tail/`). Risques : R39 (gain jugé à M ≥ 256 et au TTFT), R43 (décodage
 inchangé : le quad n'est pris qu'à M ≥ 256, le décodage reste sur le GEMV),
 R54 non touché. Aucun push, aucun merge dans `rdna3-iqr`.
+
+## 2026-11-20 — W43 intégration : tuile 4×4 du préfill 27B, validation sur build neuf
+
+Branche `rdna3-iqr` à **4c114b2d** (merge de `w43-27b-prefill` : `15d42b17`
+code, `a1d8b583` docs), sur `197a239a` + W42e + W44. Arbre hôte **neuf**
+`<work-root>/work/w43int`, build **neuf** `build-w43int` (gfx1100, FFmpeg,
+cache de tune 36 rows).
+
+- Suite complète : compteurs W42 au chiffre près — sched **548 964/213**,
+  engine **1 087/52** (3 skips), fixture **109 671/59**, config **2 952/71**,
+  iqr 76/11, ple_hc 76/10, moe_iqr 15/15, moe_w4nl 18/14, vision_rows 76/12,
+  attn_paged 36/11, logits 8/4, gather 33/3, mtp 22/3, rerank 36/5, act 103/6,
+  tp2 12/2, dflash 37/3, `r3d_selftest` **196 rows, 0 échec, 16 skips**.
+- `kbench --bench` 27B **3 181/3 181** (3,619e-03) ; Flash-Next
+  `--op gemm_nt_q` **572/572** (2,752e-03) ; MiniCPM `--op gemm_nt_q`
+  **578/578** (3,485e-03) ; 0 échec, 0 divergence. Replay strict `libref`
+  **1 134/1 134**, 0 divergence, pire 3,442e-03.
+- Gates servis (serveur neuf, `cache_n=0`) : 27B 2 047 NS=0/NS=3
+  **15,27 / 26,94 tok/s** (sha `d7cf7a3b`) ; Flash-Next 3 252 **11,79 / 19,46**
+  (sha `960a2212`) ; MiniCPM 781 **33,04** contre 33,09 sur w41f
+  (sha `8833d699`) — textes **identiques au bit**.
+- Apport W43 : préfill 27B 972 tokens **2 006 ms / 484,5 tok/s** (+4,7 à
+  +7,4 %), 3 252 **6 688 ms / 486,2** (+3,8 à +5,6 %) ; décodage 98,1–98,5 %
+  des références (le quad n'est pris qu'à M ≥ 256, le décodage reste sur le
+  GEMV), R43 tenu. Carte : kbench 2 793 MHz, aucune ligne throttlée.
+- Pause demandée par l'utilisateur après W43/W44 : aucun lot ouvert.
