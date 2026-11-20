@@ -705,3 +705,26 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   config 2 952/71, moe_w4nl 18/14, iqr 76/11, `r3d_selftest` 196 rows /
   0 échec / 16 skips. `rad-kbench --op moe_gemm_q` : **110/110**, 0 échec,
   pire rel_l2 3,162e-03.
+
+## W42b — attention h256 de préfill : plans f32 pré-échelonnés (2026-11-19)
+
+- **W42b** : la bande de préfill (six vagues) stage K et V élargis et
+  pré-échelonnés (`code*scale` exact en f32), range les 64 dims d'une lane
+  slice avec huit floats de rembourrage, forme les dots **quatre clés à la
+  fois** et issue les tuiles lourdes d'abord. Décodage int8 et `splits=1`
+  inchangés. Noyau **1,68×** à 972, **1,48×** à 2 048, 1,37–1,42× sur les
+  formes servies ; servi TTFT 3 252 **−1,0 %**, 972 **−1,5 %**, textes
+  identiques au bit ; `attn_paged_device_test` **36/11** (sept cas de
+  frontière ajoutés par la revue).
+- **R54** — *constat* : le gain servi d'un préfill découpé est borné par le
+  stager du second chunk (36,45 Gio h2d par préfill), pas par l'attention.
+
+## W42 — intégration (2026-11-19)
+
+- Trois lots fusionnés sur `b1f95704` : W42g (`2bc0d534`), W42m (`d07b9d45`),
+  W42b (`a7165d41`). Aucun push, bit-exact conservé.
+- Validation sur build neuf `w42int/build-w42int` : suite aux compteurs de
+  l'union (`vision_rows` 76/12, `attn_paged` 36/11), kbench 27B 3 181/3 181,
+  MiniCPM 1 802/1 802, Flash-Next 4 786/4 786 (0 échec, 0 divergence),
+  replay strict 1 134/1 134 ; gates servis identiques au bit (27B
+  `d7cf7a3b`, Flash-Next `960a2212`, MiniCPM `8833d699`).

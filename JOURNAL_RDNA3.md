@@ -2721,3 +2721,31 @@ préfill **5 238 / 5 742 ms**, 972 **2 053 / 2 337 ms**, textes **identiques
 octet pour octet** aux références `fn-ns0.txt`/`fn-ns3.txt` (313 octets, sha
 `960a2212e059f981`). La dispersion d'un run à l'autre est de **±30 ms (±0,6 %)** :
 c'est l'ordre des gains servis mesurés ici.
+
+## 2026-11-20 — W42 intégration : les trois lots fusionnés, validation sur build neuf
+
+Branche `rdna3-iqr` à **a7165d41** : W42g (`2bc0d534`), W42m (`d07b9d45`),
+W42b (`a7165d41`), tous sur `b1f95704`. Aucun push, bit-exact conservé.
+Arbre hôte **neuf** `<work-root>/work/w42int`, build **neuf** `build-w42int`
+(gfx1100, FFmpeg, cache de tune 36 rows recopié de `w29-rebase/build-clean`).
+
+- Suite complète : compteurs de l'union, identiques aux entrées des trois
+  lots — sched 548 964/213, engine 1 087/52 (3 skips), fixture 109 671/59,
+  config 2 952/71, iqr 76/11, ple_hc 76/10, moe_iqr 15/15, moe_w4nl 18/14,
+  **vision_rows 76/12**, **attn_paged 36/11**, logits 8/4, gather 33/3,
+  mtp 22/3, logit_rerank 36/5, act 103/6, tp2 12/2, dflash 37/3,
+  `r3d_selftest` **196 rows, 0 échec, 16 skips**.
+- `rad-kbench --bench`, un conteneur à la fois : 27B **3 181/3 181**
+  (3,619e-03, 547 s), MiniCPM **1 802/1 802** (3,485e-03, 327 s), Flash-Next
+  **4 786/4 786** (1,520e-02, 2 298 s) ; 0 échec, 0 divergence. Replay strict
+  `libref` : **1 134/1 134**, 0 échec, 0 divergence, 211 capped, pire
+  3,442e-03.
+- Gates servis (payloads W41, serveur neuf, `cache_n=0`) : 27B 2 047
+  NS=0/NS=3 **15,29/27,10 tok/s**, textes identiques (sha `d7cf7a3b`,
+  NS0=NS3) ; Flash-Next 3 252 **11,89/19,57** (sha `960a2212`) ; MiniCPM 781
+  **33,37** contre 33,37 sur w41f (sha `8833d699`). Vision : la tour est
+  inchangée par W42m/W42b, le texte servi reste celui validé dans W42g
+  (TTFT 1 024²/2 048² 3,12 / 15,84 s).
+- Carte à 40 °C, horloges nominales, aucun throttling. Artefacts :
+  `<work-root>/work/w42int/`, `/tmp/w42int-tests/`, `/tmp/w42int-kbench/`,
+  `<work-root>/work/w41-results/w42int-gate/`.
