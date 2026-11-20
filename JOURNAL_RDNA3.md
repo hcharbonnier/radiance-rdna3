@@ -2980,3 +2980,83 @@ cache de tune 36 rows).
   des références (le quad n'est pris qu'à M ≥ 256, le décodage reste sur le
   GEMV), R43 tenu. Carte : kbench 2 793 MHz, aucune ligne throttlée.
 - Pause demandée par l'utilisateur après W43/W44 : aucun lot ouvert.
+
+## 2026-11-20 — W45 : préfill 27B — au-delà du 4×4, la tuile 8×4 et le bloc de 256 tokens sont rejetés
+
+Branche `rdna3-iqr` à **0b0283e3**, aucun push, aucun merge. Arbre hôte
+**neuf** `<work-root>/work/w45a`, build **neuf** `build-w45a` (gfx1100,
+FFmpeg, cache de tune recopié de `w29-rebase/build-clean`). Suite au W43
+(tuile registre 4×4, +3,8 à +7,4 % servi), le lot devait pousser la tuile
+au-delà. **Résultat négatif** : les deux directions essayées perdent 3 à 8 % au
+noyau et 6 à 9 % au servi ;
+aucun code n'est gardé, l'arbre est revenu à `0b0283e3` (`libr3d.so`
+sha256 `dcb18af7…`, octet pour octet le build d'avant l'essai).
+
+**Forme et profil d'abord.** `rad-info --recipe` redonne `codes=u4/u5,
+tcq_code=mad, tcq=16, group=128, scale=f32/bf16` → `kTrellisMad, LRB=0, GS=1`.
+Profil `--profile-ops`, payload 972 tokens, `NS=0`, serveur neuf : le préfill
+est **2 018,6 ms**, dont `gemm_nt_q` **1 783,5 ms = 88,4 %** (N=34 816 :
+775,0 ms ; N=5 120 : 636,5 ; N=16 384 : 283,2 ; N=12 288 : 73,3 ; N=1 024 :
+15,4). Le noyau à M=972 est donc bien le poste ; il tourne à 6,2–6,3 ms par
+appel N=34 816.
+
+**Candidat (a), 8×4.** Lane à 8 tokens × 4 rangées (32 sorties), vague 64
+tokens, workgroup 256 ; 8 dwords d'activation et 4 de poids par 32 `v_dot4`
+(0,125 dword de poids par dot4 au lieu de 0,25). ISA
+(`-Rpass-analysis=kernel-resource-usage`) : **160–166 VGPR, 0 spill** à
+l'unroll 4, **208–215 VGPR, 0 spill** à l'unroll 8. `rad-kbench --op
+gemm_nt_q --bench --max-cases 1` (194/194, 0 échec, 0 divergence) :
+l'unroll 4 est **catastrophique** (M=512 N=34 816 : 9 737,9 µs contre
+5 907,6, **1,65×** plus lent ; M=256 : 4 474,4 contre 3 035,3). L'unroll 8
+ramène la perte à **1,04–1,08×** (M=512 : 6 167,6 contre 5 907,6 ; N=16 384
+3 011,1 contre 2 783,1 ; N=5 120 K=6 144 1 332,6 contre 1 057,7 = 1,26×) ;
+inverser la boucle `dot4` (rangée dehors) ne change rien (1,05–1,07×).
+Servi, serveur neuf, `cache_n=0` : **972 tokens 2 141,1 ms / 454,0 tok/s**
+contre 1 969,5 / 493,5 (**+8,7 % de temps, −8,0 % de débit**), **3 252 tokens
+7 013,9 ms / 463,6** contre 6 600,8 / 492,7 (**+6,3 % de temps, −5,9 % de
+débit**) ; textes **identiques au bit**
+(sha `555c7b8b…` à 972, `b344d80e…` à 3 252, les mêmes que la base). Le 8×4
+était donc exact mais plus lent : les 32 sommes + 32 accumulateurs coûtent
+plus que le stream de poids épargné.
+
+**Candidat (b)/(c), bloc de 256 tokens sur la tuile 4×4.** La tuile 4×4 est
+gardée, le workgroup passe à 8 vagues (256 tokens) et le staging parallèle
+généralisé (32 segments sur 8 vagues, 4 segments par vague, moitié de vague
+inactive) : VGPR **inchangés (mêmes 124–130 sur les formes relevées, 0
+spill)**, donc même tuile de calcul, mais le décodage trellis est amorti sur
+deux fois plus de tokens. kbench
+194/194 : **M=512 6 280,1 µs contre 5 907,6 (1,063×)**, M=256 3 183,3 contre
+3 035,3 (1,049×), N=5 120 K=6 144 1 358,7 contre 1 057,7 (1,28×). Rejeté :
+les blocs de 8 vagues ne laissent que **16 vagues/CU** (2 blocs) contre 20
+(5 blocs de 4 vagues) ; l'occupation perdue coûte plus que le staging gagné.
+
+**Conclusion.** La configuration 4×4 / 128 tokens / 4 vagues est un **optimum
+local** de ce noyau : agrandir la tuile de lane (8×4) ou le bloc (256) coûte
+3–8 % au noyau (26–28 % sur N=5 120 K=6 144) et 6–9 % au servi. Les deux
+variantes sont bit-exactes (kbench 0 divergence, textes servis identiques),
+l'échec est purement de débit. Rien n'est gardé, pas de nouveau seuil, pas de
+repli.
+
+**Validation finale sur l'arbre revenu à `0b0283e3`** (`build-w45a`,
+`RADIANCE_HOME`, `libr3d.so` sha `dcb18af7…`) : sched **548 964/213**,
+engine **1 087/52** (3 skips), fixture **109 671/59**, config **2 952/71**,
+iqr 76/11, ple_hc 76/10, moe_iqr 15/15, moe_w4nl 18/14, vision_rows 76/12,
+attn_paged 36/11, logits 8/4, gather 33/3, mtp 22/3, rerank 36/5, act 103/6,
+tp2 12/2, dflash 37/3, `r3d_selftest` **196 rows, 0 échec, 16 skips**.
+`rad-kbench --bench` 27B **3 181/3 181** (3,619e-03, 547 s), `--op gemm_nt_q`
+**698/698** sur 194 géométries (2,976e-03), Flash-Next `--op gemm_nt_q`
+**572/572** (2,752e-03), MiniCPM `--op gemm_nt_q` **578/578** (3,485e-03) ;
+0 échec, 0 divergence, aucune ligne throttlée. Gates servis (serveur neuf,
+`cache_n=0`, payload W41 p2047-64) : NS=0 **15,25 tok/s** (98,5 % de 15,48),
+NS=3 **26,97 tok/s** (98,25 % de 27,45), préfill 4 322 / 4 413 ms, textes sha
+**`d7cf7a3b…`** identiques à `<work-root>/work/w41-results/d27-ns{0,3}.txt` ;
+préfill 972 **1 969,5 ms / 493,5 tok/s**, 3 252 **6 600,8 ms / 492,7**.
+Carte : 56 W, GFX 1 151 MHz, MEM 96 MHz, `THROTTLE_STATUS=THROTTLED` au repos
+(drapeau connu) ; kbench 2 565–2 798 MHz de moyenne selon le run. Artefacts :
+`<work-root>/work/w45-results/` (`kb/kb-gemm-base.md`, `kb-gemm-oct.md`,
+`kb-gemm-oct8.md`, `kb-gemm-oct8b.md`, `kb-gemm-quad8w.md`, `kb-27b-full.md`,
+`kb-27b-gemm.md`, `kb-fn-gemm.md`, `kb-mini-gemm.md`, `gate/`). Risques :
+R39 (jugé au noyau à M=512 et au servi 972/3 252), R43 (décodage 98,25–98,5 %,
+aucun chemin de décodage touché), R50 non touché, R55 non touché ; **R57**
+ajouté (ne pas rouvrir la tuile au-delà du 4×4 ni le bloc de 128 sans un
+changement d'occupation). Aucun push, aucun merge dans `rdna3-iqr`.

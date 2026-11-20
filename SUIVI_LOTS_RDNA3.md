@@ -791,3 +791,20 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   références (bruit), textes identiques au bit.
 - Le « 56,5 % de `moe_gemm_q` » du handover est la row **`gemm_nt_q` trellis
   dense** (89,1 % du préfill 972) ; le 27B n'émet pas de `moe_gemm_q`.
+
+## W45 — la tuile au-delà du 4×4 (2026-11-20)
+
+- **R57** — *mesure (W45)* : la tuile 4×4 du préfill 27B (128 tokens, 4
+  vagues, 124–126 VGPR) est un **optimum local**. Le 8×4 (32 sorties par lane,
+  bloc 256, 160–215 VGPR, 0 spill) est bit-exact mais **1,04–1,08×** plus lent
+  au noyau à M=512 (1,26× sur N=5 120 K=6 144 ; 1,65× à l'unroll 4) et
+  **+8,7 % / +6,3 % de temps** au servi (972 / 3 252) ; le 4×4 à bloc de 256
+  (8 vagues, staging sur 8 vagues) perd **1,05–1,06×** (1,28× sur N=5 120
+  K=6 144) parce qu'il ne laisse que 16 vagues/CU contre 20. Ne pas rouvrir
+  l'un ou l'autre sans changer l'occupation d'abord ; un gain à M ≤ 512 ne
+  vaut rien (R39), juger au servi 972 et 3 252.
+- **W45** : 8×4 et bloc de 256 mesurés, **rejetés** (3–8 % au noyau, jusqu'à
+  26–28 % sur N=5 120 K=6 144 ; 6–9 % au servi, textes bit-identiques) ; aucun
+  code gardé, arbre revenu à `0b0283e3`. Suite, kbench 27B 3 181/3 181, FN
+  572/572, MiniCPM 578/578 et gates servis (15,25 / 26,97 tok/s, sha
+  `d7cf7a3b`) rejoués sur build neuf.
