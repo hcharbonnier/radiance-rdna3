@@ -3060,3 +3060,109 @@ R39 (jugé au noyau à M=512 et au servi 972/3 252), R43 (décodage 98,25–98,5
 aucun chemin de décodage touché), R50 non touché, R55 non touché ; **R57**
 ajouté (ne pas rouvrir la tuile au-delà du 4×4 ni le bloc de 128 sans un
 changement d'occupation). Aucun push, aucun merge dans `rdna3-iqr`.
+
+## 2026-11-20 — W46 : gemm_nt_bias vision — la tuile 64 rangées est au plafond d'émission
+
+Branche `rdna3-iqr` à **9f43983d**, aucun push, aucun merge. Arbre hôte **neuf**
+`<work-root>/work/w46a`, builds **neufs** `build-w46a` (mesures et essais) puis
+`build-w46f` (validation), gfx1100 + FFmpeg, cache de tune recopié de
+`w29-rebase/build-clean`. Objet : les ~1,2× qui restaient au noyau après W42g
+(2 146 → 1 516 ms, 9,10 TF/s, plafond bit-exact estimé ~11 TF/s). **Résultat
+négatif** : dix variantes de tuilage, de staging et d'ordonnancement mesurées,
+toutes neutres ou plus lentes ; aucun code n'est gardé et l'arbre est revenu à
+`9f43983d` (`build-w46f` : `libr3d.so` sha256 `1bc9c42e…`).
+
+**Profil d'abord** (`--profile-ops`, payload `/tmp/vision2048.json`, `NS=0`, un
+seul processus GPU, `cache_n=0`) : le passage 2048² fait **16 002 ms** d'ops
+device, dont `attn_dense` 27 × 241–243 ms (**6,5 s**, clos R40, non touché) et
+`gemm_nt_bias` **1 495,0 ms en 111 appels** (mêmes formes que W42g) :
+
+| appel | n | ms/appel | TF/s |
+|---|---:|---:|---:|
+| fc1 N=4304 K=1152 act=gelu_tanh | 27 | 17,527 | 9,27 |
+| fc2 N=1152 K=4304 | 27 | 17,664 | 9,20 |
+| qkv N=3456 K=1152 | 27 | 14,311 | 9,12 |
+| proj N=1152 K=1152 | 27 | 4,532 | 9,60 |
+| patch N=1152 K=1536 | 1 | 5,798 | 10,0 |
+| merger1 N=4608 K=4608 (M=4 096) | 1 | 19,499 | 8,92 |
+| merger2 N=2560 K=4608 (M=4 096) | 1 | 10,795 | 8,95 |
+
+Servi non profilé sur le même arbre : **1 024² TTFT 3 056,1 ms**, **2 048²
+15 455,2 ms**, textes sha `8144ea1c…` / `4b24fd7e…`, identiques aux références
+`w40a-results/serve/base-v1024.json` / `base-v2048.json`.
+
+**ISA du noyau `gemm_nt_bias_kernel<64>`** (`--offload-arch=gfx1100`, mêmes
+options que le build) : wave32, **LDS 17 408 B**, **193 VGPR alloués** (175
+utilisés), cible `amdgpu-waves-per-eu(8)` non tenue (7). Corps chaud (4 k
+déroulés) :
+**336 instructions pour 128 MAC = 2,62 instr/MAC** — 128 `v_mul_f32`, 128
+`v_add_f32`, 48 élargissements bf16→f32 (24 `v_lshlrev_b32` + 24 `v_and_b32`),
+12 `ds_load_2addr_b32` (3 par k, 6 dwords), 8 `s_waitcnt`, 2 `s_delay_alu`,
+~12 divers. Les **1 536 `v_fma_f64`** du noyau sont la branche `erf` exacte,
+morte pour `act=2` : c'est bien le `tanhf` de W42g qui tourne.
+
+**La carte n'est pas limitée par l'horloge** : 2 287–2 496 MHz tenus pendant les
+runs (`amd-smi metric --clock --power`, 240 W socket, hotspot 95 °C). Le
+plafond d'émission VALU de gfx1100 sans VOPD est
+96 CU × 4 SIMD × 32 lanes × 2,49 GHz = **3,07e13 lane-op/s** (c'est ce que
+mesurent les 61 TF/s publiés : un FMA par lane et par cycle) ; à 2,62
+lane-op/MAC il plafonnerait à **23,4 TF/s**, et le noyau fait **9,2 TF/s, soit
+39 %**. Le même calcul sur la boucle nue (2,06 lane-op/MAC) donne **42 %** :
+l'écart n'est donc pas dans le mélange d'instructions mais dans un coût
+effectif de **~2,4 cycles par instruction**, le même avec et sans les lectures
+LDS. Aucun des leviers essayés ne l'entame.
+
+**Où sont les 22 % restants** (micro-bench du même protocole, M=16 384
+N=1152 K=4304, A/B/B/A, 3 lots de 20 appels, minimum) :
+
+| variante de diagnostic | ms/appel | lecture |
+|---|---:|---|
+| base | 17,9–19,1 | 9,1 TF/s |
+| sans lectures LDS ni élargissement dans la boucle k | **13,94** | 11,67 TF/s = le « ~11 TF/s » de W42g |
+| sans chargements globaux du staging (stores LDS + barrières gardés) | 14,5–16,0 | le staging coûte 15–18 % |
+
+Le chemin de calcul seul est donc **déjà au plafond estimé** : les 1,2× sont
+l'exposition mémoire des chargements de staging, pas la boucle interne. Retirer
+les lectures LDS et l'élargissement enlève 18 instructions sur 84 par k et le
+temps tombe de 18,4 à 13,94 ms, soit le rapport des comptes d'instructions
+(76 % mesuré contre 79 % attendu) : la boucle est limitée par l'émission, pas
+par une latence cachée.
+
+**Variantes mesurées et rejetées** (toutes bit-exactes : la boucle garde
+`acc = acc + a*b` en k croissant, aucun FMA, `tanhf` inchangé ; aucune n'a
+changé un octet du contrat de la row) :
+
+| variante | ms/appel (fc2) | verdict |
+|---|---:|---|
+| `kKT=32` (LDS 8,7 Ko, 7 blocs/CU, 36 tours) | 22,2–25,2 | **1,25× plus lent** : le coût par tour de staging/barrière double |
+| `kKT=128` (LDS 34,8 Ko, 1 bloc/CU, 9 tours) | 23,7–25,8 | 1,35× plus lent : 4 vagues/CU ne suffisent pas |
+| préchargement de la tuile suivante en registres (32 dwords), avec ou sans `asm` mémoire / `sched_barrier` | 18,0–19,3 | neutre : le compilateur redescend les chargements derrière la barrière |
+| tuile 8×8 par lane / 128 colonnes (64 accs, LDS 26 Ko, 2 blocs/CU) | 18,0–18,9 | neutre : −12 % d'instructions compensés par −33 % de vagues |
+| 8×8 + `kKT=32` (LDS 12,8 Ko, 5 blocs/CU) | 19,0 | neutre |
+| staging en `ldg_u32` (moitié des requêtes, 128 B pleins par vague) | 18,0–19,1 | 0 à +2 %, dans le bruit |
+| `waves-per-eu` 4 / 10 (9 atteintes) | 19,3–21,5 / neutre | plus de registres ou moins de vagues : jamais mieux |
+
+**Conclusion.** La tuile 64 rangées × 64 colonnes, `kKT=64`, 12 vagues/CU et
+2,62 instr/MAC est un **optimum local** ; le gain restant demanderait de
+recouvrir le staging ou de casser le coût de ~2,4 cycles par instruction, pas
+un autre tuilage. Rien n'est gardé : `libr3d/r3d_gemm_nt_bias.hip` est
+identique à `9f43983d`.
+
+**Validation finale sur `build-w46f`** (build neuf, `RADIANCE_HOME`) : sched
+**548 964/213**, engine **1 087/52** (3 skips), fixture **109 671/59**, config
+**2 952/71**, iqr 76/11, ple_hc 76/10, moe_iqr 15/15, moe_w4nl 18/14,
+vision_rows **76/12**, attn_paged 36/11, logits 8/4, gather 33/3, mtp 22/3,
+rerank 36/5, act 103/6, tp2 12/2, dflash 37/3, `r3d_selftest` **196 rows,
+0 échec, 16 skips** — les compteurs du §5.5 du handover W43 au chiffre près.
+kbench Flash-Next complet **4 786/4 786**, 0 échec, 0 divergence, pire rel_l2
+**1,520e-02**, 1 442 skips, 1 992 s ; `--op gemm_nt_bias --bench` **380/380**,
+0 divergence, pire rel_l2 **9,086e-05**. Gates servis (serveur neuf,
+`cache_n=0`) : Flash-Next 3 252 NS=0 **5 210,5 ms** et NS=3 **6 494,1 ms**,
+textes sha **`960a2212…`** identiques aux deux références `w41-results` ;
+vision 1 024² **3 060,1 ms** (réf. 3 192,9), 2 048² **15 481,9 ms** (réf.
+16 474,1), textes sha `8144ea1c…` / `4b24fd7e…` identiques. Artefacts :
+`<work-root>/work/w46-results/` (`profile2048.log`, `suite.log`,
+`kb/w46-kbench-full.md`, `kb/w46-kbench-gnb.md`, `final/`). Carte : 2 400–2 496
+MHz pendant les mesures, 240 W, hotspot 95 °C, `THROTTLE_STATUS=THROTTLED` au
+repos (drapeau connu). Risques : R40 non ouvert (`attn_dense` non touché),
+R52/R55 non touchés, R57 non rouvert ; **R58** ajouté.

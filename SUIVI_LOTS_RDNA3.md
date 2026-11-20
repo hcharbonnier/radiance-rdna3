@@ -808,3 +808,30 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   code gardé, arbre revenu à `0b0283e3`. Suite, kbench 27B 3 181/3 181, FN
   572/572, MiniCPM 578/578 et gates servis (15,25 / 26,97 tok/s, sha
   `d7cf7a3b`) rejoués sur build neuf.
+
+## W46 — gemm_nt_bias vision : la tuile 64 rangées est au plafond d'émission (2026-11-20)
+
+- **R58** — *mesure (W46)* : le `gemm_nt_bias` bf16 de la tour vision (tuile
+  64 rangées × 64 colonnes, `kKT=64`, 17 408 B de LDS, 193 VGPR, 2,62
+  instructions/MAC, 9,10–9,27 TF/s) tourne à **~39 % du plafond d'émission VALU
+  sans VOPD** — 3,07e13 lane-op/s à 2 490 MHz × 96 CU × 4 SIMD × 32 lanes, soit
+  23,4 TF/s à son mélange — **et la boucle nue** (sans lectures LDS ni
+  élargissement, 2,06 lane-op/MAC) **plafonne au même ~42 %** : le coût est un
+  ~2,4 cycles par instruction, identique avec et sans staging, que le tuilage
+  ne touche pas. Le « plafond ~11 TF/s » de W42g est donc le **chemin de calcul
+  observé** (13,94 ms contre 17,9–19,1 ms sur N=1152 K=4304), et les 15–18 %
+  qui séparent les deux sont l'**exposition mémoire du staging** (64 rangées +
+  64 colonnes lues par tuile), qui ne répond ni au préchargement en registres
+  (le compilateur redescend les chargements derrière la barrière, même avec un
+  `asm` mémoire ou `sched_barrier`), ni à l'occupation (`kKT=32` → 7 blocs/CU :
+  1,25× plus lent ; `kKT=128` → 1 bloc/CU : 1,35× plus lent), ni aux tuiles
+  plus larges (8×8 / 128 colonnes : neutre à 2 blocs/CU), ni au staging en
+  `ldg_u32` (0 à +2 %). Ne pas rouvrir ce noyau sans un moyen de **recouvrir**
+  le staging (copie globale→LDS asynchrone, ou ordonnanceur gardant les
+  chargements en vol à travers la barrière) ; un k plus large ou plus étroit
+  est mesuré et perdu.
+- **W46** : 10 variantes mesurées, toutes neutres ou plus lentes ; aucun code
+  gardé, arbre à `9f43983d` (`build-w46f`, `libr3d.so` sha `1bc9c42e…`). Suite
+  complète aux compteurs du §5.5, kbench Flash-Next 4 786/4 786 et
+  `--op gemm_nt_bias` 380/380, gates servis (FN 3 252 sha `960a2212`, vision
+  3 060 / 15 482 ms) rejoués sur build neuf.
