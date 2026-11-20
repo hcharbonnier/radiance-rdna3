@@ -2785,7 +2785,7 @@ de tune 36 rows recopié de `w29-rebase/build-clean`). Instrumentation
   ≤ 805 Mio sur 37,73 Gio.
 - **Les copies sont masquées.** `max-num-seqs 1` (+650 Mio de dalle, experts
   37,32 → 37,97 Gio) abaisse le staging à **18,19 Gio/passe (−684 Mio par
-  passe, −1,37 Gio par préfill)** et le préfill reste **5 373 ms** contre
+  passe, −1,34 Gio par préfill)** et le préfill reste **5 373 ms** contre
   **5 306 / 5 358 / 5 376 / 5 407** (plage des témoins, ±50 ms) : les octets
   h2d du stager ne sont pas sur le chemin critique à 3 252. À 972, la queue de
   76 rangées n'est **pas** stagée et lit en place : c'est là que les octets
@@ -2799,11 +2799,11 @@ de tune 36 rows recopié de `w29-rebase/build-clean`). Instrumentation
 **Conclusion : R54 est faux dans sa conclusion.** Le second chunk ne bute pas
 sur un mur du stager. Les copies sont recouvertes : retirer 684 Mio de staging
 par passe ne rend rien, et le profil `--profile-ops` du run entier à 3 252
-compte **10 849 ms d'ops et 295 ms d'attente pour 11 245 ms de mur** (profil
-actif, non comparable à un run nu). Le gain d'attention de W42b sur le préfill
-entier y est du même ordre que sur un prompt à un chunk (−56 ms à 3 252 contre
-−70 ms à 2 067), donc l'attention du second chunk n'est pas absorbée par un mur
-de copie. Le re-stream est **structurel** (2 chunks × 18,86 Gio), pas un défaut
+compte **10 849 ms d'ops et 295 ms d'attente, soit 11 144 ms des 11 245 ms de
+mur** (profil actif, non comparable à un run nu). Le gain d'attention de W42b
+sur le préfill entier y est du même ordre que sur un prompt à un chunk
+(−56 ms à 3 252 contre −70 ms à 2 067), donc l'attention du second chunk n'est
+pas absorbée par un mur de copie. Le re-stream est **structurel** (2 chunks × 18,86 Gio), pas un défaut
 du prêt. **Aucune modification de `core/`** : garder le pool résident est hors
 budget VRAM, et garder l'anneau vaudrait < 30 ms, sous le bruit.
 
@@ -2830,14 +2830,15 @@ Flash-Next **4 786/4 786**, 0 échec, 0 divergence, 1 442 skipped, pire rel_l2
 les gros cas, elles ne servent pas ici). Gates servis (serveur neuf,
 `cache_n=0`, payloads W41) : 3 252 NS=0/NS=3 préfill **5 276 / 5 798 ms**,
 décodage **11,89 / 19,56 tok/s** (99,2 / 98,9 % de 11,98/19,77, R43 tenu) ;
-972 NS=0/NS=3 préfill **2 079 / 2 658 ms** ; textes **identiques au bit**
-(`960a2212`, NS0=NS3, et identiques à `fn-ns0.txt`/`fn-ns3.txt`). h2d mesuré par
+972 NS=0/NS=3 préfill **2 079 / 2 658 ms** ; textes **identiques au bit** —
+3 252 `960a2212` (NS0/NS3/ms1, identique à `fn-ns0.txt`/`fn-ns3.txt`), 972
+`84348e79` (NS0/NS3/ms1). h2d mesuré par
 `/stats` pendant la requête : 3 252 **41,68 / 44,18 Gio** (stagés 37,73 /
 41,40), 972 **22,90 / 23,46 Gio** (stagés 18,87 / 20,70). Le couple
 `max-num-seqs 1` du même passage confirme la lecture : à 3 252, 36,395 Gio
 stagés contre 37,731 (**−1,34 Gio**) donnent **5 308 contre 5 276 ms (+0,6 %,
 dans la plage)** ; à 972, 18,197 contre 18,865 (**−0,67 Gio**) donnent
 **2 041 contre 2 079 ms (−1,9 %)** — c'est la queue en place qui compte. Carte
-43 °C / 23 W au repos avant la passe, aucun throttler PPT signalé aux runs
-servis. Artefacts : `<work-root>/work/w44a/{build-w44a,results*,results-gate}`,
+43 °C / 23 W au repos avant la passe, drapeau `THROTTLED` levé (bruit connu) et
+aucun PPT signalé aux runs servis. Artefacts : `<work-root>/work/w44a/{build-w44a,results*,results-gate}`,
 `/tmp/w44-tests/`, `/tmp/w44-kbench-fn.md`.

@@ -749,7 +749,7 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   n'est rendu qu'au **premier pas de décodage** (`allow=1 501 696 000`, soit
   `loan 0→1,40 Gio`), comme voulu en W34.
 - **Copies masquées** : `max-num-seqs 1` (+650 Mio de dalle) baisse le staging
-  à **18,19 Gio/passe (−684 Mio par passe, −1,37 Gio par préfill)** et le
+  à **18,19 Gio/passe (−684 Mio par passe, −1,34 Gio par préfill)** et le
   préfill reste **5 373 ms** contre 5 306–5 407 (plage des témoins, ±50 ms).
   Témoin sans stager (`kStagerMinRows` 1<<20) : **6 168/6 212 ms** — le stager
   vaut **1,16×** sur le préfill, son coût est recouvré.
@@ -761,9 +761,10 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   `need > ring_/2` et une couche demande **420,4 Mio** pour un demi-anneau de
   402,8 Mio (R55).
 - Suite verte aux compteurs W42, kbench Flash-Next **4 786/4 786**, gates
-  servis identiques au bit (`960a2212`) et décodage **11,89 / 19,56 tok/s**
-  (99,2 / 98,9 % des références) ; 3 252 **5 276 / 5 798 ms**, 972
-  **2 079 / 2 658 ms** ; détail et commandes dans le journal.
+  servis identiques au bit (3 252 `960a2212`, 972 `84348e79`) et décodage
+  **11,89 / 19,56 tok/s** (99,2 / 98,9 % des références) ; 3 252
+  **5 276 / 5 798 ms**, 972 **2 079 / 2 658 ms** ; détail et commandes dans le
+  journal.
 - **R55** — *règle (W44)* : chaque buffer de l'anneau vaut `f × layer_max`
   (402,81 Mio ici) alors qu'une couche pinnée en demande **420,4 Mio** :
   l'anneau ne tient que **1,9 couche**, tout `now=false` est refusé
