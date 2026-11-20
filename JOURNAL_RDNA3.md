@@ -2776,3 +2776,96 @@ points appariés sur carte refroidie (36 °C).
   4 flux tournent 10–15 % sous le sclk médian des points mono, les ratios
   sont conservateurs. Rapport :
   `<work-root>/work/w42int/results/multiflux/RAPPORT_MULTIFLUX_27B_2026-11-20.md`.
+
+## 2026-11-20 — W44 : stager de préfill, R54 infirmé (aucun changement de core)
+
+Worktree `w44-stager` remis sur `rdna3-iqr` (**197a239a**), arbre hôte **neuf**
+`<work-root>/work/w44a`, build **neuf** `build-w44a` (gfx1100, FFmpeg, cache
+de tune 36 rows recopié de `w29-rebase/build-clean`). Instrumentation
+`RADIANCE_DEBUG_STAGER` posée pour la mesure (`core/engine.cpp`,
+`core/place/stager.cpp`), puis **retirée** : l'arbre livré est identique à
+197a239a.
+
+**Ce que dit la mesure** (`p3252_64.json`, serveur neuf, `cache_n=0`) :
+
+- **Octets h2d par chunk.** NS=0 : chunk 1 (2 048 rangées) **20 256 427 008 o =
+  18,86 Gio** stagés, chunk 2 (1 204 rangées) **20 256 427 008 o** — cumul
+  **40 512 854 016 o = 37,73 Gio**. Le compteur du mover (`/stats`) donne
+  **41,67–41,68 Gio h2d** pour tout le serveur
+  (37,7 de staging + ~3,9 de promotions de décodage : 1 704 promotions,
+  1 129 démotions), d2h 2,11–2,13. NS=3 : **22 228 291 584 o/passe (20,70 Gio)**,
+  41,4 Gio de staging, h2d total **44,18 Gio** (1 195 promotions ; 9 391 slots
+  pinnés, le pool du drafter est plus gros).
+- **Le prêt n'est pas rendu entre les deux chunks.** Les deux passes partent au
+  **niveau 0** (2 048 et 1 204 rangées > 1 024), `stage=1`, `allow=0`,
+  `loan 0→0`, `held 0→0`, `ring=full` : aucun `set_loan` inter-chunk. Le prêt
+  n'est rendu qu'au **premier pas de décodage** (tok=1, niveau 1,
+  `allow=1 501 696 000`, soit `loan 0→1,40 Gio`), exactement l'intention de
+  W34. Le re-stream ne vient donc pas du prêt.
+- **Pourquoi 2 × le pool.** L'anneau fait **805,62 Mio** (deux buffers de
+  402,81 Mio = `f × layer_max`), soit **1,9 couche** ; le pool pinné est de
+  **18,9 Gio** (8 510 slots), la dalle est pleine (16 089 slots, KV 852 Mio,
+  arène 719,56 Mio + anneau). À 1 204 rangées, top-10 sur 512 experts route
+  **tous** les experts (12 040 tirages : aucun expert ne reste non routé) : un
+  staging « routé seulement » ne gagnerait rien. Tenir le pool résident demande
+  **18,9 Gio** absents ; ne garder que l'anneau entre deux chunks économise
+  ≤ 805 Mio sur 37,73 Gio.
+- **Les copies sont masquées.** `max-num-seqs 1` (+650 Mio de dalle, experts
+  37,32 → 37,97 Gio) abaisse le staging à **18,19 Gio/passe (−684 Mio par
+  passe, −1,34 Gio par préfill)** et le préfill reste **5 373 ms** contre
+  **5 306 / 5 358 / 5 376 / 5 407** (plage des témoins, ±50 ms) : les octets
+  h2d du stager ne sont pas sur le chemin critique à 3 252. À 972, la queue de
+  76 rangées n'est **pas** stagée et lit en place : c'est là que les octets
+  comptent (W42m : −1,0 %).
+- **Témoin sans stager** (`kStagerMinRows = 1<<20`, arbre jumeau
+  `w44ns/build-w44ns`, même split : experts 37,32 Gio, anneau 805,62 Mio) :
+  préfill 3 252 **6 168 / 6 212 ms** contre 5 306–5 407 ; 2 068 tokens
+  (2 048 + 20) 3 386 → **3 901 ms** ; 1 236 tokens 2 335 → **2 766 ms** ; h2d
+  ramené à 3,95 Gio (promotions seules), décodage inchangé (11,83 contre 11,82).
+
+**Conclusion : R54 est faux dans sa conclusion.** Le second chunk ne bute pas
+sur un mur du stager. Les copies sont recouvertes : retirer 684 Mio de staging
+par passe ne rend rien, et le profil `--profile-ops` du run entier à 3 252
+compte **10 849 ms d'ops et 295 ms d'attente, soit 11 144 ms des 11 245 ms de
+mur** (profil actif, non comparable à un run nu). Le gain d'attention de W42b
+sur le préfill entier y est du même ordre que sur un prompt à un chunk
+(−56 ms à 3 252 contre −70 ms à 2 067), donc l'attention du second chunk n'est
+pas absorbée par un mur de copie. Le re-stream est **structurel** (2 chunks × 18,86 Gio), pas un défaut
+du prêt. **Aucune modification de `core/`** : garder le pool résident est hors
+budget VRAM, et garder l'anneau vaudrait < 30 ms, sous le bruit.
+
+**Défaut relevé, non corrigé** : le pré-staging de fin de passe (`end_pass`,
+`kLead = 3`, atteignable via `set_next_prefill` au niveau 0) ne s'arme jamais.
+`stage_layer(..., now=false)` rend `kLater` dès `need > ring_/2`
+(`core/place/stager.cpp:227`) ; la couche 0 demande **440 795 136 o
+(420,4 Mio)** pour un demi-anneau de **422 379 520 o (402,8 Mio)** — chaque
+buffer de l'anneau vaut `f × layer_max`, sous les 420,4 Mio réellement pinnés
+d'une couche. Le run-ahead se réduit donc à la couche suivante (`now=true`,
+`next_ <= cur + 1`) et le pré-staging inter-chunks est **inerte**
+(`early=0`). Le corriger ne rendrait que le recouvrement d'une couche (~14 ms
+de copie), masqué ; non fait, car la règle du demi-anneau est le contrat du
+chemin servi (risque **R56**).
+
+**Validation** (`build-w44a`, build neuf, `RADIANCE_HOME`) : suite complète aux
+compteurs du §5.5/W42 au chiffre près — sched 548 964/213, engine 1 087/52
+(3 skips), fixture 109 671/59, config 2 952/71, iqr 76/11, ple_hc 76/10,
+moe_iqr 15/15, moe_w4nl 18/14, **vision_rows 76/12**, **attn_paged 36/11**,
+logits 8/4, gather 33/3, mtp 22/3, logit_rerank 36/5, act 103/6, tp2 12/2,
+dflash 37/3, `r3d_selftest` 196 rows / 0 échec / 16 skips. `rad-kbench --bench`
+Flash-Next **4 786/4 786**, 0 échec, 0 divergence, 1 442 skipped, pire rel_l2
+1,520e-02 (2 307 s de mur ; les lignes Speed portent des notes PPT0/PPT1 sur
+les gros cas, elles ne servent pas ici). Gates servis (serveur neuf,
+`cache_n=0`, payloads W41) : 3 252 NS=0/NS=3 préfill **5 276 / 5 798 ms**,
+décodage **11,89 / 19,56 tok/s** (99,2 / 98,9 % de 11,98/19,77, R43 tenu) ;
+972 NS=0/NS=3 préfill **2 079 / 2 658 ms** ; textes **identiques au bit** —
+3 252 `960a2212` (NS0/NS3/ms1, identique à `fn-ns0.txt`/`fn-ns3.txt`), 972
+`84348e79` (NS0/NS3/ms1). h2d mesuré par
+`/stats` pendant la requête : 3 252 **41,68 / 44,18 Gio** (stagés 37,73 /
+41,40), 972 **22,90 / 23,46 Gio** (stagés 18,87 / 20,70). Le couple
+`max-num-seqs 1` du même passage confirme la lecture : à 3 252, 36,395 Gio
+stagés contre 37,731 (**−1,34 Gio**) donnent **5 308 contre 5 276 ms (+0,6 %,
+dans la plage)** ; à 972, 18,197 contre 18,865 (**−0,67 Gio**) donnent
+**2 041 contre 2 079 ms (−1,9 %)** — c'est la queue en place qui compte. Carte
+43 °C / 23 W au repos avant la passe, drapeau `THROTTLED` levé (bruit connu) et
+aucun PPT signalé aux runs servis. Artefacts : `<work-root>/work/w44a/{build-w44a,results*,results-gate}`,
+`/tmp/w44-tests/`, `/tmp/w44-kbench-fn.md`.

@@ -629,13 +629,18 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
 - **R51** — *règle* : pour paralléliser une attention bit-exacte, découper la
   **dimension de sortie**, jamais les clés (la réduction sur les clés est
   l'ordre de sommation).
-- **R54** — *constat (W42b)* : l'attention h256 de préfill gagne **1,3–1,7×**
-  au noyau mais **~1 % servi** à 3 252 tokens. Une invite qui tient en **un**
-  chunk encaisse le gain prédit (2 067 tokens : préfill 3 269 → 3 199 ms) ; le
-  **second chunk** d'un préfill découpé n'en rend rien — le mover re-stream
-  **36,45 Gio h2d** par préfill (48 couches routées à chaque chunk), donc
-  l'attention n'y est plus le chemin critique. Avant d'optimiser l'attention de
-  préfill, mesurer le chemin critique du chunk court : c'est le stager.
+- **R54** — *constat (W42b), corrigé (W44)* : l'attention h256 de préfill gagne
+  **1,3–1,7×** au noyau mais **~1 % servi** à 3 252 tokens. Une invite qui tient
+  en **un** chunk encaisse le gain prédit (2 067 tokens : préfill 3 269 →
+  3 199 ms). Le **second chunk** d'un préfill découpé n'en rend rien —
+  36,45 Gio h2d annoncés en W42b, **37,73 Gio de staging mesurés** en W44
+  (41,67 Gio h2d avec les promotions), 48 couches routées à chaque chunk. W44 a
+  mesuré ce poste : le prêt **n'est pas** rendu entre les deux chunks (les deux
+  passes sont stagées, niveau 0), le re-stream est **structurel** (2 × le pool de
+  18,9 Gio pour un anneau de 1,9 couche) et les copies sont **masquées** —
+  retirer 684 Mio de staging par passe ne change pas le préfill. La conclusion
+  « c'est le stager qui borne le chunk court » est **fausse** : ne pas rouvrir
+  l'anneau ni le prêt pour ce poste (voir W44 et R56).
 - **R55** — *règle* : un débit **mural** (Σ tokens / temps du lot) ne se
   compare pas à un débit de **décodage**. À métrique égale, 4 flux 27B à 2 k
   font **1,27×** un flux (W42e) ; leur plafond est le **préfill sérialisé**
@@ -722,8 +727,11 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   formes servies ; servi TTFT 3 252 **−1,0 %**, 972 **−1,5 %**, textes
   identiques au bit ; `attn_paged_device_test` **36/11** (sept cas de
   frontière ajoutés par la revue).
-- **R54** — *constat* : le gain servi d'un préfill découpé est borné par le
-  stager du second chunk (36,45 Gio h2d par préfill), pas par l'attention.
+- **R54** — *constat (W42b), corrigé (W44)* : le gain servi d'un préfill
+  découpé semblait borné par le stager du second chunk (36,45 Gio h2d par
+  préfill), pas par l'attention. W44 a mesuré le poste et l'a **falsifié**
+  (prêt non rendu entre les chunks, copies masquées, re-stream structurel) :
+  voir l'entrée R54 du registre et la section W44.
 
 ## W42 — intégration (2026-11-19)
 
@@ -734,3 +742,39 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   MiniCPM 1 802/1 802, Flash-Next 4 786/4 786 (0 échec, 0 divergence),
   replay strict 1 134/1 134 ; gates servis identiques au bit (27B
   `d7cf7a3b`, Flash-Next `960a2212`, MiniCPM `8833d699`).
+
+## W44 — stager de préfill : R54 infirmé, le prêt n'est pas le coupable (2026-11-20, non livré)
+
+- **Mesure** (arbre neuf `w44a/build-w44a`, instrumentation retirée) : à
+  3 252 tokens en NS=0, chaque chunk stage **20 256 427 008 o (18,86 Gio)** et
+  le préfill en copie **37,73 Gio** ; h2d du serveur 41,67 Gio (dont ~3,9 de
+  promotions de décodage), d2h 2,11. En NS=3 : **20,70 Gio/passe**, 44,18 Gio
+  (9 391 slots pinnés pour le drafter).
+- **Le prêt n'est pas rendu entre les chunks** : les deux passes partent au
+  niveau 0, `stage=1`, `allow=0`, `loan 0→0`, `held 0→0`, `ring=full` ; il
+  n'est rendu qu'au **premier pas de décodage** (`allow=1 501 696 000`, soit
+  `loan 0→1,40 Gio`), comme voulu en W34.
+- **Copies masquées** : `max-num-seqs 1` (+650 Mio de dalle) baisse le staging
+  à **18,19 Gio/passe (−684 Mio par passe, −1,34 Gio par préfill)** et le
+  préfill reste **5 373 ms** contre 5 306–5 407 (plage des témoins, ±50 ms).
+  Témoin sans stager (`kStagerMinRows` 1<<20) : **6 168/6 212 ms** — le stager
+  vaut **1,16×** sur le préfill, son coût est recouvré.
+- **Conclusion** : re-stream **structurel** (2 chunks × le pool de 18,9 Gio
+  pour un anneau de 805,62 Mio = 1,9 couche) ; garder le pool résident demande
+  18,9 Gio de VRAM absents. Aucune modification de `core/`.
+- **Défaut relevé, non corrigé** : le pré-staging de fin de passe (`end_pass`,
+  `kLead = 3`) est inerte — `stage_layer(..., now=false)` refuse dès
+  `need > ring_/2` et une couche demande **420,4 Mio** pour un demi-anneau de
+  402,8 Mio (R56).
+- Suite verte aux compteurs W42, kbench Flash-Next **4 786/4 786**, gates
+  servis identiques au bit (3 252 `960a2212`, 972 `84348e79`) et décodage
+  **11,89 / 19,56 tok/s** (99,2 / 98,9 % des références) ; 3 252
+  **5 276 / 5 798 ms**, 972 **2 079 / 2 658 ms** ; détail et commandes dans le
+  journal.
+- **R56** — *règle (W44)* : chaque buffer de l'anneau vaut `f × layer_max`
+  (402,81 Mio ici) alors qu'une couche pinnée en demande **420,4 Mio** :
+  l'anneau ne tient que **1,9 couche**, tout `now=false` est refusé
+  (`need > ring_/2` = 402,8 Mio, soit 422 379 520 o) et le run-ahead se réduit
+  à la couche suivante. Mesurer `stage_need` avant de compter sur « 3 couches
+  d'avance » ; ne pas toucher la règle du demi-anneau sans A/B servi, elle
+  protège la couche qui arrive.
