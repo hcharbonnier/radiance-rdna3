@@ -640,7 +640,7 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   18,9 Gio pour un anneau de 1,9 couche) et les copies sont **masquées** —
   retirer 684 Mio de staging par passe ne change pas le préfill. La conclusion
   « c'est le stager qui borne le chunk court » est **fausse** : ne pas rouvrir
-  l'anneau ni le prêt pour ce poste (voir W44 et R55).
+  l'anneau ni le prêt pour ce poste (voir W44 et R56).
 - **W41c** (92722381) : staging KV préchargé 4 pages en avance (85 % du coût
   d'attention h256 était du staging sérialisé), hc_norm vectorisé,
   hc_up 32→64. Pas Flash-Next **−6,5 %** en NS=0 (11,29 → 12,07 tok/s) et
@@ -725,7 +725,7 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
   découpé semblait borné par le stager du second chunk (36,45 Gio h2d par
   préfill), pas par l'attention. W44 a mesuré le poste et l'a **falsifié**
   (prêt non rendu entre les chunks, copies masquées, re-stream structurel) :
-  voir R54 dans W41b/W41c et la section W44.
+  voir l'entrée R54 du registre et la section W44.
 
 ## W42 — intégration (2026-11-19)
 
@@ -759,13 +759,13 @@ Quatre agents en worktrees séparés, un seul run GPU à la fois.
 - **Défaut relevé, non corrigé** : le pré-staging de fin de passe (`end_pass`,
   `kLead = 3`) est inerte — `stage_layer(..., now=false)` refuse dès
   `need > ring_/2` et une couche demande **420,4 Mio** pour un demi-anneau de
-  402,8 Mio (R55).
+  402,8 Mio (R56).
 - Suite verte aux compteurs W42, kbench Flash-Next **4 786/4 786**, gates
   servis identiques au bit (3 252 `960a2212`, 972 `84348e79`) et décodage
   **11,89 / 19,56 tok/s** (99,2 / 98,9 % des références) ; 3 252
   **5 276 / 5 798 ms**, 972 **2 079 / 2 658 ms** ; détail et commandes dans le
   journal.
-- **R55** — *règle (W44)* : chaque buffer de l'anneau vaut `f × layer_max`
+- **R56** — *règle (W44)* : chaque buffer de l'anneau vaut `f × layer_max`
   (402,81 Mio ici) alors qu'une couche pinnée en demande **420,4 Mio** :
   l'anneau ne tient que **1,9 couche**, tout `now=false` est refusé
   (`need > ring_/2` = 402,8 Mio, soit 422 379 520 o) et le run-ahead se réduit

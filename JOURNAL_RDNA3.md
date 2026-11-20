@@ -2767,7 +2767,7 @@ de tune 36 rows recopié de `w29-rebase/build-clean`). Instrumentation
   **41,67–41,68 Gio h2d** pour tout le serveur
   (37,7 de staging + ~3,9 de promotions de décodage : 1 704 promotions,
   1 129 démotions), d2h 2,11–2,13. NS=3 : **22 228 291 584 o/passe (20,70 Gio)**,
-  41,4 Gio de staging, h2d total **44,18 Gio** (1 196 promotions ; 9 391 slots
+  41,4 Gio de staging, h2d total **44,18 Gio** (1 195 promotions ; 9 391 slots
   pinnés, le pool du drafter est plus gros).
 - **Le prêt n'est pas rendu entre les deux chunks.** Les deux passes partent au
   **niveau 0** (2 048 et 1 204 rangées > 1 024), `stage=1`, `allow=0`,
@@ -2817,7 +2817,7 @@ d'une couche. Le run-ahead se réduit donc à la couche suivante (`now=true`,
 `next_ <= cur + 1`) et le pré-staging inter-chunks est **inerte**
 (`early=0`). Le corriger ne rendrait que le recouvrement d'une couche (~14 ms
 de copie), masqué ; non fait, car la règle du demi-anneau est le contrat du
-chemin servi (risque **R55**).
+chemin servi (risque **R56**).
 
 **Validation** (`build-w44a`, build neuf, `RADIANCE_HOME`) : suite complète aux
 compteurs du §5.5/W42 au chiffre près — sched 548 964/213, engine 1 087/52
