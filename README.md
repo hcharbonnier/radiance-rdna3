@@ -14,7 +14,52 @@ AVX-512/AVX2 kernels (`libavx`) serve every model here: the small ones (Embeddin
 Qwen3-ASR, the 0.8B-3B models) at interactive speed on a desktop CPU, the 27B and larger far more
 slowly than a card.
 
+A fork of this tree serves a single RDNA3 card; its scope, recipes and measured results are in
+[RDNA3 fork](#rdna3-fork-rdna3-iqr) below.
+
 To support the development of radiance: [Patreon](https://patreon.com/StillDeadCode).
+
+## RDNA3 fork (`rdna3-iqr`)
+
+This branch serves a single RDNA3 card, a Radeon PRO W7900 (`gfx1100`, 48 GiB) under ROCm. It is
+based on v2.1.0 (`3045979`), 261 commits ahead of it, at `9f43983d`; nothing is pushed. Only
+`libr3d` is built: `libr4d` (`gfx12xx`) and `libhalo` (`gfx1151`) are outside the build target.
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DRAD_GPU_TARGETS=gfx1100 -DRAD_WITH_FFMPEG=ON
+cmake --build build -j 16
+```
+
+Three containers are served and validated on this card, measured at temperature 0:
+
+| model | decode | prefill | notes |
+|---|---|---|---|
+| Qwen3.8-Flash-Next IQR-V4 (MoE, MTP, vision) | 11.8 tok/s, 19.5 with `NS=3` at 3 252 tokens (1.65×) | 5.24–5.28 s at 3 252 tokens | vision 1024²/2048²: TTFT 3.12 s / 15.84 s |
+| Qwen3.8-27B IQR dense (trellis u4/u5) | 15.3 tok/s, 26.9 with `NS=3` at 2 047 tokens | 484–486 tok/s at 972 and 3 252 tokens | `NS=3` is the served setting |
+| MiniCPM5-2B IQ8R (DSpark drafter) | 33.0 tok/s at 781 tokens, no speculation | — | `NS=7` for the drafter; `NS=3` is refused by the arch |
+
+`NS` is `num-speculative-tokens`. The serve recipes (the full YAML files are in
+[`HANDOVER_RDNA3_W43.md`](HANDOVER_RDNA3_W43.md)):
+
+| model | settings |
+|---|---|
+| Qwen3.8-27B IQR | `kv-cache-dtype: i8`, `num-speculative-tokens: 3`, `max-num-seqs: 4` |
+| Qwen3.8-Flash-Next | `placement: expert_tiered`, `host-pool-mib: 24576`, `kv-cache-dtype: i8`, `NS=3` |
+| MiniCPM5-2B | `kv-cache-dtype: bf16`, `NS=0` |
+
+Validation on this branch: `r3d_selftest` reports 196 rows, no failure and 16 skips, and
+`rad-kbench` replays 3 181/3 181 cases on the 27B, 4 786/4 786 on Flash-Next and 1 802/1 802 on
+MiniCPM5-2B with no failure and no divergence; the strict fixture replay is 1 134/1 134. Served
+texts are identical to the reference, bit for bit.
+
+Contract: a change is kept only if it leaves the served text bit-exact at temperature 0. The two
+remaining large wins — `attn_dense` in the vision tower and the 27B's h256 split-KV at decode —
+change the text and are refused.
+
+Details: [`HANDOVER_RDNA3_W43.md`](HANDOVER_RDNA3_W43.md),
+[`JOURNAL_RDNA3.md`](JOURNAL_RDNA3.md), [`SUIVI_LOTS_RDNA3.md`](SUIVI_LOTS_RDNA3.md) and
+[`AGENTS.md`](AGENTS.md).
 
 ## Models
 
