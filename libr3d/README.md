@@ -57,19 +57,20 @@ The table groups the rows by family; `r3d_rows.cpp` and `r3d.h` hold the full se
 | family | rows |
 | --- | --- |
 | `norm` | `rmsnorm_bf16` (optional residual add and multiplier), `rmsnorm_f32`, `layernorm_bf16` |
-| `elem` | `add` (with `div`, and the broadcast band), `mul`, `silu`, `gelu`, `sigmoid`, `act_mul_{silu,gelu,sigmoid}`, `softmax`, `scale`, `fill` (bf16/f32/i32/i64), `gather_rows`, `scatter_rows`, bf16 and f32 where the op has both, plus seven `cast` pairs and `silu_mul_bf16` |
+| `elem` | `add` (with `div`, and the broadcast band), `mul`, `silu`, `gelu`, `sigmoid`, `act_mul_{silu,gelu,sigmoid}`, `softmax`, `scale`, `fill` (bf16/f32/i32/i64), `gather_rows` and `scatter_rows` (bf16/f32, plus the `u8` opaque byte rows the KV tier moves), seven `cast` pairs and `silu_mul_bf16` |
 | `attn` | `rope_bf16` (neox and gptj, in place over packed QKV), `kv_store_{bf16,f16,fp8}`, `attn_paged_{bf16,fp8}_{decode,prefill}`: head_dim 128, split-KV combined in the same launch |
-| `kv` | `kv_len_trim_i32` (per-sequence context lengths less `trim`, the QSA slice's own last row), `qsa_tail_store_bf16` (the QSA indexer's tail into a per-layer linear KV state, ring addressed by position) |
-| `gemm` | `embed_lookup_bf16`, `gemm_nt_bf16_{m16,tiled}`, `gemm_nt_f16_m16`, `gemm_nt_q_fp8a16_m16`, `gemm_nt_q_fp8a8_{m16,tiled}`, `gemm_nt_q_mxfp4a8_{m16,tiled}` (OCP-MXFP4 weight: e2m1 codes, an e8m0 scale per 32 of K), `gemm_nt_q_w2a8_{m16,tiled}` (2-bit and 4-bit grids on the 128x128 tile), `gemm_nt_q_w4a8_m16` (signed int4 weight, decode band), `gemm_nt_q_w4a16asym_m64` and `gemm_nt_q_w5a16_m64` (4- and 5-bit codes against an f16 activation, 1..64 rows on the wave matrix), `gemm_nt_q_w8a8_{m16,m64}` (signed int8 weight, decode band and 17..127 prefill rows on the wave matrix), `gemm_nt_q_gated_fp8a8` |
+| `kv` | `kv_len_trim_i32` (per-sequence context lengths less `trim`, the QSA slice's own last row), `qsa_tail_store_bf16` (the QSA indexer's tail into a per-layer linear KV state, ring addressed by position), `qsa_block_key_bf16` (the compressed key of `ratio` raw keys, norm and rope), `qsa_score_{bf16,f16,f32}` (relu-per-head block scores, one row per query dtype), `qsa_select_bf16` (the top-k complete pages and the partial page, `-1` padded), `qsa_work` (the tail and the completing blocks gathered into block keys) |
+| `gemm` | `embed_lookup_bf16`, `gemm_nt_bf16_{m16,tiled}`, `gemm_nt_f16_m16`, `gemm_nt_q_fp8a16_m16`, `gemm_nt_q_fp8a8_{m16,tiled}`, `gemm_nt_q_mxfp4a8_{m16,tiled}` (OCP-MXFP4 weight: e2m1 codes, an e8m0 scale per 32 of K), `gemm_nt_q_w2a8_{m16,tiled}` (2-bit and 4-bit grids on the 128x128 tile), `gemm_nt_q_w4a8_m16` (signed int4 weight, decode band), `gemm_nt_q_w4a16asym_m64` and `gemm_nt_q_w5a16_m64` (4- and 5-bit codes against an f16 activation, 1..64 rows on the wave matrix), `gemm_nt_q_w8a8_{m16,m64}` (signed int8 weight, decode band and 17..127 prefill rows on the wave matrix), `gemm_nt_q_gated_fp8a8`, `gemm_iqr_nt_m16` and `gemm_iqr_tiled` (the IQR trellis weight at group 128, and their `_w256` rows for IQ8R: two 128-wide rotations sharing one bf16 scale per (row, 256), one int32 sum folded per 256) |
 | `vocab` | `logits_gemm_bf16`: the head, read once per token, as bf16 or as E4M3 codes with a bf16 scale per 128x128 block; the `impl` axis picks the decode (the LDS table, the per-byte ALU formula) |
-| `quant` | `quant_act_fp8_bf16`, `quant_act_i8_bf16`, `quant_act_i8g_bf16`, `had_quant_act_{i8,fp8}_bf16` and `had_quant_act_i8g_bf16` (the same with a block Walsh-Hadamard rotation), `gated_had_quant_{i8,i8g,fp8}_bf16`, `gelu_mul_quant_i8_bf16`, `quant_cols_fp8_bf16`, `rmsnorm_quant_{fp8,i8}_bf16` (norm and quantiser in one pass), `gated_quant_fp8_bf16`, `dequant_fp8`, `dequant_e5m2`, `dequant_i8` |
+| `quant` | `quant_act_fp8_bf16`, `quant_act_i8_bf16`, `quant_act_i8g_bf16`, `had_quant_act_{i8,fp8}_bf16` and `had_quant_act_i8g_bf16` (the same with a block Walsh-Hadamard rotation; its `_256_bf16` row is the IQ8R pair of 128-wide rotations under one scale), `gated_had_quant_{i8,i8g,fp8}_bf16` (plus `gated_had_quant_i8g_256_bf16`), `gelu_mul_quant_i8_bf16`, `quant_cols_fp8_bf16`, `rmsnorm_quant_{fp8,i8}_bf16` (norm and quantiser in one pass; `rmsnorm_had_quant_i8g_256_bf16` is the IQ8R form), `gated_quant_fp8_bf16`, `dequant_fp8`, `dequant_e5m2`, `dequant_i8` |
 | `sample` | pre-filters `sample_{penalties,dry,ngram_ban,mask,logprobs}_f32`; spine `sample_{argmax,temp,topk,pick,topp,minp,typical,xtc}_f32` — f32 logits in and out, the draw the reference's in its order, the top-R scan single-pass (the plane read once) |
 | `moe` | `expert_scale_bf16` (the renormalised top-k weight times the expert's per-expert scale, in place), `moe_router_topk_bf16` (softmax top-k, renormalised if `norm`), `moe_router_topk_scatter` (the top-k and the counting sort as one op), `moe_router_sigmoid_topk` (the GLM-style router: sigmoid scores, selection on scores + bias, the kept weights scaled by `route_scale`), `moe_scatter_small` (the routed slots' stable counting sort: one workgroup up to 1024 slots, three passes over 256-slot tiles above), `moe_gather` (fold the expert outputs back to the token, with the optional shared arm), `moe_gemm_q_e4m3` (grouped E4M3 GEMM; the `impl` axis: 16x16 table decode, 16x16 ALU decode, 16x128 block with the F32 scales folded), `moe_gemm_bf16` (unquantised experts, wave matrix), `moe_gemm_mxfp4a8` (canonical MXFP4 experts), `moe_gemm_w4a8` (int8 activation, packed two's-complement int4 experts: the i32 wave matrix, an f32 a-scale and a bf16 w-scale per (row, 128 of K), token- and sorted-order `a`), `moe_gemm_w4a4` (int4 activation, packed two's-complement int4 experts: both widen to int8 on the i32 wave matrix, an f32 a-scale and a bf16 w-scale per (row, 128 of K), token- and sorted-order `a`), `row_topk_{bf16,f32}` (the reference files the op under `moe`, so the row does too) |
 | `gdn` | `gdn_kkt_solve_c64` (`A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1` per 64-chunk; libhalo's kernel), `gdn_chunk_scan_k128_v128_c64` (the chunked scan: WY recompute, state recurrence and output in one kernel; libhalo's), `gdn_gated_rmsnorm_h128`, `gdn_gated_norm_had_quant_i8` (the gated norm fused with the rotation and quantiser), `gdn_conv_prep_w4_h128` (causal conv, split, l2norm, gating and the per-chunk gate cumsum in one prefill kernel), `gdn_conv_update_w4_h128` (the same convolution at decode over a rolling conv-state buffer), `gdn_recurrent_update_k128_v128` (the decode-time recurrent state update, per_candidate or anchor; libhalo's), `gdn_conv_recurrent_update_k128_v128` (the convolution and the recurrent update as one decode kernel, q/k/v never materialised; libhalo's) |
 | `draft` | `dflash_select_bf16`: the drafter's accept step, a walk over the draft block's candidate lattice |
+| `mtp` | `mtp_enter_e4m3` (the MTP head's entry: grouped pre-fc norm of the wide stream, the embedding norm, two E4M3 fc matrices and the `wadd` gate), `logit_rerank_iqr` and `logit_rerank_i8` (exact rescoring of a draft round's `R` candidates against the trunk's lm_head, in the IQR and i8 forms) |
 
-The table holds 111 rows over 72 schemas; `r3d_selftest` checks every schema slot for slot against
-the `libref.so` beside the plugin. Fourteen rows carry tune axes (see
+The table holds 190 rows over 104 schemas; `r3d_selftest` checks every schema slot for slot against
+the `libref.so` beside the plugin. Eighteen rows carry tune axes (see
 [Tunable params](#tunable-params)); the rest are single-implementation.
 
 There are two int8 activation rows because the reference has two ops and they are not
@@ -433,9 +434,13 @@ cache, per candidate token or as one committed state with a replay scratch slot 
 `gdn_conv_recurrent_update_k128_v128` is the two as one kernel: the fold holds q, k and v in
 registers, so they are never written and the step is one launch instead of two.
 
-The QSA rows are the indexer's tail: `kv_len_trim_i32` trims each sequence's context lengths by
-`trim` (the slice's own last row), and `qsa_tail_store_bf16` writes the QSA indexer's tail into a
-per-layer linear KV state, ring addressed by position. The MoE plumbing rows are the router and
+The QSA rows are the indexer: `kv_len_trim_i32` trims each sequence's context lengths by
+`trim` (the slice's own last row), `qsa_tail_store_bf16` parks the raw keys that have not
+completed a block in a per-layer linear KV state, ring addressed by position, and `qsa_work`
+gathers the tail and the completing blocks. `qsa_block_key_bf16` compresses `ratio` raw keys into
+one block key (norm, rope), `qsa_score_{bf16,f16,f32}` scores blocks against the query and
+`qsa_select_bf16` returns the top-k complete pages and the partial page. The MoE plumbing rows
+are the router and
 the sort: `moe_router_topk_bf16` (softmax top-k, renormalised if `norm`),
 `moe_router_sigmoid_topk` (the GLM-style router: sigmoid scores, selection on scores + bias, the
 kept weights scaled by `route_scale`), `moe_router_topk_scatter` (the top-k and the counting sort
@@ -594,6 +599,31 @@ splits and width the launcher chose.
 all-reduce over the host link most of them sit on is slower than sending the bytes through the
 host. Nothing here is built as a chained form, so both optional symbols are omitted, which is the
 ABI's own answer.
+
+## Known limits
+
+- **Images need the media build.** The vision rows are compiled only with
+  `-DRAD_WITH_FFMPEG=ON`, and the host needs the `libav*-dev` packages with
+  `pkg-config --modversion libavformat` answering. Without the flag the library reports
+  `capabilities.image=false` and refuses every image, so a media-free artifact is a deliberate
+  build choice, not a fault in the model.
+- **The KV tier moves opaque bytes.** A host-tier entry is gathered and scattered through
+  `gather_rows_u8` / `scatter_rows_u8`: one dword a thread, `n` and both pitches in bytes, and a
+  fragment whose width is a multiple of 4. The bytes are never elements: the bf16/f32 rows route a
+  value through the E4M3 codec, and a NaN payload would not survive the round trip.
+- **`M` is a band capacity, not a row count (R24).** The engine prepares the arguments once per
+  (op, band, domain), leaves the ranged parameter at the band's ceiling, and carries the live
+  extent in the issued tensors (`o.rows` after the issue's narrowing). A kernel that read the
+  ranged `M` as its loop bound would read and write past a shorter step; every row here takes its
+  bounds from the operands, and `rad-kbench --band-capacity` exercises the contract.
+- **MTP 48 table coverage is open (R23).** Flash-Next's MTP is served: this library declares
+  `mtp_enter` and `logit_rerank` (IQR and i8), and `NS=3` gives 1.82× the decode with identical
+  greedy text. What kbench still cannot pose is the container's MTP 48 **expert tables**
+  (`moe_gemm_q`), so their "Not covered" cases are a tooling gap, not a missing row.
+- **A joined weight may live in VRAM.** A row that reads a `rad.planes` header at issue must not
+  dereference it on the host (a W25 SIGSEGV in `gemm_nt_q_w2a8_m16`): derive the plane offsets
+  from the layout rule, or keep a host copy. The `w2a8` arm also picks an MT whose chunk divides
+  K (M=1/K=2560 uses MT=4).
 
 ## What is not here yet
 

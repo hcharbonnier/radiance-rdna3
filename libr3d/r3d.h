@@ -97,12 +97,14 @@ int r3d_scale_bf16(long x, long s, long y, int M, int n, int s_dt, int x_ld, int
 int r3d_scale_f32(long x, long s, long y, int M, int n, int s_dt, int x_ld, int y_ld, long stream);
 int r3d_fill(long y, int M, int n, int y_ld, int dt, float v, long stream);
 
-/* In-place rotary on a fused qkv row: q, then k; v is untouched. `mode` is R3D_ROPE_NEOX or
- * R3D_ROPE_GPTJ; `rot` the rotary width (<= head_dim, even). `scale` divides the position: the
- * angle of pair i is (pos / scale) * theta^-i, as in ref_rope. YaRN's magnitude (`yarn_factor`) is not
- * implemented. `pos` is M i32 positions, one per row. */
+/* In-place rotary on a fused qkv row: q, then k; v is untouched. `mode` is R3D_ROPE_NEOX,
+ * R3D_ROPE_GPTJ or R3D_ROPE_IMROPE; `rot` the rotary width (<= head_dim, even). `scale` divides the
+ * position: the angle of pair i is (pos / scale) * theta^-i, as in ref_rope. YaRN's magnitude
+ * (`yarn_factor`) is not implemented. With a rank-1 position plane `pos_cs` is 0 and `pos_rs` 1;
+ * an imrope plane is [3, M], component-major, and `s1`/`s2` are its first two sections' widths. */
 int r3d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_head, int n_head_kv, float theta,
-                  float scale, int mode, int rot, int qkv_ld, long stream);
+                  float scale, int mode, int rot, int qkv_ld, int pos_cs, int pos_rs, int s1,
+                  int s2, long stream);
 
 /* K and V into a paged cache at slot_mapping's slots. The cache is [blocks, kv_heads, block_size,
  * 2*head_dim] with the strides the shim reads off the operand (sb/sh/so/sd). A negative slot is
@@ -131,6 +133,12 @@ int r3d_gather_rows(long x, long idx, long y, int M, int n, int x_ld, int y_ld, 
                     long long src_rows, long stream);
 int r3d_scatter_rows(long v, long idx, long x, int M, int n, int v_ld, int x_ld, int dt,
                      long long dst_rows, long stream);
+/* The byte moves: the u8 row pair, opaque rows copied whole rather than through a codec. `n` and
+ * both pitches are bytes and must be whole dwords. */
+int r3d_gather_rows_u8(long x, long idx, long y, int M, int n, int x_ld, int y_ld,
+                       long long src_rows, long stream);
+int r3d_scatter_rows_u8(long v, long idx, long x, int M, int n, int v_ld, int x_ld,
+                        long long dst_rows, long stream);
 
 /* ================================================================== r3d_quant_fp8.hip
  *
@@ -346,6 +354,53 @@ int r3d_dflash_select(long cand, long unary, long hp, long anchor, long pred, lo
                       long long pred_ld, long long succ_ld, long long tok_ld, long stream);
 int r3d_sample_logprobs(long lg, long params, long stats, int M, int n_vocab, int k,
                         long long lg_ld, long long stats_ld, int vocab_off, long stream);
+
+/* ================================================================== r3d_embed_lookup_q.hip
+ * A gather from a quantised table: E4M3 codes with one table scale (or a plain bf16 table), one
+ * workgroup per output row. `sc_dt`/`tbl_dt`/`x_dt` are R3D_DT_*; `scale` may be 0. */
+int r3d_embed_lookup_q(long tok, long wte, long scale, long x, int M, int n_embd, int n_vocab,
+                       int vocab_offset, int x_ld, int w_ld, int sc_dt, int tbl_dt, int x_dt,
+                       long stream);
+
+/* ================================================================== r3d_ngram_hint.hip
+ * The draft pass's prefetch hint: one thread a sequence, hashing the n-gram ending at the newest
+ * token into `ids`, and maintaining the two-slot `tail` exactly as ngram_ids does. */
+int r3d_ngram_hint(long tok, long pos, long cu, long mult, long vsz, long off, long cidx,
+                   long tail, long ids, int n_seq, int heads, int ngram, int eos, int hist,
+                   int ids_ld, int slots, long stream);
+
+/* ================================================================== r3d_ple_gate_bf16.hip
+ * The signed-square-root dot gate over `hc` streams of width n. gv/gvn are [rows, hc*n] bf16;
+ * wk/wq/wc are the [hc*n] f32 gains. */
+int r3d_ple_gate(long k, long q, long v, long wk, long wq, long wc, long gv, long gvn, int M,
+                 int n, int hc, int k_ld, int q_ld, int v_ld, int g_ld, int gn_ld, float eps,
+                 float wadd, float geps, long stream);
+
+/* ================================================================== r3d_hc_bf16.hip
+ * The wide residual stream's read, write, entry and control-vector projection. The read needs
+ * `hc_read_scratch_bytes(M, lowrank, hc)` bytes (d and the stream scales). `mix_e4m3` selects the
+ * joined E4M3 rows whose stride and scale group are passed explicitly. Optional pointers are 0. */
+int64_t r3d_hc_read_scratch_bytes(int M, int lowrank, int hc);
+int r3d_hc_read(long h, long w, long down, long up, long injw, long x, long inj, long q, long qs,
+                long rq, long rs, long scratch, long long scratch_bytes, int M, int n, int hc,
+                int lr, float eps, float wadd, int group, int h_ld, int x_ld, int inj_ld,
+                int injw_ld, int q_ld, int qs_ld, int rq_ld, int rs_ld, int mix_e4m3, int q_dt,
+                int rq_dt, int x_dt, int down_ld, int down_stride, int down_G, int up_ld,
+                int up_stride, int up_G, long stream);
+int r3d_hc_write(long y, long inj, long h, int M, int n, int hc, int y_ld, int inj_ld, int h_ld,
+                 long stream);
+int r3d_hc_enter(long x, long h, int M, int n, int hc, int x_ld, int h_ld, int x_dt, int h_dt,
+                 long stream);
+int r3d_hc_project(long h, long v, long on, int M, int n, int hc, float scale, int h_ld, int on_ld,
+                   long stream);
+
+/* ================================================================== r3d_ar_hc_write.hip
+ * The one-rank collective form: moe_gather's sums and narrows, then hc_write. `sig` applies the
+ * sigmoid to the shared gate; sh/sg are 0 when the shared arm is absent. */
+int r3d_ar_gather_hc_write(long ye, long ew, long sorted, long sh, long sg, long y, long inj,
+                           long h, int M, int n, int hc, int top_k, int T, int ye_ld, int ew_ld,
+                           int y_ld, int inj_ld, int h_ld, int ew_f32, int sh_ld, int sg_ld,
+                           int sig, long stream);
 
 }  /* extern "C" */
 

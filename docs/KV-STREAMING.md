@@ -21,10 +21,13 @@ follows from its phase and row shape, both already in the pass key.
 The VRAM paged pool (`core/mem/kv.{h,cpp}`) is where a live sequence's KV lives. The idle tiers
 (`core/mem/kvtier.*`, `core/runtime/tierexec.*`) copy a finished conversation's blocks to pinned
 host memory and back on a prefix-cache hit: a hot cache whose unit is a published prefix entry,
-moved between identical layouts on publish and admission, in memory no kernel dereferences.
-Streaming needs many small, per-launch, selection-driven copies with a residency map, so it is a
-module of its own (§4.1). It keeps the tiers' two rules: never block the host on the step path, and
-order copies with events, not syncs (`spec.md` §5.4).
+moved between identical layouts on publish and admission, in memory no kernel dereferences. The
+move is one `gather_rows`/`scatter_rows` per (group, layer) at a `dtype` of `u8`: a KV fragment is
+opaque bytes, so `libr3d` serves it with its byte rows (`gather_rows_u8`, `scatter_rows_u8`, a
+dword per thread, `n` and both pitches in bytes) rather than the bf16/f32 rows whose element path
+goes through the E4M3 codec. Streaming needs many small, per-launch, selection-driven copies with
+a residency map, so it is a module of its own (§4.1). It keeps the tiers' two rules: never block
+the host on the step path, and order copies with events, not syncs (`spec.md` §5.4).
 
 ---
 

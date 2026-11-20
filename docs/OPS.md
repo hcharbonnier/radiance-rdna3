@@ -48,7 +48,10 @@ here is such a choice.
     (`docs/MOE-W4.md`).
   - `i8a8` is an i8 weight with a bf16 scale per (row, 128 of K) against an int8 activation on
     the same grid; `i8a8h` is that weight rotated by a 128-wide Walsh–Hadamard along K, its scale
-    carrying the 1/128 (libquant's `transform=fwht128`), met by `had_quant_act_i8g`.
+    carrying the 1/128 (libquant's `transform=fwht128`), met by `had_quant_act_i8g`. The IQ8R
+    group (256 of K, libquant's rotated i8) keeps the same code grid: the two 128-wide halves are
+    rotated independently and share **one** bf16 scale per (row, 256), the product of a u8 level
+    per 256 and a bf16 level per row (W27).
   - `w4a8_asym` is the unsigned-nibble-minus-zero-point grid instead of the symmetric one.
   - `fp8a8` and `fp8a16` say whether a block-scaled E4M3 weight meets an fp8 or a bf16 activation.
   - `fp8a8f32` is `fp8a8` with f32 weight scales on the 128x128 block grid. The host libraries
@@ -674,8 +677,10 @@ not slow. `libref/ref_quant.cpp` is the definition.
   each code the value over it rounded to nearest even and clamped to ±127, row-major. They feed the
   int8 trunk GEMM (`gemm_nt_q` at `dtype=i8a8`), which folds a scale per K block. The `had_` form
   rotates first and, like the rotated E4M3 form, folds nothing: its consumer is a weight at
-  `dtype=i8a8h`, whose scale carries the whole 1/`group`. It is not interchangeable with the
-  per-row `had_*` int8 forms, which fold 1/sqrt(`group`) into the activation's scale. `dequant`
+  `dtype=i8a8h`, whose scale carries the whole 1/128. It is not interchangeable with the
+  per-row `had_*` int8 forms, which fold 1/sqrt(`group`) into the activation's scale. At
+  `group=256` (IQ8R) the rotation is still 128-wide on each half and the single per-256 scale
+  carries the same 1/128, so the GEMM folds one int32 sum per 256 (W27). `dequant`
   inverts `quant_act_i8g`: the scale stream's extent gives the group count and `group` each group's
   width.
 
@@ -747,7 +752,10 @@ and is wrong, so these are separate ops.
 attention's gate is a column slice of the `[q|gate]` projection) with `had_quant_act_i8g`'s
 quantiser on its pass, for a gated attention's rotated out projection (`i8a8h`); `out_bf16` is the
 unrotated product. `n` is a multiple of 128; `group` is 128, or 256 for an IQ8R out projection (one
-scale per 256 columns of a (token, head) row).
+scale per 256 columns of a (token, head) row). The op is issued on the whole projection, so `x`,
+`q` and `out_bf16` are `[T, heads*head_dim]` while `n` names the head width, and `gate` is a
+`[T, heads, head_dim]` view whose head stride is wider than `head_dim`; a rotation block stays
+inside one head (W28).
 
 `rmsnorm_quant_i8` is `rmsnorm` with `quant_act_i8`'s quantiser on its pass: step-order int8 codes
 and one f32 scale per row, what `gemm_nt_q` reads at `dtype=w4a8` and `w8a8`. With `residual` the
@@ -2709,6 +2717,11 @@ whole tensor below. libr4d's `logits_gemm_vocab_iqr` decodes every class in one 
 every token of a prefill chunk instead of the last one per sequence: `n_tok / n_seq` times the work,
 and at `max_tok` 8192 against a 248K vocab the logits buffer alone is 8 GiB.
 
+A `dtype` of `u8` names **opaque byte rows** (the KV tier's fragments, where a row is one layer's
+bytes of one block): the move is a byte copy, not an element pass through a codec, so a NaN payload
+survives. libr3d's `gather_rows_u8` takes `n`, the source pitch and the destination pitch in bytes;
+all three are multiples of 4.
+
 ### `scatter_rows`
 
 | op | params | operands |
@@ -3137,22 +3150,43 @@ Five ops decompose one indexer, which scores blocks of key history against the q
 kernels), and libavx all five for the host path. `kv_resolve` sits between the last of them and the
 attention when the group's KV streams; it is described below, after `qsa_select`.
 
+These rows carry `M` as the ranged parameter, and on a row that parameter is the **band's
+capacity, not the step's row count** (R24): the engine prepares the arguments once per (op, band,
+domain) and leaves the band's ceiling in `M`, while the live extent travels in the issued tensors.
+Every kernel here takes its bounds from those extents (`k`'s rows, `out`'s or `score`'s rows,
+`page`'s length), so a one-row step inside a wide band is served; a kernel that read `M` as a row
+count would read and write past the step. `rad-kbench --band-capacity` is the test mode for that
+contract.
+
+The dtypes are the operands'. `qsa_tail_store`, `qsa_block_key` and `qsa_work` are bf16 only and
+constrain `dtype` to `bf16`. `qsa_score` has three rows on the `dtype` key, which names the query's
+dtype — `qsa_score_bf16`, `qsa_score_f16` and `qsa_score_f32` — each of which reads `bk` as bf16,
+f16 or f32 (widened exactly to f32) and writes f32 scores. `qsa_select` declares no `dtype` key:
+its score is f32 and its tables, counts and positions are i32.
+
 ### `qsa_block_key`
 
 The compressed key: one vector per `ratio` tokens of key history, against which the indexer's block
 scores are taken.
 
 ```
-out[b] = rope( rmsnorm( mean over j<ratio of k[b*ratio + j] ),  at position pos0 + b*ratio )
+out[b] = rope( rmsnorm( mean over j<ratio of k[b*ratio + j] ),  at the block's first position )
 ```
 
+`k` is `[M*ratio, n]` bf16 and `out` is `[M, n]` bf16; `w` is the f32 norm gain, `eps` the norm's
+epsilon and `wadd` a bias added to the gain. The norm is `x * rsqrt(mean(x^2) + eps) * (wadd + w)`
+over the rounded mean, the sum of squares accumulated in double as the reference does. The first
+position is `pos[b]` when the list is given and `pos0 + b*ratio` otherwise. `n` is at most 4096
+(one LDS row), `rotary_dim` is even and at most `n`, and `block_size` must equal `ratio`. `scale`
+is the position scale (the rotation evaluates `pos / scale`), so a YaRN ladder requires `scale` 1.
+
 The rotation is `rope`'s NeoX ladder over the first `rotary_dim` lanes, with `rope`'s YaRN
-coefficients when given, so a compressed key and the keys it summarises are rotated alike. With
-YaRN, `scale` must be 1.
+coefficients when given, so a compressed key and the keys it summarises are rotated alike.
 
 - **`M` is blocks and `k` is `ratio` times taller.** Every other op here has one output row per
   input row. A caller that sized `k` at the block count would pool rows of the next block into each
-  one, so libr4d's entry point checks it.
+  one, so libr4d's entry point checks it. The kernel takes the block count from `out`'s rows, or
+  from `page`'s length when the list is given; the ranged `M` is the band's capacity (R24).
 - **The mean is accumulated in f32 and rounded to the activation dtype before the norm**, the
   reference's order (`key_groups.float().mean(dim=1).to(raw_keys.dtype)`). Carrying f32 into the
   norm gives a small, systematic difference on every block of every layer.
@@ -3203,17 +3237,28 @@ score[m][b] = ( sum over heads h of relu( q[m][h] . bk[bt[seq(m)][b]] ) ) / sqrt
   their launch from the declared width (the live count is device data, the grid a host number). The
   architecture narrows the score operand's column count to
   `(max_ctx_len + n_tok + n_spec + ratio) / ratio + 1`, which the batch carries on the host, and the
-  pitch stays the declaration's. Every term is deliberate slack: an underestimate drops blocks from
+  pitch stays the declaration's. The kernel's own bound is
+  `min(nc[seq], the table's width, the score plane's width)`, so it walks the issued planes rather
+  than the `blocks` declaration. Every term is deliberate slack: an underestimate drops blocks from
   the selection silently, and the `+ 1` keeps `n < blocks`, which makes `qsa_select`'s partial page
   `bt[n]` readable.
 - **The relu is per (block, head) and the sum over heads**, in that order: independent votes, each
   of which can only argue for a block. Summing first would let one head's large negative cancel
   another's positive, a different model that still ranks blocks plausibly.
+- **`dtype` belongs to the query, and `bk` is independent of it.** `qsa_score_bf16`,
+  `qsa_score_f16` and `qsa_score_f32` are selected on `q`'s dtype; `bk` may be bf16, f16 or f32
+  under any of them (the block-key group is bf16 in practice), widened to f32 exactly. The
+  accumulation is f32 and `score` is f32 in every form, so an f16 query is widened, not rounded
+  twice. The row constrains nothing else: any `n`, head count and block count are served.
 - **`bt` holds page ids, not block indices.** The attention KV group is paged at the compress ratio,
   so a block and a page are the same thing: the sequence's block table is already the list to score,
   and the top-k of the output is already the table the attention reads.
 - **A negative table entry scores `-inf`, not zero.** A table is padded to its declared width and a
-  real score can be zero (every head vetoed the block), so zero would let padding outrank it.
+  real score can be zero (every head vetoed the block), so zero would let padding outrank it. A page
+  id at or past the store's page count is the other edge: the reference refuses it before writing
+  anything (`RAD_E_INVAL`), and a device launch cannot read the table, so the kernel leaves that
+  element unwritten rather than fault. The in-band "absent block" is the negative id, and it is
+  written.
 
 ### `qsa_select`
 
@@ -3256,6 +3301,9 @@ with the partial page appended.
   and the length is one past it. Without a tail, `pos%ratio` is `ratio-1` and this collapses to
   `nsel*ratio`, every selected page fully visible. The op emits it because it is one store off a
   number it already has.
+- **The operands are fixed-width and unkeyed.** `score` is f32 `[M, blocks]`; `bt`, `nc`, `pos`,
+  `cu` and the three outputs are i32. The row declares no `dtype`, constrains `blocks`, `topk`,
+  `ratio` and `seqs` to at least 1, and pads `sel` with `-1` from `nsel` to `topk + 1` on every row.
 
 libr4d's kernel takes scratch (sized by the row's scratch hook; it is not an operand). With it, a
 launch of at most 32 query rows cuts the block list into up to 16 chunks, takes each chunk's own
@@ -3329,6 +3377,10 @@ Parks the raw index keys of the tokens that have not completed a block yet:
 `state[sidx[s][0]][pos[t] % ring] = k[t]`. A block key is the mean of `ratio` consecutive raw keys,
 so at decode most of a block's keys come from earlier steps and something must carry them.
 
+`k` is `[T, n]` bf16, `state` is bf16 `[slots, 1, ring, n]` (inout), and `pos`, `cu` and `sidx`
+are i32. The row constrains `dtype` to `bf16` and `seqs` to at least 1, and the kernel refuses a
+`ring` below `ratio`.
+
 - **The tail is a linear KV state, not a plane indexed by the batch row.** It is read on a later step
   than the one that wrote it, and it has two axes a buffer cannot express: the layer (the keys are
   `index_qk_proj`'s output, a per-layer weight) and the sequence. The batch row is step-local (the
@@ -3353,6 +3405,11 @@ so at decode most of a block's keys come from earlier steps and something must c
   loop leaves.
 - **`state` is inout, and rows nothing targets keep what they held**: at decode a handful of rows
   are written and the rest are what the next block key needs.
+- **The live token count is `k`'s first extent, not the ranged `M`.** The ranged value is the
+  band's capacity (R24); the kernel launches one block a row of `k` and reads the slot pool from
+  `state`'s leading extent. The shape hook describes `state` with an `M`-row leading extent, one
+  slot per token, so a tool draws a case in which every token has its own slot; that is a
+  description, not the group's real slot count.
 
 ### `qsa_work`
 
@@ -3368,10 +3425,16 @@ beside it. The block-key kernel never learns that there were two sources. The co
 per completing block (512 KiB per layer for a 2048-token prefill chunk); the alternative is a
 block-key kernel with two sources, a per-key source selector and a tail layout.
 
+`k`, `state` and `stage` are bf16; `pos`, `cu`, `sidx`, `bt`, the optional `rope`, `page`, `bpos`
+and `nc` are i32. The row constrains `dtype` to `bf16` and `n`, `ratio`, `seqs` and `work` to at
+least 1, and the kernel refuses a `ring` below `ratio`.
+
 - **`M` is tokens and `work` is blocks**: one block per `ratio` tokens plus at most one straddling
-  block per sequence. `work` is a host bound on how many blocks can complete, not a count of how many
-  did (that is device data); slots past the count get `page = -1`, which `qsa_block_key` skips, so
-  the bound costs empty workgroups, never a wrong answer.
+  block per sequence. `work` is a capacity (`RAD_PROLE_CAPACITY`), a host bound on how many blocks
+  can complete, not a count of how many did (that is device data); slots past the count get
+  `page = -1`, which `qsa_block_key` skips, so the bound costs empty workgroups, never a wrong
+  answer. The launch walks `page`'s issued extent and the live token count is `k`'s rows; the
+  ranged `M` is the band's capacity (R24), and neither it nor the `work` capacity is a loop bound.
 - **`bt` is the block-key group's table**, not the attention group's (`docs/QSA.md` explains the
   two).
 - **`state` and `sidx` are the tail**, read at row `q % ring` of slot `sidx[s][0]` (see

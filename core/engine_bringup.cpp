@@ -1611,6 +1611,13 @@ int Engine::declare() {
  * an expert's weights. */
 static constexpr int64_t kArenaGuard = 1ll << 20;
 
+/* The smallest pass the prefill stager arms for. The ring copies a layer's pooled experts whole,
+ * whatever the pass routes, so a chunk of a few dozen rows pays the whole copy for a fraction of
+ * its work: served, an 82-token chunk staged took 0.81 s against 0.72 s reading in place, and the
+ * 67-row tail of a 963-token prompt is the same shape. 256 rows is the arena's smallest level,
+ * where a chunk's compute starts to cover the copy. */
+static constexpr int64_t kStagerMinRows = 256;
+
 /* The activation arena's smaller levels, sized by the plugin itself.
  *
  * Activations are declared for the largest step, but a decode step uses a few dozen of a prefill
@@ -3735,8 +3742,9 @@ int Engine::load_weights() {
                  humanb(r->pools.weights().used() + r->pools.weights().avail()).c_str());
 
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
-         * returns RAD_OK with `enabled() == false`. */
-        RAD_TRY(r->heat.init(r->plan, HeatParams{}));
+         * returns RAD_OK with `enabled() == false`. The move budget follows the plan's residency
+         * unless --expert-moves names one (heat_params_for). */
+        RAD_TRY(r->heat.init(r->plan, heat_params_for(r->plan, cfg_.expert_moves)));
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory
          * the process does not own, which on this driver does not fault: the copy never completes
@@ -4887,16 +4895,18 @@ int Engine::start() {
                 r->arena_low_off = std::min(off, r->program.arena_stage_off);
             }
             char* const base = (char*)r->ctx.arena_base();
+            r->sched_stage_rows = top_level + 1;
             RAD_TRY(r->stager.init(r->program, r->plan, &r->mover,
                                    base + r->program.arena_stage_off,
                                    r->arena_low_off >= 0 ? base + r->arena_low_off : nullptr,
-                                   r->program.arena_stage_bytes, top_level + 1));
+                                   r->program.arena_stage_bytes, kStagerMinRows));
             if (r->stager.enabled() && r->index == 0)
-                RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of more "
-                         "than %lld tokens copies the pooled experts of %zu routed layers onto "
+                RAD_INFO("prefill staging: a %s ring at the top of the arena; a step of at least "
+                         "%lld tokens copies the pooled experts of %zu routed layers onto "
                          "the card up to %d layers ahead of the layers that read them",
-                         humanb(r->stager.ring_bytes()).c_str(), (long long)top_level,
-                         r->stager.n_layers(), (int)PrefillStager::lead());
+                         humanb(r->stager.ring_bytes()).c_str(),
+                         (long long)r->stager.min_rows(), r->stager.n_layers(),
+                         (int)PrefillStager::lead());
         }
         /* The file stager, wherever a routed expert is on the file tier (static or dynamic plan;
          * such a unit has no other address). Routing-aware reads take this
@@ -5024,23 +5034,41 @@ int Engine::start() {
         for (auto& r : ranks_) {
             RAD_TRY(rad_dev_set(r->device));
             r->arena_lent.assign(1, 0);
+            r->arena_lent_full.assign(1, 0);
+            r->arena_ring_top.assign(1, 0);
             const Program& P = r->program;
             const int64_t top = P.arena_bytes;
             for (const ArenaLevel& lv : r->arena_levels) {
                 if (r->ctx.add_level(lv.rows, lv.offset, lv.decl) < 0) { ok = false; break; }
                 /* The span's shared level keeps the stager's ring above its buffers: it lends
-                 * what is above the ring. */
-                const bool ring = lv.rows == arena_span_rows_ && r->arena_low_off >= 0 &&
-                                  r->stager.enabled();
-                const int64_t edge = ring
-                    ? (r->arena_low_off + P.arena_stage_bytes + RAD_ALIGN_UNIT - 1) /
+                 * what is above the ring. Every other level keeps the ring at the arena's top
+                 * when its buffers clear it, so a pass at that level is staged too: it lends
+                 * only what lies between its buffers and the ring. `arena_lent_full` is the same
+                 * loan with the ring lent back, which a pass that does not stage takes. */
+                const bool ring_top = lv.rows != arena_span_rows_ && r->stager.enabled() &&
+                                      P.arena_stage_bytes > 0 &&
+                                      P.arena_stage_off >= lv.end + kArenaGuard;
+                const bool ring_span = lv.rows == arena_span_rows_ && r->arena_low_off >= 0 &&
+                                       r->stager.enabled();
+                const int64_t edge_full = (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) /
+                                          RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
+                const int64_t edge = ring_top
+                    ? (lv.end + kArenaGuard + P.arena_stage_bytes + RAD_ALIGN_UNIT - 1) /
                           RAD_ALIGN_UNIT * RAD_ALIGN_UNIT
-                    : (lv.end + kArenaGuard + RAD_ALIGN_UNIT - 1) / RAD_ALIGN_UNIT * RAD_ALIGN_UNIT;
-                r->arena_lent.push_back(top > edge ? top - edge : 0);
+                    : ring_span
+                          ? (r->arena_low_off + P.arena_stage_bytes + RAD_ALIGN_UNIT - 1) /
+                                RAD_ALIGN_UNIT * RAD_ALIGN_UNIT
+                          : edge_full;
+                const int64_t lent = top > edge ? top - edge : 0;
+                r->arena_lent.push_back(lent);
+                r->arena_lent_full.push_back(ring_span ? lent
+                                            : top > edge_full ? top - edge_full : 0);
+                r->arena_ring_top.push_back(ring_top ? 1 : 0);
             }
             if (!ok) break;
             int64_t most = 0;
             for (int64_t b : r->arena_lent) most = std::max(most, b);
+            for (int64_t b : r->arena_lent_full) most = std::max(most, b);
             if (most <= 0) continue;
             LoanStrip st;
             st.top = (char*)r->ctx.arena_base() + top;

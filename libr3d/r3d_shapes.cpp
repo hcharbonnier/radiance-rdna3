@@ -1,4 +1,4 @@
-/* r3d_shapes.cpp -- the extent and content domain of each operand of an op at a geometry.
+﻿/* r3d_shapes.cpp -- the extent and content domain of each operand of an op at a geometry.
  *
  * libr3d's side of the `RadShapeFn` hook. The component that reads an operand knows its extent,
  * and a row that exists only here is invisible to the hand-written table in `tools/`. Correctness
@@ -35,6 +35,7 @@
  */
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #include "r3d_plugin.h"
@@ -255,6 +256,35 @@ int r3d_shape_rope(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     R3D_PICK(list);
 }
 
+/* The vision tower's axial rotary: the same fused qkv row, and a [2, M] integer position plane
+ * (component-major, row then column). The two sections must fill rotary_dim / 2; a geometry that
+ * does not state them is not this op's. */
+int r3d_shape_rope_axial(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M   = gi(p, n_p, "M", 0);
+    const int64_t hd  = gi(p, n_p, "head_dim", 0);
+    const int64_t nh  = gi(p, n_p, "n_head", 0);
+    const int64_t nkv = gi(p, n_p, "n_head_kv", nh);
+    const char* sec = gs(p, n_p, "sections");
+    int n = 0, s[2] = { 0, 0 };
+    const char* q = sec;
+    for (; q && *q && n < 2; ) {
+        char* end = nullptr;
+        const long v = std::strtol(q, &end, 10);
+        if (end == q || v <= 0) return RAD_E_UNSUPPORTED;
+        s[n++] = (int)v;
+        q = end;
+    }
+    while (q && (*q == ' ' || *q == ',')) ++q;
+    if (q && *q) return RAD_E_UNSUPPORTED;
+    if (M <= 0 || hd <= 0 || hd % 2 || nh <= 0 || nkv < 0 || n != 2 || s[0] + s[1] != hd / 2)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd((uint32_t)RAD_BF16, M, (nh + 2 * nkv) * hd),   /* qkv, INOUT */
+        opd((uint32_t)RAD_I32, 2, M)                      /* positions [2, M] */
+    };
+    R3D_PICK(list);
+}
+
 /* K and V into a paged cache. Two blocks of slack over the tokens, so the slot mapping is not a
  * dense prefix. Only the cache takes `kv_dtype`; k and v are always bf16. */
 int r3d_shape_kv_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
@@ -273,6 +303,31 @@ int r3d_shape_kv_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
         opd(KV, nb, kvh, bs, 2 * hd)                                /* kv_cache, INOUT */
     };
     R3D_PICK(list);
+}
+
+/* The int8 slot: 256 K codes, 256 V codes and the two f16 scales, so the last dim is
+ * 2*head_dim+4 rather than 2*head_dim. */
+int r3d_shape_kv_store_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M   = gi(p, n_p, "M", 0);
+    const int64_t hd  = gi(p, n_p, "head_dim", 0);
+    const int64_t kvh = gi(p, n_p, "n_head_kv", 0);
+    const int64_t bs  = gi(p, n_p, "block_size", 0);
+    if (M <= 0 || hd <= 0 || kvh <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t nb = (M + bs - 1) / bs + 2;
+    const RadOpdDesc list[] = {
+        opd((uint32_t)RAD_BF16, M, kvh, hd),                        /* k */
+        opd((uint32_t)RAD_BF16, M, kvh, hd),                        /* v */
+        opd_idx(M, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),              /* slot_mapping */
+        opd((uint32_t)RAD_I8, nb, kvh, bs, 2 * hd + 4)              /* kv_cache, INOUT */
+    };
+    R3D_PICK(list);
+}
+
+/* The rope table's rows are written at a position's own row and the table holds f32, so a random
+ * cos/sin draw would not be a rotation; the device test in r3d_selftest builds it. */
+extern "C" int r3d_shape_rope_table(const RadParam*, int, int, RadOpdDesc*)
+{
+    return RAD_E_UNSUPPORTED;
 }
 
 /* x[r] = wte[ids[r] - vocab_offset]. Ids are global, so the draw's bound is `vocab_offset + n_vocab`:
@@ -398,10 +453,109 @@ int r3d_shape_kv_len_trim(const RadParam* p, int n_p, int operand, RadOpdDesc* o
 int r3d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const int64_t ring = gi(p, n_p, "ring", 0), seqs = gi(p, n_p, "seqs", 0);
+    /* The described tail gives every token its own slot, as libref's does: the state's leading
+     * extent is M, not the number of sequences, and a tool draws the same case for both. */
     const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, n), opd((uint32_t)RAD_I32, M, 1),
                                 opd((uint32_t)RAD_I32, seqs + 1, 1),
-                                opd((uint32_t)RAD_BF16, seqs, 1, ring, n),
+                                opd((uint32_t)RAD_BF16, M, 1, ring, n),
                                 opd((uint32_t)RAD_I32, seqs, 1) };
+    R3D_PICK(list);
+}
+
+/* The QSA compressed key: k [M*ratio, n], w [n] f32, page [M], pos [M], out [M, n]. */
+int r3d_shape_qsa_block_key(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t r = gi(p, n_p, "ratio", 4);
+    if (M <= 0 || n <= 0 || r <= 0) return RAD_E_UNSUPPORTED;
+    if (M > 0x7fffffffffffffffLL / r) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = { opd(D, M * r, n), opd((uint32_t)RAD_F32, n),
+                                opd_idx(M, M), opd_idx(M, M * r), opd(D, M, n) };
+    R3D_PICK(list);
+}
+
+/* The QSA block score: q [M, heads*n], bk [pages, n] (a page holds exactly n contiguous values;
+ * a KV cache's rank is a container detail), `bt` [seqs, blocks] page ids, `cu` [seqs+1], `nc`
+ * [seqs], and score [M, blocks] f32. The table's entries index the key store, and cu is the join
+ * from a query row to its sequence. */
+int r3d_shape_qsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t h = gi(p, n_p, "heads", 0), nb = gi(p, n_p, "blocks", 0);
+    const int64_t s = gi(p, n_p, "seqs", 1);
+    if (n <= 0 || h <= 0 || nb <= 0 || s <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd(D, M, h * n),                                /* q */
+        opd(D, nb, n),                                   /* bk, one page a row */
+        opd_idx(s, 0, -1, 0, nb),                        /* bt: page ids below nb */
+        opd_idx(s + 1, M + 1, -1, RAD_OPD_F_IDX_CU, 1),  /* cu: cumulative query rows */
+        opd_idx(s, nb + 1, -1, 0, 1),                    /* nc: complete blocks, 0 .. nb */
+        opd((uint32_t)RAD_F32, M, nb)                    /* score */
+    };
+    R3D_PICK(list);
+}
+
+/* The number of sequences a description can hold: every sequence needs at least one row. This is
+ * libref's qsa_seqs, so a geometry stating more sequences than tokens describes the same case for
+ * both libraries. */
+int64_t qsa_seqs(const RadParam* p, int n_p, int64_t M) {
+    const int64_t s = gi(p, n_p, "seqs", 1);
+    const int64_t m = s < M ? s : M;
+    return m > 1 ? m : 1;
+}
+
+/* The QSA selection: score [M, blocks] f32, the sequence's table [seqs, blocks] i32, the live
+ * count [seqs], each query's position [M], the join [seqs+1], and the table [M, topk+1] with its
+ * two per-query scalars. The table is filled with page 0 (every block live) and `nc` with the
+ * declared width, so a generic draw selects rather than reads padding; `cu` is one sequence over
+ * every row, which is a valid join for a case with no boundaries to hold. */
+int r3d_shape_qsa_select(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), blocks = gi(p, n_p, "blocks", 0);
+    const int64_t topk = gi(p, n_p, "topk", 0), ratio = gi(p, n_p, "ratio", 0);
+    const int64_t seqs = gi(p, n_p, "seqs", 0);
+    if (M <= 0 || blocks <= 0 || topk <= 0 || ratio <= 0 || seqs <= 0)
+        return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd((uint32_t)RAD_F32, M, blocks),                       /* score */
+        opd_idx(seqs, blocks, 0, 0, blocks),                     /* bt: page 0 everywhere */
+        opd_idx(seqs, blocks + 1, blocks),                       /* nc: the declared width */
+        opd_idx(M, 0, blocks * ratio - 1),                       /* pos: the last block boundary */
+        opd_idx(seqs + 1, 0, 0),                                 /* cu: every row in sequence 0 */
+        opd((uint32_t)RAD_I32, M, topk + 1),                     /* sel */
+        opd((uint32_t)RAD_I32, M),                               /* nsel */
+        opd((uint32_t)RAD_I32, M)                                /* seqused */
+    };
+    R3D_PICK(list);
+}
+
+/* The QSA work list: `M` is tokens, `work` is the block bound, and the two extents differ. The
+ * `cu` description is cumulative when a tool honours the flag (pos is pinned to zero, so no block
+ * completes and the description is safe for every geometry a cold launch can build). The one-
+ * component `bpos` form is described; `rope` stays absent. */
+int r3d_shape_qsa_work(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ratio = gi(p, n_p, "ratio", 0), ring = gi(p, n_p, "ring", 0);
+    const int64_t seqs = gi(p, n_p, "seqs", 0), work = gi(p, n_p, "work", 0);
+    if (M <= 0 || n <= 0 || ratio <= 0 || ring < ratio || seqs <= 0 || work <= 0)
+        return RAD_E_UNSUPPORTED;
+    /* The sequence count the work list can address: libref's clamp to M, and no more than the
+     * block bound. Everything with a sequence extent uses it, so `nc` is exactly the count the
+     * kernel derives from `cu`'s extent. */
+    const int64_t s = qsa_seqs(p, n_p, M);
+    const int64_t S = s < work ? s : work;
+    const RadOpdDesc list[] = {
+        opd((uint32_t)RAD_BF16, M, n),                       /* k */
+        opd_idx(M, 1, 0),                                    /* positions */
+        opd_idx(S + 1, 1, 0, RAD_OPD_F_IDX_CU),              /* cu_seqlens */
+        opd((uint32_t)RAD_BF16, S, 1, ring, n),              /* the tail state */
+        opd_idx(S, 1, 0, 0, 1),                              /* the state row, column 0 */
+        opd_idx(S, work, 0, 0, work),                        /* the block-key table */
+        opd_none(),                                          /* rope: the one-component form */
+        opd((uint32_t)RAD_BF16, work * ratio, n),            /* stage */
+        opd((uint32_t)RAD_I32, work),                        /* page */
+        opd((uint32_t)RAD_I32, work),                        /* bpos */
+        opd((uint32_t)RAD_I32, S)                            /* nc */
+    };
     R3D_PICK(list);
 }
 
@@ -460,6 +614,17 @@ int r3d_shape_gated_had_quant_i8g(const RadParam* p, int n_p, int operand, RadOp
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
     const RadOpdDesc list[] = { opd(D, M, 2 * n), opd((uint32_t)RAD_I8, M, n),
+                                opd((uint32_t)RAD_F32, M, ng), opd(D, M, n) };
+    R3D_PICK(list);
+}
+
+/* The gate in its own operand: gate [M, n], x [M, n], q [M, n] i8 (row-major), scale
+ * [M, n/group], out_bf16 [M, n] (optional). */
+int r3d_shape_gate_had_quant_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    const RadOpdDesc list[] = { opd(D, M, n), opd(D, M, n), opd((uint32_t)RAD_I8, M, n),
                                 opd((uint32_t)RAD_F32, M, ng), opd(D, M, n) };
     R3D_PICK(list);
 }
@@ -534,6 +699,30 @@ int r3d_shape_gemm_nt_f32(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     R3D_PICK(list);
 }
 
+
+/* The vision tower's linear: the same operands as gemm_nt plus a per-column bias, and the
+ * optional residual the epilogue adds. The description passes the residual, so the generic
+ * checks exercise that epilogue; a band that omits it sends a null operand. */
+int r3d_shape_gemm_nt_bias(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
+    const RadOpdDesc list[] = {
+        opd(D, M, K), opd(D, N, K), opd(D, N), opd(D, M, N), opd(D, M, N)
+    };                                                     /* a, b, bias, res, y */
+    R3D_PICK(list);
+}
+
+/* grid_embed: x [M, n] in place, the side x side table, and [4, M] coordinates drawn over the
+ * table's side so some rows exercise the clamped taps (libref's own description). */
+int r3d_shape_grid_embed(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), side = gi(p, n_p, "side", 0);
+    if (M <= 0 || n <= 0 || side <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd(D, M, n), opd(D, side * side, n), opd_idx(4, side, -1, 0, M)
+    };                                                     /* x, table, coord */
+    R3D_PICK(list);
+}
 
 /* The vocabulary projection, transcribed from ref_logits_gemm_shape: x [M, n_embd] and the head
  * [n_vocab, n_embd] in the activation's dtype, logits in f32 because every sampler stage reads
@@ -702,6 +891,45 @@ int r3d_shape_rmsnorm_quant_fp8(const RadParam* p, int n_p, int operand, RadOpdD
     R3D_PICK(list);                          /* x, residual, w, q, scale, out_bf16 */
 }
 
+/* The fused add + norm + rotated int8 quantiser: the same operands as rmsnorm_quant_fp8, with `q`
+ * int8 (row-major) and one f32 scale per scale group (128, or 256 for IQ8R). */
+int r3d_shape_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    const RadOpdDesc list[] = { opd(D, M, n), opd(D, M, n), opd(D, n),
+                                opd((uint32_t)RAD_I8, M, n), opd((uint32_t)RAD_F32, M, ng),
+                                opd((uint32_t)RAD_BF16, M, n) };
+    R3D_PICK(list);                          /* x, residual, w, q, scale, out_bf16 */
+}
+
+/* gemm_nt_q_gated over a rotated int8 (i8a8h) IQR weight: `a` is the trunk's int8 codes with one
+ * f32 scale per (row, `group` of K), `q` is int8 over the gate's n columns with one group-wide
+ * scale, and the intermediate gate_up is the row's scratch. `group` is 128 (the ffn fold) or 256
+ * (IQ8R's gated feed-forward). The logical shapes match gemm_nt_q's i8a8 operands; b/b_scale carry
+ * the IQR private layout, declared by the row's layout hooks. */
+int r3d_shape_gemm_nt_q_gated_i8a8h(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), N = gi(p, n_p, "N", 0), K = gi(p, n_p, "K", 0);
+    const int64_t group = gi(p, n_p, "group", 0);
+    const char* dt = gs(p, n_p, "dtype");
+    if (!dt || std::strcmp(dt, "i8a8h") != 0) return RAD_E_UNSUPPORTED;
+    if (M < 1 || M > 16 || N < 2 || (N & 1) || K < 128) return RAD_E_UNSUPPORTED;
+    if (group != 128 && group != 256) return RAD_E_UNSUPPORTED;
+    if (K % group) return RAD_E_UNSUPPORTED;
+    const int64_t n = N / 2, kb = K / group;
+    if (n % group) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd((uint32_t)RAD_I8, M, K),              /* a: the rotated int8 trunk's codes */
+        opd((uint32_t)RAD_F32, M, kb),            /* a_scale */
+        opd((uint32_t)RAD_I8, N, K),              /* b: IQR codes, gate rows [0,n) then up */
+        in_unit(opd((uint32_t)RAD_F32, N, kb)),   /* b_scale: the container's IQR form */
+        opd((uint32_t)RAD_I8, M, n),              /* q */
+        opd((uint32_t)RAD_F32, M, n / group),     /* scale */
+        opd((uint32_t)RAD_BF16, M, n),            /* out_bf16, optional */
+    };
+    R3D_PICK(list);
+}
+
 /* Paged attention over one sequence. A context equal to the query length exercises no deep paging,
  * KV split or window, so `ctx` wins when given and is never below the query. `q_len` is the ranged
  * parameter; decode and prefill chunks are different kernels (docs/OPS.md). */
@@ -774,6 +1002,24 @@ int r3d_shape_mla_attn_paged(const RadParam* p, int n_p, int operand, RadOpdDesc
     R3D_PICK(list);
 }
 
+
+/* The head_dim-256 int8 rows' operand description: not described, for libref's reason. A slot's
+ * two f16 scales cannot be drawn at random (the test builds a cache whose K row is constant and
+ * whose V codes are exact integers), so a kbench case is skipped rather than fabricated; the
+ * device test in r3d_selftest.cpp covers the row. */
+extern "C" int r3d_shape_attn_paged_i8(const RadParam*, int, int, RadOpdDesc*)
+{
+    return RAD_E_UNSUPPORTED;
+}
+
+/* Dense attention's cu_seqlens is a monotone boundary plane ending at the row count. No fill code
+ * expresses that: a random draw would make a segment point past the q/k/v planes and the row would
+ * read out of bounds. The device test in r3d_selftest.cpp builds the boundaries by hand, as it does
+ * for the h256 cache. */
+extern "C" int r3d_shape_attn_dense(const RadParam*, int, int, RadOpdDesc*)
+{
+    return RAD_E_UNSUPPORTED;
+}
 
 /* Exact per-row top-R. `pairs` packs an int32 id's bits in the first slot beside its value, in an
  * f32 plane. */
@@ -850,6 +1096,30 @@ int r3d_shape_gemm_nt_q_gated(const RadParam* p, int n_p, int operand, RadOpdDes
     R3D_PICK(list);
 }
 
+/* DFlash2's grouped dynamic depthwise convolution, slot for slot from libref's shape hook. `delta`
+ * is declared at the coefficient projection's rank so the descriptor carries the pitch the slice is
+ * read at; x and out are [T, hidden_size]. */
+int r3d_shape_dflash_conv(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t T    = gi(p, n_p, "T", 0);
+    const int64_t H    = gi(p, n_p, "hidden_size", 0);
+    const int64_t taps = gi(p, n_p, "taps", 0);
+    const int64_t NG   = gi(p, n_p, "NG", 0);
+    const int64_t grp  = gi(p, n_p, "group_size", 0);
+    const uint32_t D   = act_dt(p, n_p);
+    /* The entry point's conditions: NG is H/group and a thread owns eight channels. */
+    if (T <= 0 || H <= 0 || taps <= 0 || NG <= 0 || grp <= 0) return RAD_E_UNSUPPORTED;
+    if (H % (grp * 8) || NG != H / grp) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = {
+        opd(D, T, H),
+        /* A slice of the [T, 2, taps, NG] projection, row pitch 2*taps*NG: a packed pitch would
+         * silently read the other half's coefficients. */
+        opd(D, T, 2, taps, NG),
+        opd(D, taps, H),                    /* base: the [taps, H] weight, contiguous */
+        opd(D, T, H),                       /* out; must not alias x */
+    };
+    R3D_PICK(list);
+}
+
 /* DFlash2's candidate walk, slot for slot from libref's shape hook. `cand` and `anchor` hold token
  * ids bounded by n_vocab so the codebook gather stays inside the plane; cand/unary/hp carry one
  * row per (sequence, step), M * steps. */
@@ -903,6 +1173,27 @@ int r3d_shape_sample_topk(const RadParam* p, int n_p, int operand, RadOpdDesc* o
         opd((uint32_t)RAD_I32, M, nc), opd((uint32_t)RAD_F32, M, nc),
         opd((uint32_t)RAD_I32, M, 2 * nc)
     };                            /* logits, params, cand_idx, cand_val (logits, not probs), pairs */
+    R3D_PICK(list);
+}
+
+/* The tensor-parallel collectives. `numel` is the largest message the instance carries: init
+ * sizes the peer scratch from it and the launch reads the real count off the tensor. The all-
+ * reduce's optional `y` is described so a caller that passes one is checked against the same
+ * extent; absent means in place. A gather's output is world_size times this rank's contribution,
+ * at the same total extent whether it is flat or row-interleaved. */
+int r3d_shape_all_reduce(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t numel = gi(p, n_p, "numel", 0);
+    const uint32_t D = act_dt(p, n_p);
+    if (numel <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = { opd(D, numel), opd(D, numel) };
+    R3D_PICK(list);
+}
+int r3d_shape_all_gather(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t numel = gi(p, n_p, "numel", 0);
+    const int64_t world = gi(p, n_p, "world_size", 0);
+    const uint32_t D = act_dt(p, n_p);
+    if (numel <= 0 || world <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = { opd(D, numel), opd(D, world * numel) };
     R3D_PICK(list);
 }
 

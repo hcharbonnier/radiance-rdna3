@@ -707,18 +707,18 @@ int kf_draw_table(const KfOperand& d, size_t k, std::vector<uint8_t>* out, std::
     }
     out->assign((size_t)(per * ne), 0);
     std::vector<std::vector<uint8_t>> pl;
-    std::vector<uint8_t> logical;
+    std::vector<uint8_t> logical_bytes;
     for (int64_t e = 0; e < ne; ++e) {
         kf_draw_entry_planes(d, k, e, &pl);
         std::string w;
-        const int rc = kf_planes_logical(one, pl, &logical, &w);
-        if (rc != RAD_OK || (int64_t)logical.size() != per) {
+        const int rc = kf_planes_logical(one, pl, &logical_bytes, &w);
+        if (rc != RAD_OK || (int64_t)logical_bytes.size() != per) {
             if (why) *why = rc != RAD_OK ? w : "an expert decodes to a different size than the "
                                                "table holds";
             out->assign((size_t)(per * ne), 0);
             return rc != RAD_OK ? rc : RAD_E_SHAPE;
         }
-        std::memcpy(out->data() + per * e, logical.data(), (size_t)per);
+        std::memcpy(out->data() + per * e, logical_bytes.data(), (size_t)per);
     }
     return RAD_OK;
 }
@@ -752,6 +752,31 @@ int kf_lay_table(const RadKernelInfo* info, const RadParam* p, int n_p, int oper
         }
         out->insert(out->end(), laid.begin(), laid.end());
     }
+    return RAD_OK;
+}
+
+int kf_lay_entries(const RadKernelInfo* info, const RadParam* p, int n_p, int operand,
+                   const KfOperand& d, const KfEntryPlanes& planes, RadLayout* lay,
+                   std::vector<std::vector<uint8_t>>* out) {
+    out->clear();
+    if (!info || !info->layout || !d.has_enc) return RAD_E_UNSUPPORTED;
+    if (d.shape.size() < 2 || d.shape[0] <= 0) return RAD_E_SHAPE;
+    const KfOperand one = kf_table_entry(d);
+    std::vector<std::vector<uint8_t>> pl;
+    RadLayout first{};
+    out->resize((size_t)d.shape[0]);
+    for (int64_t e = 0; e < d.shape[0]; ++e) {
+        int rc = planes(e, &pl);
+        if (rc != RAD_OK) return rc;
+        RadLayout le{};
+        rc = kf_lay_weight(info, p, n_p, operand, one, pl, &le, &(*out)[(size_t)e]);
+        if (rc != RAD_OK) return rc;
+        if (e == 0)
+            first = le;
+        else if (le.bytes != first.bytes || le.dtype != first.dtype || le.align != first.align)
+            return RAD_E_SHAPE;
+    }
+    *lay = first;
     return RAD_OK;
 }
 
@@ -858,11 +883,92 @@ int kf_planes_logical(const KfOperand& d, const std::vector<std::vector<uint8_t>
                       std::vector<uint8_t>* out, std::string* why) {
     const int64_t n = rad_numel(d.shape);
     out->assign((size_t)rad_dtype_bytes(d.dtype, n), 0);
+    /* An IQR weight's scale view: one f32 a row and one a 128-column block, which the reference
+     * describes as their product per (row, block). The core's scale chain multiplies a level into
+     * the first-level scale's own extent; here the second level is the finer grid along K. */
+    if (d.sel.size() == 2 && d.shape.size() == 2 && planes.size() == 2) {
+        const RadEncPlane& a = d.enc.plane[d.sel[0]];
+        const RadEncPlane& b = d.enc.plane[d.sel[1]];
+        const int64_t R = d.shape[0], G = d.shape[1];
+        if (!std::strcmp(a.role, "scale") && !std::strcmp(b.role, "scale.col") &&
+            a.dtype == RAD_F32 && b.dtype == RAD_F32 && a.block[0] == 1 && a.block[1] == 0 &&
+            b.block[0] == 0 && b.block[1] > 0 && d.sel_rows[0] == R && d.sel_cols[0] == 1 &&
+            d.sel_rows[1] == 1 && d.sel_cols[1] == G && R > 0 && G > 0 && R * G == n) {
+            for (int64_t r = 0; r < R; ++r) {
+                const float rs = rad_load_f32(planes[0].data() + r * sizeof(float), RAD_F32, 0);
+                for (int64_t g = 0; g < G; ++g) {
+                    const float cf = rad_load_f32(planes[1].data(), RAD_F32, g);
+                    rad_store_f32(out->data(), d.dtype, r * G + g, rs * cf);
+                }
+            }
+            return RAD_OK;
+        }
+    }
+    /* A trellis weight's codes view: decode every plane with the scale planes at 1, which leaves
+     * the codes' integer values (the weight operand a separate scale view is applied to). */
+    KfOperand full;
+    if (kf_operand_full(d, &full)) {
+        std::vector<std::vector<uint8_t>> all((size_t)full.enc.n_planes);
+        for (size_t j = 0; j < d.sel.size() && j < planes.size(); ++j)
+            all[(size_t)d.sel[j]] = planes[j];
+        for (int i = 0; i < full.enc.n_planes; ++i) {
+            if (!all[(size_t)i].empty()) continue;
+            const RadEncPlane& p = full.enc.plane[i];
+            if (std::strncmp(p.role, "scale", 5) != 0) {
+                if (why) *why = std::string("its selected planes leave out '") + p.role + "'";
+                return RAD_E_SHAPE;
+            }
+            const int64_t elems = full.sel_rows[(size_t)i] * full.sel_cols[(size_t)i];
+            all[(size_t)i].assign((size_t)rad_dtype_bytes(p.dtype, elems), 0);
+            for (int64_t e = 0; e < elems; ++e)
+                rad_store_f32(all[(size_t)i].data(), p.dtype, e, 1.0f);
+        }
+        const void* data[RAD_ENC_MAX_PLANES] = {};
+        for (size_t k = 0; k < all.size() && k < RAD_ENC_MAX_PLANES; ++k)
+            data[k] = all[k].data();
+        /* The transform is the activation's rotation, which the IQR rows read in `a`; their
+         * weight decode (`Dec::rows`) never applies it, so the logical weight is the codes'
+         * values as they stand. Applying it here would rotate a second time. */
+        RadEncoding enc = full.enc;
+        enc.transform[0] = '\0';
+        return enc_selection_logical(enc, full.sel.data(), (int)full.sel.size(),
+                                     full.sel_rows.data(), full.sel_cols.data(), data, d.dtype, n,
+                                     out->data(), why);
+    }
     const void* data[RAD_ENC_MAX_PLANES] = {};
     for (size_t k = 0; k < planes.size() && k < RAD_ENC_MAX_PLANES; ++k)
         data[k] = planes[k].data();
     return enc_selection_logical(d.enc, d.sel.data(), (int)d.sel.size(), d.sel_rows.data(),
                                  d.sel_cols.data(), data, d.dtype, n, out->data(), why);
+}
+
+bool kf_operand_full(const KfOperand& d, KfOperand* out) {
+    if (!d.has_enc || d.sel.empty() || d.sel.size() >= (size_t)d.enc.n_planes) return false;
+    /* A trellis weight's codes view is the states' table and constants, or the codes alone when
+     * the encoding carries a stored table; the scale planes are the weight's other operand. The
+     * core refuses a selection that leaves planes out, so the reader below fills those with 1. */
+    if (!rad_enc_is(&d.enc, "trellis")) return false;
+    const RadEncPlane& p0 = d.enc.plane[d.sel[0]];
+    if (std::strncmp(p0.role, "codes", RAD_ENC_STR) != 0) return false;
+    for (int j = 0; j < (int)d.sel.size(); ++j)
+        if (std::strncmp(d.enc.plane[d.sel[(size_t)j]].role, "scale", 5) == 0) return false;
+    int64_t vr = 0, vc = 0;
+    rad_enc_view((uint32_t)d.shape.size(), d.shape.data(), &vr, &vc);
+    if (vr <= 0 || vc <= 0) return false;
+    KfOperand f = d;
+    f.sel.clear();
+    f.sel_rows.clear();
+    f.sel_cols.clear();
+    for (int i = 0; i < d.enc.n_planes; ++i) {
+        int64_t r = 0, c = 0;
+        rad_enc_plane_dims(&d.enc.plane[i], vr, vc, &r, &c);
+        if (r <= 0 || c <= 0) return false;
+        f.sel.push_back(i);
+        f.sel_rows.push_back(r);
+        f.sel_cols.push_back(c);
+    }
+    *out = std::move(f);
+    return true;
 }
 
 int kf_lay_weight(const RadKernelInfo* info, const RadParam* p, int n_p, int operand,

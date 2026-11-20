@@ -812,6 +812,185 @@ void attn_kernel(const Args A)
     }
 }
 
+/* ================================================================= the head-per-workgroup band
+ *
+ * The decode band's other cut of the same walk: a workgroup is a tile of query rows and one query
+ * head, 32 lanes split over the tile's rows, and a lane owns 128 / (32 / rows) of the head's output
+ * dims -- four dims a lane at one row a workgroup, 32 at eight rows. The reference's arithmetic is
+ * untouched -- a lane still walks the keys ascending and keeps one f32 chain per output element,
+ * the QK dot still folds 64 dot2 pairs in order -- but the layout buys two things the
+ * wave-per-KV-head tile cannot have:
+ *
+ *   - the accumulator is four floats a lane at the one-row form, not 128. The wide layout needs
+ *     192 VGPRs for qf and acc under a 256-VGPR budget, and the PV leg's f16 widening then spills:
+ *     it costs ~9 us a key at 1 k of context, 90% of it that leg (measured by ablation).
+ *   - at one row a workgroup the score is computed once. Walk one keeps it in LDS (`sS`, four bytes
+ *     a key) and walk two reads it instead of re-walking the QK dot, whose 64 dot2 are one
+ *     dependent chain of ~545 cycles a key. That is the floor of any bit-identical kernel: the
+ *     reference's dot2 order may not be reassociated, so 64 x latency a key, twice if the score is
+ *     recomputed. A wider tile recomputes the score and spends no LDS: a plane a row would not fit,
+ *     and the wider tile already has 32 lanes' worth of independent work to hide that latency.
+ *
+ * Bit-identical by construction: the score is the same function of the same widened q and staged
+ * k; `mx` (a maximum, order-free) and the `sum += exp(score - mx)` chain ascending over j are
+ * unchanged; each acc[i] is the reference's `acc[d] += w * v[d]` over the same ascending j with the
+ * same w. Only which lane holds an output element moves, and the store rounds the same pairs with
+ * `bf16x2_rne`. See the file header's split-KV note for why a split is not this: a split cuts the
+ * key range, this cuts the dimension.
+ *
+ * `kScoreMax` bounds the score plane, four bytes a key, at the 48 KiB the launch can size it to
+ * beside the 8 KiB tile; the band therefore serves one-row steps whose table bound `jcap` is at most
+ * that many keys (the engine's tables are staged in 2048-token steps, so a served context up to
+ * 12288 keys takes it). A longer one-row step keeps the two-pass kernel. The walk, the mask, the
+ * window, the row map -- rectangular or a cu_seqlens descriptor -- and the block table all come
+ * from the shared code.
+ */
+constexpr int kScoreMax = 12288;              /* keys whose scores fit the 48 KiB plane */
+
+/* A workgroup is one tile of ROWS query rows and one head: ROWS divides the wave, a row gets
+ * 32 / ROWS lanes, and a lane owns 128 / (32 / ROWS) output dims -- 4 dims at one row a
+ * workgroup, 32 at eight. The score plane exists for the one-row form only: rows a tile would need
+ * a plane each, and recomputing the QK dot for the tile's rows is cheaper than the LDS. */
+template <bool CAUSAL, int ROWS>
+__global__ __launch_bounds__(32) R3D_WAVES(4)
+void attn_head_kernel(const Args A)
+{
+    static_assert(ROWS >= 1 && ROWS <= 16 && (32 % ROWS) == 0, "the tile rows must divide a wave");
+    constexpr int kPerRow = 32 / ROWS;            /* lanes on one query row */
+    constexpr int kDims = kHeadDim / kPerRow;     /* output dims a lane owns */
+    constexpr bool kScored = (ROWS == 1);         /* the plane is this workgroup's own scores */
+
+    __shared__ uint32_t sK[kTileDw];
+    __shared__ uint32_t sV[kTileDw];
+    R3D_DYN_LDS(float, sS);
+
+    const int tid = (int)threadIdx.x;
+    const int rl = tid / kPerRow, dl = tid % kPerRow;
+    /* blockIdx.x names the batch tile, blockIdx.y the query head. */
+    const RowMap M = map_seq(A, ROWS, (int)blockIdx.x);
+    if (M.tile < 0 || M.len <= 0) return;
+    const int s = M.s;
+    const int h = (int)blockIdx.y;
+    if (h >= A.n_head) return;
+    const int gqa = A.n_head / A.kv_heads;
+    const int kh = h / gqa;
+
+    /* The tile's rows, the same clamp the wide kernel makes: an idle lane loads a row that exists
+     * so the walk stays branch-free, and never stores. */
+    const int tb = M.tile * ROWS;                 /* the tile's first row, counted in the span */
+    const bool row_ok = rl < M.span - tb && M.start + tb + rl < A.rows;
+    int tclamp = tb < M.span ? tb : M.span - 1;
+    if (tclamp < 0) tclamp = 0;
+    if (M.start + tclamp >= A.rows) tclamp = A.rows - 1 - M.start;
+    if (tclamp < 0) tclamp = 0;
+    const long long row = (long long)M.start + (row_ok ? tb + rl : tclamp);
+
+    const long long ctx = ld_ix(A.su, (size_t)s);
+    const int jend_all = (int)(ctx < A.jcap ? ctx : A.jcap);
+    const long long ib = (long long)M.start - M.i0;
+    const long long pos = ctx - M.len + tb + rl + ib;
+
+    /* The workgroup's bounds, as the wide kernel forms them from its nominal tile. */
+    const long long wmin = ctx - M.len + tb + ib;
+    const long long wmax = wmin + ROWS - 1;
+    int jlo = 0, jhi = jend_all;
+    if (CAUSAL) {
+        if (wmax + 1 < jhi) jhi = (int)(wmax + 1);
+    }
+    if (A.window > 0) {
+        const long long lo = wmin - A.window + 1;
+        if (lo > jlo) jlo = (int)(lo > 0 ? lo : 0);
+        if (!CAUSAL) {
+            const long long hi = wmax + A.window;
+            if (hi < jhi) jhi = (int)(hi > 0 ? hi : 0);
+        }
+    }
+    int b0 = jlo / kBlock, b1 = (jhi + kBlock - 1) / kBlock;
+
+    const float kds = A.kds ? A.kds[(size_t)s * A.kv_heads + kh] : 1.0f;
+    const float vds = A.vds ? A.vds[(size_t)s * A.kv_heads + kh] : 1.0f;
+
+    /* Every lane needs the whole query row to form the score, as the wide kernel does. */
+    uint32_t qf[kPairs];
+    {
+        const uint16_t* qp = A.q + row * (long long)A.q_rs + h * kHeadDim;
+#pragma unroll
+        for (int u = 0; u < kPairs / 4; ++u) {
+            const r3d_u32x4 raw =
+                *(const __attribute__((address_space(1))) r3d_u32x4*)(const void*)(qp + u * 8);
+            const uint32_t d[4] = { raw.x, raw.y, raw.z, raw.w };
+#pragma unroll
+            for (int j = 0; j < 4; ++j) qf[u * 4 + j] = A.q16 ? d[j] : bf16x2_to_f16x2(d[j]);
+        }
+    }
+
+    /* Walk one: the scores and their maximum, kept for walk two when the plane is this row's. */
+    float mx = -INFINITY;
+    for (int b = b0; b < b1; ++b) {
+        const int blk = (int)ld_ix(A.bt, (size_t)s * (size_t)A.bt_rs + (size_t)b * (size_t)A.bt_cs);
+        group_barrier();
+        if (blk >= 0) stage<false, 32>(A, sK, sV, blk, kh, kds, vds, tid);
+        group_barrier();
+        if (blk < 0) continue;
+        const int j0 = b * kBlock;
+        const int nu = j0 + kBlock <= jhi ? kBlock : (jhi > j0 ? jhi - j0 : 0);
+        const bool nomask = !CAUSAL && A.window <= 0;
+        for (int u = 0; u < nu; ++u) {
+            const int j = j0 + u;
+            if (!row_ok || (!nomask && !visible(j, pos, CAUSAL, A.window))) continue;
+            const float sc = score_of(qf, sK + u * kPitch, A.scale);
+            if (sc > mx) mx = sc;
+            if (kScored && tid == 0) sS[j] = sc;   /* every lane holds the same score: one writer */
+        }
+    }
+
+    /* Walk two: the denominator and this lane's dims of P . V, over the same ascending keys.
+     *
+     * Every lane walks, including one the mask never lets see a key: the stage is cooperative --
+     * 32 threads split the tile -- so a lane that returned here would leave its share unstaged and
+     * the rest of the wave would read a partial tile. A lane with no visible key runs the walk with
+     * `mx_use` and never forms a weight (its mask skips every key), so its sum stays zero and its
+     * row is written as zeros, which is what the reference's empty softmax is. */
+    float acc[kDims];
+#pragma unroll
+    for (int i = 0; i < kDims; ++i) acc[i] = 0.0f;
+    float sum = 0.0f;
+    const float mx_use = mx > -INFINITY ? mx : 0.0f;
+    for (int b = b0; b < b1; ++b) {
+        const int blk = (int)ld_ix(A.bt, (size_t)s * (size_t)A.bt_rs + (size_t)b * (size_t)A.bt_cs);
+        group_barrier();   /* also orders the score stores of walk one before this read */
+        if (blk >= 0) stage<false, 32>(A, sK, sV, blk, kh, kds, vds, tid);
+        group_barrier();
+        if (blk < 0) continue;
+        const int j0 = b * kBlock;
+        const int nu = j0 + kBlock <= jhi ? kBlock : (jhi > j0 ? jhi - j0 : 0);
+        const bool nomask = !CAUSAL && A.window <= 0;
+        for (int u = 0; u < nu; ++u) {
+            const int j = j0 + u;
+            if (!row_ok || (!nomask && !visible(j, pos, CAUSAL, A.window))) continue;
+            const float sc = kScored ? sS[j] : score_of(qf, sK + u * kPitch, A.scale);
+            const float w = exp_ref(sc - mx_use);
+            sum += w;
+            const uint32_t* vp = sV + u * kPitch;
+#pragma unroll
+            for (int i = 0; i < kDims; ++i) {
+                const int d = dl * kDims + i;
+                const uint32_t pair = vp[d >> 1];
+                const float v = (d & 1) ? f16_to_f32((uint16_t)(pair >> 16))
+                                        : f16_to_f32((uint16_t)(pair & 0xffffu));
+                acc[i] = acc[i] + w * v;
+            }
+        }
+    }
+
+    if (!row_ok) return;
+    uint16_t* op = A.out + row * (long long)A.o_rs + h * kHeadDim + dl * kDims;
+    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+#pragma unroll
+    for (int i = 0; i < kDims; i += 2)
+        *(uint32_t*)(void*)(op + i) = bf16x2_rne(acc[i] * inv, acc[i + 1] * inv);
+}
+
 /* ------------------------------------------------------------------ split-KV reduce
  *
  * A wave per (query row, head): 32 lanes x 4 dims. The slices combine ascending, each rescaled by
@@ -931,12 +1110,6 @@ int fill(Args& A, long q, long kv, long bt, long seqused, long k_desc, long v_de
     A.causal = causal ? 1 : 0; A.window = window;
     A.jcap = max_ctx;
     if ((long long)bt_cols * block_size < max_ctx) A.jcap = bt_cols * block_size;
-    /* RAD_R3D_TRACE: the table geometry and the walk's reach (jcap). A short jcap means the table
-     * is narrower than the sequence, a plan fact rather than a kernel one. */
-    if (r3d_trace_on())
-        std::fprintf(stderr, "[r3d] attn: q_len %d rows %ld n_seq %d bs %d bt cols %d pitch %d "
-                             "cstride %d max_ctx %d -> jcap %d\n", q_len, rows, num_seqs,
-                     block_size, bt_cols, bt_rs, bt_cs, max_ctx, A.jcap);
     {   /* RAD_R3D_TRACE: a one-record hipMalloc buffer the kernel writes and launch() reads back,
          * allocated on first traced use. Null when the flag is unset. */
         static void* g_trace_buf = nullptr;
@@ -944,39 +1117,6 @@ int fill(Args& A, long q, long kv, long bt, long seqused, long k_desc, long v_de
         if (r3d_trace_on() && !g_trace_buf)
             (void)hipMalloc(&g_trace_buf, sizeof(DevRec));
         if (g_trace_buf) A.trace_buf = (DevRec*)g_trace_buf;
-    }
-    /* RAD_R3D_TRACE: synchronise the device and print, for up to 4 sequences, the first 16 block
-     * table entries ("[r3d] devstate s=.. bt=..") and seqused with the KV base, then the first
-     * block id. The device sync is needed because staging may run on the engine's stream, and a
-     * copy on the default stream is unordered with it. */
-    if (r3d_trace_on())
-    {
-        (void)hipDeviceSynchronize();
-        const char* kvb = A.kv8 ? (const char*)A.kv8 : (const char*)A.kv;
-        for (int s = 0; s < (int)num_seqs && s < 4; ++s) {
-            int row[16];
-            if (hipMemcpy(row, (const char*)A.bt + (size_t)s * (size_t)bt_rs * sizeof(int),
-                          16 * sizeof(int), hipMemcpyDeviceToHost) == hipSuccess) {
-                std::fprintf(stderr, "[r3d] devstate s=%d bt=", s);
-                for (int c = 0; c < 16; ++c) std::fprintf(stderr, "%s%d", c ? " " : "", row[c]);
-                std::fprintf(stderr, "\n");
-            }
-            int su = -1;
-            if (A.su &&
-                hipMemcpy(&su, (const char*)A.su + (size_t)s * sizeof(int), sizeof(int),
-                          hipMemcpyDeviceToHost) == hipSuccess)
-                std::fprintf(stderr, "[r3d] devstate s=%d seqused=%d kvbase=%p\n", s, su,
-                             (const void*)kvb);
-        }
-        int first = -1;
-        if (kvb &&
-            hipMemcpy(&first, (const char*)A.bt, sizeof(int), hipMemcpyDeviceToHost) == hipSuccess &&
-            first >= 0) {
-            /* Only the block id is printed: a D2H copy from the cache base faults in the engine
-             * process even where the kernel's own read is fine. */
-            std::fprintf(stderr, "[r3d] devstate first_block=%d (block content not read)\n",
-                         first);
-        }
     }
     A.scale = scale > 0.0f ? scale : 1.0f / std::sqrt((float)kHeadDim);
     A.splits = splits > 0 ? splits : 1;
@@ -1017,12 +1157,14 @@ template <int GQA, int W> struct waves_ok {
 int tok_per_block(int gqa, int waves) { return waves * (32 / (gqa > 0 ? gqa : 1)); }
 
 /* The decode entry's `splits` when the caller asked for the widest legal: enough workgroups to fill
- * a 16-CU card (two workgroups a CU at four waves a SIMD) and no more, on a doubling ladder. */
+ * the card (two workgroups a CU at four waves a SIMD) and no more, on a doubling ladder. The target
+ * is the head_dim-256 rows' (128 workgroups): the old 32 left a 96-CU card at a third of its
+ * occupancy whenever the tile and KV-head counts were small, which is the decode band's shape. */
 int pick_splits(int tiles, int num_seqs, int kv_heads)
 {
     const long long blocks = (long long)tiles * num_seqs * kv_heads;
     int sp = 1;
-    while (sp < 8 && blocks * sp < 32) sp *= 2;
+    while (sp < 16 && blocks * sp < 128) sp *= 2;
     return sp;
 }
 
@@ -1134,13 +1276,63 @@ int launch(const Args& A, long out, long stream)
     return 0;
 }
 
+/* The band's launcher (see "the head-per-workgroup band"). One workgroup a (tile of `rows` query
+ * rows, head), a wave of 32 lanes. A one-row tile has no split and keeps its scores in the launch's
+ * dynamic LDS, sized to the step's own key bound, which the caller has checked against `kScoreMax`;
+ * a wider tile recomputes the score and needs no plane. */
+template <bool CAUSAL, int ROWS>
+int launch_head_rows(const Args& A, long out, long stream, size_t smem)
+{
+    Args B = A;
+    B.out = (uint16_t*)(uintptr_t)out;
+    /* A rectangular batch's tiles are known; a descriptor's are bounded by the plane's rows, each
+     * tile carrying at least one row. */
+    const unsigned tiles = A.cu
+        ? (unsigned)A.rows
+        : (unsigned)(A.n_seq * ((A.q_len + ROWS - 1) / ROWS));
+    dim3 grid(tiles, (unsigned)A.n_head, 1);
+    hipStream_t st = (hipStream_t)(uintptr_t)stream;
+    (void)hipGetLastError();
+    R3D_KLAUNCH_S((attn_head_kernel<CAUSAL, ROWS>), grid, dim3(32), smem, st, B);
+    const hipError_t ke = hipGetLastError();
+    if (ke != hipSuccess) {
+        if (r3d_trace_on())
+            std::fprintf(stderr, "[r3d] attn: %s on the head launch: grid (%u, %u, 1) block 32 "
+                                 "causal %d rows %d n_seq %d n_head %d jcap %d\n",
+                         hipGetErrorName(ke), grid.x, grid.y, (int)CAUSAL, ROWS, A.n_seq,
+                         A.n_head, A.jcap);
+        return -4;
+    }
+    return 0;
+}
+
+int launch_head(const Args& A, long out, long stream, int rows)
+{
+    const size_t smem = rows == 1 ? (size_t)A.jcap * sizeof(float) : 0u;
+    const bool causal = A.causal != 0;
+    switch (rows) {
+    case 1:  return causal ? launch_head_rows<true, 1>(A, out, stream, smem)
+                           : launch_head_rows<false, 1>(A, out, stream, smem);
+    case 2:  return causal ? launch_head_rows<true, 2>(A, out, stream, smem)
+                           : launch_head_rows<false, 2>(A, out, stream, smem);
+    case 4:  return causal ? launch_head_rows<true, 4>(A, out, stream, smem)
+                           : launch_head_rows<false, 4>(A, out, stream, smem);
+    case 8:  return causal ? launch_head_rows<true, 8>(A, out, stream, smem)
+                           : launch_head_rows<false, 8>(A, out, stream, smem);
+    default: return causal ? launch_head_rows<true, 16>(A, out, stream, smem)
+                           : launch_head_rows<false, 16>(A, out, stream, smem);
+    }
+}
+
 }  // namespace
 
-extern "C" int r3d_attn_decode_h128(long q, long kv, long bt, long seqused, long k_desc,
-                                    long v_desc, long cu, long out, int num_seqs, int q_len,
-                                    int head_dim, int gqa, int n_head, int block_size, int bt_cols, int bt_rs, int bt_cs, int max_ctx,
-                                    int window, int causal, float scale, int kv_dt, long q_ld,
-                                    long out_ld, int splits, long scratch, long stream)
+/* The decode entry. `head_band` is what the row's own entry always asks for; the wide band's
+ * export below turns it off so a device test can hold the two to each other byte for byte. */
+static int decode_entry(long q, long kv, long bt, long seqused, long k_desc,
+                        long v_desc, long cu, long out, int num_seqs, int q_len,
+                        int head_dim, int gqa, int n_head, int block_size, int bt_cols, int bt_rs, int bt_cs, int max_ctx,
+                        int window, int causal, float scale, int kv_dt, long q_ld,
+                        long out_ld, int splits, long scratch, long stream, bool head_band)
 {
     /* With `cu` (the ragged descriptor) `q_len` is the query plane's row count (see the launchers'
      * header) and a sequence's rows are cu[s+1] - cu[s]. The width and split count are picked on
@@ -1160,7 +1352,41 @@ extern "C" int r3d_attn_decode_h128(long q, long kv, long bt, long seqused, long
                        cu ? 0 : q_len, head_dim, gqa, n_head, block_size, bt_cols, bt_rs, bt_cs,
                        max_ctx, window, causal, scale, kv_dt, q_ld, out_ld, sp, scratch, waves);
     if (e) return e;
+    /* A bf16 cache and no split: the head-per-workgroup band takes the step, tiles of `rows` query
+     * rows (the next power of two at or above `per`, up to 16). A one-row tile keeps its scores in
+     * a plane sized by the launch, so its key bound must fit `kScoreMax`. Everything else -- an fp8
+     * cache, a split, a step wider than the decode band's 16 rows, a one-row step past `kScoreMax`
+     * keys -- keeps the wide two-pass kernel. Both are bit-identical. */
+    int rows = 1;
+    while (rows < per && rows < 16) rows *= 2;
+    const bool plane_ok = rows > 1 || A.jcap <= kScoreMax;
+    if (head_band && per <= 16 && !A.kv8 && A.splits <= 1 && plane_ok)
+        return launch_head(A, out, stream, rows);
     return launch(A, out, stream);
+}
+
+extern "C" int r3d_attn_decode_h128(long q, long kv, long bt, long seqused, long k_desc,
+                                    long v_desc, long cu, long out, int num_seqs, int q_len,
+                                    int head_dim, int gqa, int n_head, int block_size, int bt_cols, int bt_rs, int bt_cs, int max_ctx,
+                                    int window, int causal, float scale, int kv_dt, long q_ld,
+                                    long out_ld, int splits, long scratch, long stream)
+{
+    return decode_entry(q, kv, bt, seqused, k_desc, v_desc, cu, out, num_seqs, q_len, head_dim,
+                        gqa, n_head, block_size, bt_cols, bt_rs, bt_cs, max_ctx, window, causal,
+                        scale, kv_dt, q_ld, out_ld, splits, scratch, stream, true);
+}
+
+/* The wide band's entry, never the head band. Exported for tests/attn_paged_device_test.cpp, which
+ * holds the head band to it byte for byte; the row never asks for it. */
+extern "C" int r3d_attn_decode_h128_wide(long q, long kv, long bt, long seqused, long k_desc,
+                                         long v_desc, long cu, long out, int num_seqs, int q_len,
+                                         int head_dim, int gqa, int n_head, int block_size, int bt_cols, int bt_rs, int bt_cs, int max_ctx,
+                                         int window, int causal, float scale, int kv_dt, long q_ld,
+                                         long out_ld, int splits, long scratch, long stream)
+{
+    return decode_entry(q, kv, bt, seqused, k_desc, v_desc, cu, out, num_seqs, q_len, head_dim,
+                        gqa, n_head, block_size, bt_cols, bt_rs, bt_cs, max_ctx, window, causal,
+                        scale, kv_dt, q_ld, out_ld, splits, scratch, stream, false);
 }
 
 extern "C" int r3d_attn_prefill_h128(long q, long kv, long bt, long seqused, long k_desc,
@@ -1362,7 +1588,8 @@ bool plan_once(long long n_seq, long long rows, long long q_len, long long cols,
 void plan_line(bool decode, const RadTensor* Q, const RadTensor* KV, const RadTensor* O,
                const RadTensor* CU, const RadTensor* SU, const RadTensor* BT, const void* scratch,
                long long n_seq, long long rows, long long q_len, long long bt_cols, long long bt_rs,
-               long long bt_cs, int block_size, int max_ctx, int waves, int splits, bool by_ctx)
+               long long bt_cs, int block_size, int max_ctx, int waves, int splits, int band,
+               bool by_ctx)
 {
     /* The walk's bound, the same expression fill() uses: the TABLE's columns times the block,
      * capped by the cache's context (jend = min(ctx, max_blocks * block_size)). */
@@ -1379,10 +1606,10 @@ void plan_line(bool decode, const RadTensor* Q, const RadTensor* KV, const RadTe
 
     std::fprintf(stderr,
                  "[r3d] plan: %s n_seq=%lld rows=%lld q_len=%lld cu rank=%u numel=%lld ctx=%lld "
-                 "bt cols=%lld pitch=%lld max_ctx=%d -> jcap=%lld waves=%d splits=%d",
+                 "bt cols=%lld pitch=%lld max_ctx=%d -> jcap=%lld waves=%d splits=%d band=%d",
                  decode ? "decode" : "prefill", n_seq, rows, q_len,
                  r3d_has(CU) ? (unsigned)CU->rank : 0u, r3d_has(CU) ? r3d_numel(CU) : 0LL, ctx,
-                 bt_cols, bt_rs, max_ctx, jcap, waves, splits);
+                 bt_cols, bt_rs, max_ctx, jcap, waves, splits, band);
 
     /* The addresses the launch bakes into its arguments. A replayed graph re-runs the kernels with
      * the arguments frozen at capture, so if a later request's planes live at other addresses the
@@ -1588,6 +1815,19 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
                                                             (long long)splits * kPartStride * 4));
     }
 
+    /* The head-per-workgroup band's take, by the rule decode_entry applies: zero means the wide
+     * two-pass kernel, any other value is the query rows a workgroup carries. */
+    int band = 0;
+    if (decode) {
+        int r = 1;
+        while (r < per && r < 16) r *= 2;
+        const long long reach = bt_cols * (long long)block_size;
+        const long long jc = reach < max_ctx ? reach : (long long)max_ctx;
+        if (per >= 1 && per <= 16 && KV->dtype == RAD_BF16 && splits <= 1 &&
+            (r > 1 || jc <= kScoreMax))
+            band = r;
+    }
+
     /* Trace output, all under RAD_R3D_TRACE and after every check (a refused step is reported by
      * the refusal lines). The ring is drained first, printing records written since the last call
      * (replayed steps included), then re-armed for this launch. The plan line's `q_len` is the
@@ -1598,7 +1838,7 @@ int attn_shim(const RadArgs* a, RadStream s, bool decode)
     if (r3d_trace_on())
         plan_line(decode, Q, KV, O, CU, SU, BT, splits > 1 ? (const void*)a->scratch : nullptr,
                   n_seq, rows, ragged ? 0LL : q_len, bt_cols, bt_rs, bt_cs, block_size, max_ctx,
-                  waves, splits, r3d_trace_wide());
+                  waves, splits, band, r3d_trace_wide());
 
     /* With a descriptor the entries take the plane's row count where a rectangular batch passes
      * its per-sequence length. */

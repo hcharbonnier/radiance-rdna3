@@ -8,7 +8,7 @@ plugin claims.
 | plugin | id | quantisation | what it serves |
 |---|---|---|---|
 | `arch/llama_fp8` | `llama` | `fp8_e4m3` | the plain LLaMA decoder under the `fp8_e4m3` descriptor; its linears go through `LinearFP8` (`arch/common/rad_fp8.h`), which refuses a block-fp8 weight at load |
-| `arch/llama_dense_fp8` | `llama` | *(empty)* | the same graph from a bf16 checkpoint, linears made IQ8R by a recipe (`data/recipes/minicpm5-2b-iq8r.recipe`) or kept bf16. MiniCPM5-2B |
+| `arch/llama_dense_fp8` | `llama` | *(empty)* | the same graph from a bf16 checkpoint, linears made IQ8R by a recipe (`data/recipes/minicpm5-2b-iq8r.recipe`) or kept bf16. MiniCPM5-2B. Its IQ8R is libquant's **256-wide** group (two 128-wide rotations, one scale per 256), served on `libr3d` since W27 |
 | `arch/qwen35_bf16` | `qwen35` | *(empty)* | the Qwen3.5/3.6/3.8 dense hybrid, served bf16 |
 | `arch/qwen35_fp8` | `qwen35` | `fp8_e4m3` | the same under the `fp8_e4m3` descriptor, and the imported quantisations (an int4 W4A16 release, `data/recipes/q38-27b-w4a16.recipe`); a block-fp8 weight is refused at load |
 | `arch/hyv3_bf16` | `hyv3` | *(empty)* | Tencent Hy-Memory-30B-A3B BF16 safetensors; BF16, W4 or W8A8 weights by recipe; TP1/2, BF16 KV |

@@ -2358,7 +2358,14 @@ int Engine::arena_step(const RadBatch* b) {
      * hold). */
     const bool more = b->phase != RAD_PHASE_DECODE && sched_.prefill_continues();
     for (auto& r : ranks_) {
-        const int64_t allow = r->arena_lent[(size_t)level];
+        /* A pass stages only when it is a prefill chunk long enough to arm the stager. Such a
+         * pass takes the loan that reserves the ring at the arena's top (`arena_lent`); any other
+         * pass, a decode step above all, lends the ring back to the slab (`arena_lent_full`) and
+         * gets no ring, so the residents it keeps are the ones the next large chunk finds. */
+        const bool stage = b->phase != RAD_PHASE_DECODE && b->draft_pass == 0 &&
+                           r->stager.enabled() && b->n_tok >= r->stager.min_rows();
+        const int64_t allow = (stage || level == 0) ? r->arena_lent[(size_t)level]
+                                                    : r->arena_lent_full[(size_t)level];
         if (r->mover.loan(Mover::kLendArena) > allow ||
             r->mover.loan_held(Mover::kLendArena) > allow) {
             RAD_TRY(rad_dev_set(r->device));
@@ -2368,12 +2375,22 @@ int Engine::arena_step(const RadBatch* b) {
                         "%s", r->index, (long long)b->n_tok, rad_strerror(st));
                 return st;
             }
+        } else if (r->mover.loan(Mover::kLendArena) < allow) {
+            /* A staged pass narrowed the loan; give the slab its full stretch back before this
+             * step, or the cap would stay at the narrow value for every step after it: the slab
+             * admits experts against the cap, and a decode keeps hosts it could have paged in. */
+            RAD_TRY(r->mover.set_loan(Mover::kLendArena, allow));
         }
         RAD_TRY(r->ctx.set_level(level));
-        /* The full plan lends nothing, so its top (the staging region) is the step's ring; the
-         * span's shared level keeps a place of its own for it (stager.h); every other level
-         * lends both. */
-        char* const ring = level == 0 ? r->stager.ring_full()
+        /* The full plan lends nothing, so its top (the staging region) is the step's ring. A
+         * smaller level keeps that same ring when it was reserved for it (arena_ring_top, set
+         * where the level's loan was computed); the span's shared level has a place of its own
+         * right above its buffers; every other level lends the top and has no ring. */
+        const bool ring_top = level > 0 && (size_t)level < r->arena_ring_top.size() &&
+                              r->arena_ring_top[(size_t)level] != 0;
+        char* const ring = !stage ? nullptr
+                         : level == 0 ? r->stager.ring_full()
+                         : ring_top ? r->stager.ring_full()
                          : arena_last_ == arena_span_rows_ && r->arena_low_off >= 0
                                ? r->stager.ring_low() : nullptr;
         r->stager.set_ring(ring);
@@ -2827,7 +2844,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     {
         int64_t stage_rows = 0;
         for (auto& rk : ranks_)
-            if (rk->stager.enabled()) stage_rows = std::max(stage_rows, rk->stager.min_rows());
+            if (rk->stager.enabled()) stage_rows = std::max(stage_rows, rk->sched_stage_rows);
         sched_.set_stage_rows(stage_rows);
         /* The shortest prompt a span pays for where routed experts are read from host memory: a
          * spanned step runs at the full plan, which lends the expert slab nothing, while every

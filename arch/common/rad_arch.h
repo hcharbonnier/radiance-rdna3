@@ -344,8 +344,18 @@ private:
     std::string             scope_;
 };
 
-/* Returns the first negative status from a declare step. */
-#define RAD_ARCH_TRY(expr)  do { int _s = (expr); if (_s < 0) return _s; } while (0)
+/* Returns the first negative status from a declare step. RAD_ARCH_TRACE names the step that failed
+ * (file, line and expression): an architecture that refuses a container otherwise reports only the
+ * caller's error. */
+#define RAD_ARCH_TRY(expr)                                                                        \
+    do {                                                                                          \
+        int _s = (expr);                                                                          \
+        if (_s < 0) {                                                                             \
+            if (std::getenv("RAD_ARCH_TRACE"))                                                    \
+                std::fprintf(stderr, "[arch] %s:%d %s -> %d\n", __FILE__, __LINE__, #expr, _s);    \
+            return _s;                                                                            \
+        }                                                                                         \
+    } while (0)
 
 /* ================================================================== C++-side decl helpers */
 /* C++ forms of rad_group_layer() and friends, which are C compound literals (a GNU extension in
@@ -1587,12 +1597,15 @@ inline int drafter_geom(Geom& dg, const Geom& target, const RadModelMeta* meta, 
 /* The drafter's own KV group, bound to its layers from `base_layer`: it differs from the trunk's
  * in layer count and head geometry. A `window` > 0 makes it RAD_KV_WINDOW, which recycles blocks
  * below the window. Its dtype is --kv-cache-dtype, like every attention cache, and is written to
- * dg.kv_dtype. */
+ * dg.kv_dtype; a caller passing a non-zero `dtype` overrides it for this group alone, for a
+ * drafter whose head shape the served cache widths cover in another dtype than the trunk's (the
+ * two groups are declared apart, and the core sizes each page from its own group). */
 inline int drafter_kv_group(RadBuilder* b, Names& nm, const RadBuildCtx* ctx, Geom& dg,
-                            int64_t window, int base_layer, rad_kvgroup* out) {
+                            int64_t window, int base_layer, rad_kvgroup* out,
+                            uint32_t dtype = 0) {
     RadKVGroupDecl d{};
     d.kind      = window > 0 ? RAD_KV_WINDOW : RAD_KV_FULL;
-    d.dtype     = rad_kv_cache_dtype(ctx, RAD_BF16);
+    d.dtype     = dtype ? dtype : rad_kv_cache_dtype(ctx, RAD_BF16);
     d.window    = window;
     d.n_head_kv = dg.n_head_kv;
     d.head_dim  = dg.head_dim;

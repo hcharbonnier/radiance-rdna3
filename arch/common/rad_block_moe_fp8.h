@@ -1097,7 +1097,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         /* A clamped layer is served too: GateQuantFP8 clamps into the bf16 plane, then
          * quantises it into the rotated codes. Not before a W5NL down projection, which reads
          * rotated E4M3: no clamp writes those codes. */
-        const bool clamp_w5 = down_w5_fp8 && c.swiglu_limit > 0;
+        const bool clamp_w5 = a8 && fmt[0] == 11 && fmt[1] == 7 && c.swiglu_limit > 0;
         if (!pair || !c.expert_rot || !kServed8[fmt[0]] || !down_supported || c.calib ||
             clamp_w5) {
             fprintf(stderr, "radiance: layer %d: int8 activations meet rotated experts (int8, "

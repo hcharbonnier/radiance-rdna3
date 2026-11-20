@@ -727,6 +727,48 @@ TEST(the_joined_planes_form_round_trips_and_finds_each_plane_by_role) {
     CHECK_EQ(rad_planes_layout(&e, bad, t, 3, &L), RAD_E_SHAPE);
 }
 
+/* The lm head's joined offsets as the launch derives them from geometry alone: the header and the
+ * two entries round to RAD_PLANES_ALIGN, codes start there and scale after the codes' bytes,
+ * 64-aligned again; the codes row is n_embd bytes and the scale row is n_embd/128 elements of its
+ * dtype. This is the invariant r3d_vocab_bf16.hip uses when the weight is VRAM-resident and cannot
+ * be read at issue, so a change in rad_planes' alignment or order has to fail here. */
+TEST(the_lm_head_offsets_follow_from_its_geometry) {
+    struct Case { uint32_t cdt, sdt; long long rows, cols; };
+    const Case cases[] = {
+        { RAD_I8, RAD_BF16, 248320, 2560 },     /* the W15 head */
+        { RAD_F8E4M3, RAD_F16, 131, 2048 },     /* a ragged vocabulary */
+        { RAD_F8E4M3, RAD_F32, 1024, 320 },     /* f32 scales */
+    };
+    for (const Case& c : cases) {
+        RadEncoding e = rad_enc_affine(c.cdt, c.sdt, 1, 128);
+        const int sel[2] = { 0, 1 };
+        const long long sr = (c.rows + 127) / 128, sc = (c.cols + 127) / 128;
+        const long long srow = (long long)rad_dtype_bytes(c.sdt, sc);
+        std::vector<uint8_t> codes((size_t)(c.rows * c.cols)), scale((size_t)(sr * srow));
+        RadTensor t[2] = {};
+        t[0].dtype = c.cdt; t[0].rank = 2; t[0].shape[0] = c.rows; t[0].shape[1] = c.cols;
+        t[0].stride[0] = c.cols; t[0].stride[1] = 1; t[0].data = codes.data();
+        t[1].dtype = c.sdt; t[1].rank = 2; t[1].shape[0] = sr; t[1].shape[1] = sc;
+        t[1].stride[0] = sc; t[1].stride[1] = 1; t[1].data = scale.data();
+
+        RadPlanesEntry en[2] = {};
+        const int64_t bytes = rad_planes_plan(&e, sel, t, 2, en);
+        REQUIRE(bytes > 0);
+        const int64_t off = rad_planes_round((int64_t)sizeof(RadPlanesHeader) +
+                                             2 * (int64_t)sizeof(RadPlanesEntry));
+        CHECK_EQ((long long)en[0].offset, (long long)off);
+        CHECK_EQ((long long)en[0].row_bytes, c.cols);
+        CHECK_EQ((long long)en[1].offset, (long long)rad_planes_round(off + c.rows * c.cols));
+        CHECK_EQ((long long)en[1].row_bytes, srow);
+        CHECK_EQ((long long)bytes,
+                 (long long)rad_planes_round((long long)en[1].offset + sr * srow));
+
+        RadLayout L{};
+        REQUIRE_EQ(rad_planes_layout(&e, sel, t, 2, &L), RAD_OK);
+        CHECK_EQ((long long)L.bytes, (long long)bytes);
+    }
+}
+
 /* Every finite midpoint between adjacent codes, and one and two floats either side, both signs:
  * one RTNE, with subnormals kept and the overflow edge exact. */
 TEST(the_abi_narrowings_round_to_nearest_even_at_every_midpoint) {

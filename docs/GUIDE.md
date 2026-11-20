@@ -1409,6 +1409,14 @@ its tail in other chunks than a cold prefill can flip a near-tie in greedy text.
   chunk starts, a boundary the chunk already ends on, so it costs a copy and no step. An exact
   repeat re-prefills the cold run's last chunk; an appended turn re-prefills that chunk and what
   the turn added.
+  One exception: a prompt **shorter than its first checkpoint interval** has no grid position to
+  resume at, so it anchors a tail snapshot one quantum below its last boundary, once that anchor
+  reaches 256 tokens (`Scheduler::kShortTailMin`). Without it an agent conversation whose turns
+  stay under an interval would reuse no linear state at all and re-prefill the whole transcript
+  every turn.
+  The cost is one snapshot and a short final chunk, and the next turn recomputes that interval's
+  end in a shorter chunk: the trade `nearest` already makes at every tail, so a near-tie in
+  greedy text below the first interval can follow the resumed chunking rather than a cold run's.
 - `nearest`: a hit resumes at the deepest snapshot or block, and a prompt's tail snapshot is at
   its last quantum boundary. A turn re-prefills up to one chunk less than under `exact`.
 
@@ -2473,6 +2481,12 @@ keys are refused on it, and so are the pixel bands.
 | `image-gen-max-pixels: N`, `image-gen-max-refs: N` | the model's | an image generator's largest image, in pixels, and the reference pictures a request. The generator sizes its per-image and conditioning buffers, and so the activation arena, for them; on a card the weights nearly fill, a smaller image is what makes room. Larger requests are refused; a generator that keeps fixed buffers is named at startup. Images in flight follow `max-num-seqs` |
 | `max-source-pixels: N` | 67108864 | the largest image or frame the decoder accepts, before any resize |
 
+An image above `image-max-pixels`, or one whose patches would exceed one encoder pass
+(`mm-max-patches`), is **scaled down to fit, not refused**; `max-source-pixels` is the only hard cap,
+and it applies before any resize. The effective size is not echoed in the response, so the image
+token count is the visible signal. The `data:` URL's declared media type is not cross-checked
+against the bytes: the decoder identifies the format from the content.
+
 **Quality measurement**, instead of serving; see [TOOLS.md](TOOLS.md#the-kl-mode)
 
 | key | |
@@ -2514,6 +2528,7 @@ keys are refused on it, and so are the pixel bands.
 | `expert-stats: FILE` | count the routed experts every layer selects, apart for prefill, decode, mixed steps and draft-head passes, and write them to `FILE` as JSON every 30 s and at shutdown (written through a temporary and a rename). Counted on the host from the routing histograms the core already copies back for the heat engine, so it adds no device work and no synchronisation; under expert parallelism each rank's slice is mapped to the model's expert ids through the container's directory |
 | `expert-profile: FILE` | rank the expert plane by this `expert-stats` JSON's `decode` counts instead of the container's activation profile, which is prefill-heavy (decode-hot experts differ); the planner keeps the hottest resident |
 | `expert-pin-top: F` | pin the hottest fraction `F` (0 < F <= 1) of the routed experts by `expert-profile`'s share: heat never demotes them, so the decode-hot set stays resident while the rest streams. 0, the default, is off |
+| `expert-moves: N` | swaps the heat engine may propose per slab class each step, from the first step; 0, the default, follows the plan: 16 once a broad pass has shaped the resident set and at least 60% of the movable expert bytes stay on the card (the extra swaps only re-copy experts the steps would hit), 64 otherwise and again after 512 steps without such a pass |
 | `draft-expert-placement: WHERE` | `auto` (the default) or `host`: `host` pins a draft head's (MTP, DSpark) routed experts in the host pool before any placement strategy runs, read in place like a pooled expert; `auto` leaves them to the strategy |
 | `server.live: true` | the live terminal view (§6.4) |
 | `server.log: LEVEL` | `info` (the default), `debug` or `trace`: how much the server logs (§6.5) |

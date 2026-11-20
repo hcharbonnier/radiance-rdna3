@@ -227,6 +227,17 @@ struct RuConv {
 // Max tokens per sequence for the folded convolution (preloaded into registers, static indices).
 #define RU_CVT 8
 
+// Arrival counters for the folded convolution: one block per (stream, output), zeroed once and
+// reset by the last arriver of each group. As with split_ctr in r3dh_gemm_fp8a8.hip, launches
+// sharing a block must not overlap: different streams get different blocks, and launches on one
+// stream sharing an output are ordered by their dependency. gdn_conv_recurrent_update_had at
+// IQ8R's group (256) needs one more counter per (sequence, pair of value heads), beside the key
+// heads': they are the block's upper half, the key heads' take the entries below it. At group 128
+// the `_had` row uses no pair counter.
+constexpr unsigned kMaxConvCtr = 4096;
+constexpr unsigned kRuPairCtr = 2048;
+static_assert(kRuPairCtr * 2 == kMaxConvCtr, "the pairs' counters are the block's upper half");
+
 // A channel's conv state rewritten as gdn_conv_update does: shifted by one, the old history's
 // tail then this step's tokens. The launcher requires the window split to be R3DH_GDN_CONV_W - 2,
 // so these are the same stores.
@@ -249,6 +260,44 @@ __device__ __forceinline__ void ru_conv_rewrite(unsigned short* sp, const unsign
 // the reads complete, which vmcnt(0) gives.
 __device__ __forceinline__ void ru_sync() {
   asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)\n\ts_barrier" ::: "memory");
+}
+
+// had_quant_act_i8g's rotation, in registers: one wave holds a HAD-wide block, VPL = HAD/32
+// contiguous values a lane, so lane l holds indices l*VPL .. l*VPL+VPL-1. A butterfly at stride h
+// pairs index i with i + h: below VPL both are in the lane, above it the partner is lane
+// l + h/VPL (one r3dh_xor_lane exchange), so the masks are 1, 2, 4, 8 and 16 at any HAD. This is
+// r3d_fwht.h's mapping, repeated here because that header's r3d_common.h would redefine
+// swap16/wave_max against r3dh_common.h. Unnormalised: the caller folds 1/sqrt(HAD) into the
+// scale, as had_quant_act_i8g does.
+template <int VPL, int MASK>
+__device__ __forceinline__ void ru_fwht_xstage(float* v, int lane) {
+  const unsigned int sm = (lane & MASK) ? 0x80000000u : 0u;
+#pragma unroll
+  for (int j = 0; j < VPL; ++j) {
+    const float o = r3dh_xor_lane<MASK>(v[j]);
+    v[j] = __int_as_float(__float_as_uint(v[j]) ^ sm) + o;
+  }
+}
+
+template <int HAD>
+__device__ __forceinline__ void ru_fwht_wave(float* v, int lane) {
+  constexpr int VPL = HAD / 32;
+#pragma unroll
+  for (int h = 1; h < VPL; h <<= 1) {
+#pragma unroll
+    for (int j = 0; j < VPL; ++j) {
+      if ((j & h) == 0) {
+        const float a = v[j], b = v[j + h];
+        v[j] = a + b;
+        v[j + h] = a - b;
+      }
+    }
+  }
+  ru_fwht_xstage<VPL, 1>(v, lane);
+  ru_fwht_xstage<VPL, 2>(v, lane);
+  ru_fwht_xstage<VPL, 4>(v, lane);
+  ru_fwht_xstage<VPL, 8>(v, lane);
+  ru_fwht_xstage<VPL, 16>(v, lane);
 }
 
 template <int ABF16, int NORM, int VS, int NT, int ANC, int STG = 0, int SDT = 0,
@@ -280,7 +329,11 @@ void r3dh_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
   constexpr int NR = RU_V / VS;         // v rows this workgroup owns
   constexpr int THR = NR * 2;
   static_assert(!(NORM && VS > 1), "the fused row norm needs the whole 128-wide row");
+  static_assert(NORM != 4 || CV, "the pair's arrival counter is the folded convolution's block");
   __shared__ float wsum[THR / 32];
+  // NORM 3: a block of tokens' bf16 output rows, for the rotation (one token a wave afterwards)
+  constexpr int RB = THR / 32;
+  __shared__ __attribute__((aligned(8))) unsigned short srot[NORM == 3 ? RB * RU_V : 1];
   __shared__ float spart[STG ? RU_TMAX * 4 : 1];   // per (token, half): sum q^2, sum k^2
   __shared__ float sscl [STG ? RU_TMAX * 2 : 1];   // per token: the two closed scales
   const int n = blockIdx.x, hv = blockIdx.y;
@@ -720,14 +773,49 @@ void r3dh_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
     const unsigned short ob = f32_to_bf16(on);
     if (half == 0) o[((size_t)tok * H + hv) * RU_V + row] = ob;
 
+    // NORM 3 (gdn_conv_recurrent_update_had, group 128): had_quant_act_i8g's codes of the row's
+    // 128 stored bf16 values, rotated by ru_fwht_wave<128> in one wave (a lane four consecutive
+    // channels), then the wave's amax / 127 scale and round-to-nearest-even. Nothing in the token
+    // loop reads the codes, so the rows wait in LDS and every RB tokens (and after the last) each
+    // wave takes one token's: the rotation leaves the serial chain of the state update.
+    if (NORM == 3 && oq) {
+      const int tb = t % RB;
+      if (half == 0) srot[tb * RU_V + row] = ob;
+      if (tb == RB - 1 || t == T - 1) {
+        ru_sync();
+        const int rw = tid >> 5, rl = tid & 31;
+        if (rw <= tb) {
+          const int rtok = tok - tb + rw;
+          const uint2 rr = *(const uint2*)(srot + rw * RU_V + 4 * rl);
+          float rv[4] = { bf16_to_f32((unsigned short)(rr.x & 0xFFFFu)),
+                          bf16_to_f32((unsigned short)(rr.x >> 16)),
+                          bf16_to_f32((unsigned short)(rr.y & 0xFFFFu)),
+                          bf16_to_f32((unsigned short)(rr.y >> 16)) };
+          ru_fwht_wave<128>(rv, rl);
+          float m = fmaxf(fmaxf(fabsf(rv[0]), fabsf(rv[1])), fmaxf(fabsf(rv[2]), fabsf(rv[3])));
+          m = r3dh_wave_max(m);
+          const float qs = m > 0.0f ? m * (1.0f / 127.0f) : 1.0f;
+          if (rl == 0) os[(size_t)rtok * os_ld + hv] = qs;
+          const float inv = 1.0f / qs;
+          uint32_t pk = 0;
+#pragma unroll
+          for (int j = 0; j < 4; ++j)
+            pk |= ((uint32_t)(int)rintf(fminf(fmaxf(rv[j] * inv, -127.0f), 127.0f)) & 0xFFu) << (8 * j);
+          *(uint32_t*)(oq + (size_t)rtok * oq_pitch + (size_t)hv * RU_V + 4 * rl) = pk;
+        }
+        ru_sync();               // srot is reused by the next block of tokens
+      }
+    }
+
     // The out projection's quantiser, folded in (saves 48 launches per decode step, each with less
     // work than its launch gap). The quant group (128) is the row and NORM gives one workgroup per
     // (token, head), so the amax is a workgroup reduction and the scale index is (tok, hv).
     // Bit-identical to the standalone quantiser: it quantises the stored bf16 `ob`, not the f32
     // `on`, with r3dh_fused_quant_fp8.hip's quant_group arithmetic (including the clamp that keeps
     // the group maximum from becoming NaN). NORM == 2 writes int8 codes instead (quant_act_i8g:
-    // scale amax / 127, round to nearest-even).
-    if (NORM && oq) {
+    // scale amax / 127, round to nearest-even). NORM 3 (the `_had` row at group 128) took the
+    // rotated path above; NORM 4 (its group-256 form) writes after the token loop.
+    if ((NORM == 1 || NORM == 2) && oq) {
       const float ov = bf16_to_f32(ob);
       float mv = (half == 0) ? fabsf(ov) : 0.0f;
       mv = fmaxf(mv, r3dh_xor_lane<16>(mv)); mv = fmaxf(mv, r3dh_xor_lane<8>(mv));
@@ -762,6 +850,57 @@ void r3dh_gdn_recurrent_update_kernel(const unsigned short* __restrict__ q,
               + (size_t)row * RU_K + k0;
 #pragma unroll
         for (int j = 0; j < RU_HK; j += 8) ru_store8<NT, SDT>(p + j, &h[j]);
+      }
+    }
+  }
+
+  // NORM 4 (gdn_conv_recurrent_update_had at IQ8R's group, 256): had_quant_act_i8g's codes with
+  // one scale per 256 columns of `o`, two value heads' rows. A workgroup owns one head, so the
+  // second of a pair to arrive quantises both heads' rows for every token of the sequence, from
+  // the stored bf16 `o`: each head's 128 values through ru_fwht_wave<128> in one wave (wave 0 the
+  // even head, wave 1 the odd), the amax over the pair, then that quantiser's amax / 127 scale and
+  // round-to-nearest-even. The arrival is r3dh_gemm_fp8a8's idiom: every store made visible
+  // device-wide before the arrival is published, and the workgroup completing the count resets it
+  // for the next launch and acquires its partner's rows.
+  if (NORM == 4) {
+    if (oq) {
+      __shared__ unsigned int s_pair;
+      __threadfence();
+      __syncthreads();
+      unsigned int* const pc = cv.ctr + kRuPairCtr + (size_t)n * (H / 2) + (hv >> 1);
+      if (tid == 0)
+        s_pair = __hip_atomic_fetch_add(pc, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+      __syncthreads();
+      if (s_pair == 1u) {
+        if (tid == 0) __hip_atomic_store(pc, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
+        const int hp = hv & ~1, pw = tid >> 5, pl = tid & 31;
+        for (int t = 0; t < T; ++t) {
+          const int tok = bos + t;
+          float rv[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+          if (tid < 64) {
+            const unsigned short* src = o + ((size_t)tok * H + hp + pw) * RU_V + 4 * pl;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) rv[j] = bf16_to_f32(src[j]);
+            ru_fwht_wave<128>(rv, pl);
+            float m = fmaxf(fmaxf(fabsf(rv[0]), fabsf(rv[1])), fmaxf(fabsf(rv[2]), fabsf(rv[3])));
+            m = r3dh_wave_max(m);
+            if (pl == 0) wsum[pw] = m;
+          }
+          __syncthreads();
+          if (tid < 64) {
+            const float m = fmaxf(wsum[0], wsum[1]);
+            const float qs = m > 0.0f ? m * (1.0f / 127.0f) : 1.0f;
+            if (tid == 0) os[(size_t)tok * os_ld + (hp >> 1)] = qs;
+            const float inv = 1.0f / qs;
+            uint32_t pk = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+              pk |= ((uint32_t)(int)rintf(fminf(fmaxf(rv[j] * inv, -127.0f), 127.0f)) & 0xFFu) << (8 * j);
+            *(uint32_t*)(oq + (size_t)tok * oq_pitch + (size_t)(hp + pw) * RU_V + 4 * pl) = pk;
+          }
+          __syncthreads();             // wsum is reused by the next token
+        }
       }
     }
   }
@@ -933,12 +1072,6 @@ extern "C" int r3dh_gdn_recurrent_update_k128_v128_bf16_fp32state(
 
 // ============================================================== the folded convolution
 
-// Arrival counters for the folded convolution: one block per (stream, output), zeroed once and
-// reset by the last arriver of each group. As with split_ctr in r3dh_gemm_fp8a8.hip, launches
-// sharing a block must not overlap: different streams get different blocks, and launches on one
-// stream sharing an output are ordered by their dependency.
-constexpr unsigned kMaxConvCtr = 4096;
-
 // The blocks live as long as their output's memory: the core reports each device range it frees
 // (rad_plugin_freed below), and the blocks of outputs inside it go, since nothing launched against
 // that memory runs any more. A process that loads and unloads models would otherwise keep every
@@ -995,7 +1128,7 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
                                     long sidx_stride, const void* nacc, const void* z,
                                     long z_pitch, const void* nw, float neps, int nact, int N,
                                     int H, int Hg, float scale, float thr, int state_fp16,
-                                    RadStream stream, int oq_i8, bool anc) {
+                                    RadStream stream, int qmode, bool anc) {
   if (anc && sidx_stride < 6) return RAD_E_SHAPE;
   if (anc && sidx_stride * RU_FSTR > st_head) return RAD_E_SHAPE;
   const int sdt = state_fp16 ? 1 : 0;
@@ -1004,8 +1137,12 @@ static int ru_conv_recurrent_launch(const RuConv& cv, const void* a, const void*
   const bool nt = flood <= (long)RU_NT_MB * 1024 * 1024;
   const dim3 grid(N, H, 1), blk(RU_V * 2);
 #define RC_LAUNCH(NTC, ANCC, SDTC)                                                            \
-  do { if (oq_i8) RC_LAUNCH_NM(2, NTC, ANCC, SDTC); else RC_LAUNCH_NM(1, NTC, ANCC, SDTC); }    \
-  while (0)
+  do {                                                                                       \
+    if (qmode <= 1)      RC_LAUNCH_NM(1, NTC, ANCC, SDTC);                                   \
+    else if (qmode == 2) RC_LAUNCH_NM(2, NTC, ANCC, SDTC);                                   \
+    else if (qmode == 3) RC_LAUNCH_NM(3, NTC, ANCC, SDTC);                                   \
+    else                 RC_LAUNCH_NM(4, NTC, ANCC, SDTC);                                   \
+  } while (0)
 #define RC_LAUNCH_NM(NM, NTC, ANCC, SDTC)                                                     \
   hipLaunchKernelGGL((r3dh_gdn_recurrent_update_kernel<1, NM, 1, NTC, ANCC, 0, SDTC, 1>),       \
                      grid, blk, 0, (hipStream_t)stream, nullptr, nullptr, nullptr, a, b,       \
@@ -1149,7 +1286,9 @@ enum { OPD_CR_X = 0, OPD_CR_CW, OPD_CR_CB, OPD_CR_CSTATE, OPD_CR_CIDX, OPD_CR_A,
        OPD_CR_ALOG, OPD_CR_DTB, OPD_CR_STATE, OPD_CR_SIDX, OPD_CR_NACC, OPD_CR_CU, OPD_CR_Z,
        OPD_CR_NORMW, OPD_CR_O, OPD_CR_OQ, OPD_CR_OS };
 
-extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) {
+/* `had`: gdn_conv_recurrent_update_had, whose `o_q` / `o_scale` are had_quant_act_i8g's codes of
+ * `o` (required, int8). The arithmetic and every other byte are the base op's. */
+static int r3dh_gdn_conv_recurrent_entry(const RadArgs* a, RadStream s, bool had) {
     if (gdn_dims_ok() != RAD_OK) return R3DH_NO(RAD_E_SHAPE);
     const RadTensor* x     = r3dh_opt(a, OPD_CR_X);
     const RadTensor* cw    = r3dh_opt(a, OPD_CR_CW);
@@ -1175,6 +1314,8 @@ extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s)
         !z || !nw || !o)
         return R3DH_NO(RAD_E_INVAL);
     if ((oq != nullptr) != (os != nullptr)) return R3DH_NO(RAD_E_INVAL);
+    /* The `_had` row's codes are required and int8: an fp8 form is the base row's. */
+    if (had && (!oq || oq->dtype != RAD_I8)) return R3DH_NO(RAD_E_INVAL);
     if (x->rank != 2 || cst->rank != 3 || o->rank != 3 || ta->rank != 2 || tb->rank != 2)
         return R3DH_NO(RAD_E_SHAPE);
     if (state->rank < 2 || sidx->rank < 1 || cidx->rank < 1) return R3DH_NO(RAD_E_SHAPE);
@@ -1197,7 +1338,16 @@ extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s)
     if (H % Hg) return R3DH_NO(RAD_E_SHAPE);
     const long long nhv = r3dh_geti_or(a, "n_head_v", 0);
     if (nhv > 0 && nhv != H) return R3DH_NO(RAD_E_SHAPE);
-    if ((long long)N * Hg > (long long)kMaxConvCtr) return R3DH_NO(RAD_E_SHAPE);
+    /* `_had`'s scale group: 128 (one per value head) or 256 (IQ8R: one per pair of value heads,
+     * the pair's counters the conv block's upper half). Any other group is refused. */
+    const long long qgrp = r3dh_geti_or(a, "group", RU_V);
+    const bool wide = had && qgrp == 2 * RU_V;
+    if (had && qgrp != RU_V && !wide) return R3DH_NO(RAD_E_UNSUPPORTED);
+    if (wide && (H % 2 || (long long)N * Hg > (long long)kRuPairCtr ||
+                 (long long)N * (H / 2) > (long long)kRuPairCtr))
+        return R3DH_NO(RAD_E_SHAPE);
+    if ((long long)N * Hg > (long long)(wide ? kRuPairCtr : kMaxConvCtr))
+        return R3DH_NO(RAD_E_SHAPE);
 
     const long long xpitch = r3dh_row_pitch(x);
     if (xpitch < 0) return R3DH_NO(RAD_E_STRIDE);
@@ -1225,6 +1375,17 @@ extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s)
     /* The recurrent half's checks, as in r3dh_rad_gdn_recurrent_update. */
     const int anc = ru_state_form(a);
     if (anc < 0) return R3DH_NO(RAD_E_UNSUPPORTED);
+    /* `_had` writes its codes as four-byte stores, so its rows are [tokens, heads * head_v] with
+     * a pitch and a base a dword wide, and its scale row is [tokens, n_head_v] (group 128) or
+     * [tokens, n_head_v / 2] (group 256). The base rows' byte stores need neither. */
+    const long long oq_pitch = oq ? (long long)r3dh_row_pitch(oq) : 0;
+    const long long os_ld = os ? (long long)r3dh_row_pitch(os) : 0;
+    if (had) {
+        if (oq->rank < 2 || oq_pitch < H * V) return R3DH_NO(RAD_E_SHAPE);
+        if ((oq_pitch & 3) || ((size_t)oq->data & 3)) return R3DH_NO(RAD_E_ALIGN);
+        if (os->rank < 2 || os_ld < (wide ? H / 2 : H)) return R3DH_NO(RAD_E_SHAPE);
+        if ((size_t)os->data & 3) return R3DH_NO(RAD_E_ALIGN);
+    }
     const float scale = (float)r3dh_getf(a, "scale", 1.0);
     const float thr   = (float)r3dh_getf(a, "softplus_thr", 20.0);
     const float neps  = (float)r3dh_getf(a, "eps", 0.0);
@@ -1244,12 +1405,21 @@ extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s)
     cv.ctr = ru_conv_ctr(s, o->data);
     if (!cv.ctr) return R3DH_NO(RAD_E_NOMEM);
 
+    /* 0: no codes, 1: E4M3, 2: int8, 3: had group 128, 4: had group 256 (the pair's counters). */
+    const int qmode = had ? (wide ? 4 : 3) : (oq ? (oq->dtype == RAD_I8 ? 2 : 1) : 0);
+
     return ru_conv_recurrent_launch(
         cv, ta->data, tb->data, (long)ab_stride, alog->data, dtb->data, state->data,
         (long)state->stride[0], (long)state->stride[1], o->data, oq ? oq->data : nullptr,
-        os ? os->data : nullptr, oq ? (long)r3dh_row_pitch(oq) : 0,
-        os ? (long)r3dh_row_pitch(os) : 0, cu->data, sidx->data, (long)sidx->stride[0],
+        os ? os->data : nullptr, oq_pitch, os_ld, cu->data, sidx->data, (long)sidx->stride[0],
         nacc ? nacc->data : nullptr, z->data, (long)z_row, nw->data, neps, nact, N, (int)H,
-        (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s,
-        oq && oq->dtype == RAD_I8 ? 1 : 0, anc != 0);
+        (int)Hg, scale, thr, state->dtype == RAD_F16 ? 1 : 0, s, qmode, anc != 0);
+}
+
+extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s) {
+    return r3dh_gdn_conv_recurrent_entry(a, s, false);
+}
+
+extern "C" int r3dh_rad_gdn_conv_recurrent_update_had(const RadArgs* a, RadStream s) {
+    return r3dh_gdn_conv_recurrent_entry(a, s, true);
 }

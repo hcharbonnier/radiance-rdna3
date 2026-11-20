@@ -1100,9 +1100,13 @@ TEST(an_exact_tail_snapshot_is_where_the_last_chunk_starts) {
     /* One ending on the grid: the last chunk is [1536, 2048), and its end is an interval. */
     c = cut_from(f.sch, 0, 2048, 512);
     CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1536, 2048 }));
-    /* Inside the first interval nothing (as under nearest: cheap to prefill again). */
+    /* Inside the first interval exact has no grid point to resume at, so it anchors a snapshot
+     * a quantum below the prompt's last boundary -- far enough that a re-rendered tail cannot
+     * push it past the divergence: the next turn resumes there instead of re-prefilling the whole
+     * conversation (Short-turn anchor). */
     c = cut_from(f.sch, 0, 900, 512);
-    CHECK(c.ckpts.empty());
+    CHECK((c.ends == std::vector<int64_t>{ 512, 832, 900 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 832 }));
     /* A step sharing its budget may straddle the tail: split there, the snapshot written. */
     int64_t ck = -1;
     CHECK_EQ(f.sch.plan_chunk(1400, 1800, 512, &ck), 136);
@@ -1121,9 +1125,43 @@ TEST(an_exact_tail_snapshot_is_where_the_last_chunk_starts) {
     CHECK((c.ckpts == std::vector<int64_t>{ 1024, 1792 }));
 }
 
-/* The property itself, over every geometry and many prompt lengths: every checkpoint is on the
- * grid and is a chunk start of the cold run of the prompt that wrote it and of any longer prompt
- * it prefixes (an agent's next turn), and from it the hit cuts exactly the cold run's chunks. */
+/* --tail-anchor off drops the short-turn anchor: a prompt under the first interval runs its whole
+ * last chunk and writes no off-grid snapshot, so its next turn re-prefills it. At or past the
+ * interval the cut is the same either way: the interval's checkpoint is a chunk end, not a tail
+ * anchor. */
+TEST(a_prompt_under_the_interval_runs_one_chunk_with_the_tail_anchor_off) {
+    Fixture f;
+    f.build(4096, 64, /*max_tok=*/2048);
+    f.cfg.checkpoint_interval = 2048;
+    REQUIRE_EQ(f.start(), RAD_OK);
+    CHECK_EQ(f.sch.tail_checkpoint(972), (int64_t)896);
+    Cut c = cut_from(f.sch, 0, 972, 2048);
+    CHECK((c.ends == std::vector<int64_t>{ 896, 972 }));
+    CHECK((c.ckpts == std::vector<int64_t>{ 896 }));
+
+    Fixture t;
+    t.build(4096, 64, /*max_tok=*/2048);
+    t.cfg.checkpoint_interval = 2048;
+    t.cfg.tail_anchor = false;
+    REQUIRE_EQ(t.start(), RAD_OK);
+    CHECK_EQ(t.sch.tail_checkpoint(972), (int64_t)-1);
+    CHECK_EQ(t.sch.tail_checkpoint(900), (int64_t)-1);
+    c = cut_from(t.sch, 0, 972, 2048);
+    CHECK((c.ends == std::vector<int64_t>{ 972 }));
+    CHECK(c.ckpts.empty());
+
+    const Cut a = cut_from(f.sch, 0, 3000, 2048);
+    const Cut b = cut_from(t.sch, 0, 3000, 2048);
+    CHECK(a.ends == b.ends);
+    CHECK(a.ckpts == b.ckpts);
+    CHECK(!a.ckpts.empty());
+}
+
+/* The property itself, over every geometry and many prompt lengths: every checkpoint past the
+ * first interval is on the grid and is a chunk start of the cold run of the prompt that wrote it
+ * and of any longer prompt it prefixes (an agent's next turn), and from it the hit cuts exactly the
+ * cold run's chunks. A prompt shorter than one interval is the one exception: its anchor is a
+ * resume point no grid has, which the check below pins. */
 TEST(an_exact_hit_from_any_checkpoint_recomputes_the_cold_runs_own_chunks) {
     for (int kind = 0; kind < 6; ++kind) {
         Fixture f;
@@ -1134,6 +1172,10 @@ TEST(an_exact_hit_from_any_checkpoint_recomputes_the_cold_runs_own_chunks) {
         for (int64_t L = 100; L <= 3000; L += 37) {
             const Cut cold = cut_from(f.sch, 0, L, 512);
             for (int64_t c : cold.ckpts) {
+                /* A prompt shorter than one interval anchors a snapshot off the grid (one quantum
+                 * below its tail): the trade pinned below. Everything else is on the grid and a
+                 * cold run's chunk start. */
+                if (c <= g.checkpoint_interval && !g.on_grid(c)) continue;
                 CHECK(g.on_grid(c));
                 if (c >= L) continue;
                 CHECK(std::find(cold.ends.begin(), cold.ends.end(), c) != cold.ends.end());
@@ -1148,18 +1190,23 @@ TEST(an_exact_hit_from_any_checkpoint_recomputes_the_cold_runs_own_chunks) {
         }
         CHECK(kind == 5 ? checked == 0 : checked > 20);
     }
-    /* What nearest gives up: its tail snapshot at a 1000-token prompt's last quantum boundary
-     * (960) is no chunk start of the 1500-token turn after it, which a cold run cuts at 768 and
-     * 1024, so a hit there recomputes [960, 1024) as a chunk of its own. */
-    Fixture n;
-    n.build();
-    REQUIRE_EQ(n.start(), RAD_OK);
-    const Cut c1000 = cut_from(n.sch, 0, 1000, 512);
-    CHECK(std::find(c1000.ckpts.begin(), c1000.ckpts.end(), 960) != c1000.ckpts.end());
-    const Cut c1500 = cut_from(n.sch, 0, 1500, 512);
-    CHECK(std::find(c1500.ends.begin(), c1500.ends.end(), 960) == c1500.ends.end());
-    CHECK(std::find(c1500.ends.begin(), c1500.ends.end(), 768) != c1500.ends.end());
-    CHECK_EQ(cut_from(n.sch, 960, 1500, 512).ends.front(), 1024);
+    /* The exception, pinned: a 1000-token prompt (interval 1024) anchors at 896, which is no chunk
+     * start of the 1500-token turn after it -- the cold run cuts [0, 1024) whole -- so that turn
+     * recomputes [896, 1024) in a chunk of its own. Without the anchor it resumed at nothing and
+     * re-prefilled all 1500 (Scheduler::admit_one, HitCut::NoSnapshot). Nearest already takes the
+     * same trade at every tail. */
+    for (int exact = 0; exact < 2; ++exact) {
+        Fixture n;
+        exact_fixture(n, 1);
+        n.cfg.prefix_exact = exact != 0;
+        REQUIRE_EQ(n.start(), RAD_OK);
+        const Cut c1000 = cut_from(n.sch, 0, 1000, 512);
+        CHECK(std::find(c1000.ckpts.begin(), c1000.ckpts.end(), 896) != c1000.ckpts.end());
+        const Cut c1500 = cut_from(n.sch, 0, 1500, 512);
+        CHECK(std::find(c1500.ends.begin(), c1500.ends.end(), 896) == c1500.ends.end());
+        CHECK(std::find(c1500.ends.begin(), c1500.ends.end(), 1024) != c1500.ends.end());
+        CHECK_EQ(cut_from(n.sch, 896, 1500, 512).ends.front(), 1024);
+    }
 }
 
 /* At admission: a hit at a snapshot resumes there (plan_chunk put it on the grid); a hit with no
@@ -1443,6 +1490,46 @@ TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     f.commit_plain();
     CHECK_EQ((int)f.pc.committed.size(), 1);
     CHECK_EQ(f.pc.committed[0], 512);        /* ctx_len 256 + ckpt_tok 255 + 1 */
+}
+
+/* A prompt shorter than one checkpoint interval: exact resume has no grid position below the
+ * first interval, so before R22 the turn wrote no snapshot at all, the next turn matched its
+ * attention blocks, found no slot for the linear state and reused nothing
+ * (prefix_hit_cuts_total{reason="no_snapshot"}). The turn anchors a snapshot at its last quantum
+ * boundary; a later turn resumes there and its first chunk writes the next anchor, so the ladder
+ * grows with the conversation. */
+TEST(a_prompt_under_one_interval_anchors_a_snapshot_its_next_turn_resumes_from) {
+    for (int exact = 0; exact < 2; ++exact) {
+        Fixture f;
+        exact_fixture(f, 1);                  /* interval 1024, chunks of 512 */
+        f.cfg.prefix_exact = exact != 0;
+        REQUIRE_EQ(f.start(), RAD_OK);
+
+        /* The earlier turn left its anchor at 832 (one quantum below its last boundary); this
+         * turn appends 168 tokens to 1000. The resume keeps the anchor even under exact: it is a
+         * snapshot, not a position to round down. */
+        f.pc.seed(832);
+        f.pc.lin = 832;
+        f.pc.src = 1;
+        const uint64_t a = f.submit(1000, 8);
+        const RadBatch* b = f.sch.step();
+        REQUIRE(b != nullptr);
+        CHECK_EQ(f.sch.find(a)->n_computed, 832);
+        CHECK_EQ(b->ctx_lens[0], 832);
+        CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 1);
+        const SchedMetrics m = f.sch.metrics();
+        CHECK_EQ(m.linear_cached_tokens, 832);
+        CHECK_EQ(m.hit_cut_no_snapshot, 0);
+        CHECK_EQ(m.hit_cut_tokens, 0);
+
+        /* Its first chunk runs to the next anchor, one quantum below this turn's tail
+         * (832 + 64 = 896); checkpoint_tok is the anchor's offset inside the chunk, as RadBatch
+         * spells it. */
+        CHECK_EQ(b->n_tok, 64);
+        CHECK_EQ(b->n_checkpoints, 1);
+        CHECK_EQ(b->checkpoint_tok[0], 63);
+        CHECK_EQ(b->ctx_lens[0] + b->checkpoint_tok[0] + 1, 896);
+    }
 }
 
 /* A hit that resumes more than an interval below the attention blocks is counted with its own
@@ -3877,8 +3964,12 @@ TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
     CHECK_EQ(f.sch.plan_chunk(1024, 100000, f.sch.busy_cap(1024, 100000, 2048, 272), nullptr), 1024);
     /* more reserved than the floor allows for: the floor */
     CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 1500), 1024);
-    /* a prompt's last stretch, shorter than the cap: all of it */
-    CHECK_EQ(f.sch.plan_chunk(0, 1500, f.sch.busy_cap(0, 1500, 2048, 272), nullptr), 1500);
+    /* a prompt's last stretch, shorter than the cap: all of it, once past the tail anchor */
+    CHECK_EQ(f.sch.busy_cap(1408, 1500, 2048, 272), 1776);
+    CHECK_EQ(f.sch.plan_chunk(1408, 1500, f.sch.busy_cap(1408, 1500, 2048, 272), nullptr), 92);
+    /* a whole short prompt is split at its tail anchor: the snapshot the next turn resumes from
+     * costs a short final chunk (Scheduler::kShortTailMin) */
+    CHECK_EQ(f.sch.plan_chunk(0, 1500, f.sch.busy_cap(0, 1500, 2048, 272), nullptr), 1408);
     /* a budget already under the floor: never more than the budget */
     CHECK_EQ(f.sch.busy_cap(0, 100000, 512, 64), 512);
     /* decode rows alone behind it (2 rows x (1 + 3 drafts)): no split; the chunk ends a quantum

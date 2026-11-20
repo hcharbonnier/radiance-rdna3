@@ -49,7 +49,8 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
 # relayout_iqr_test holds the IQR relayout to the stored form r4d_iqr.h describes, so it also
 # compiles r4d_iqr_layout.cpp.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test)
+# iqr_parity_test compiles both libraries' IQR layout sources and requires byte equality (ADR-1).
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test iqr_parity_test)
 # Their relayouts' vector loops, at every CPU level (libr4d/r4d_hsimd.h), built for these tests
 # whether or not libr4d itself is.
 include(${CMAKE_SOURCE_DIR}/cmake/RadSimdLevels.cmake)
@@ -174,6 +175,46 @@ file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 if(NOT RAD_HIP_FOUND)
   list(FILTER RAD_TESTS EXCLUDE REGEX "/dspark_device_test\\.cpp$")
 endif()
+# iqr_device_test dlopens the built libr3d, so it exists only where that library is built;
+# hc_layout_test is host arithmetic over the same plugin, so it needs no card.
+if(TARGET libr3d AND RAD_HIP_FOUND)
+  set(RAD_TESTS_WITH_R3D_DEVICE iqr_device_test ple_hc_device_test qsa_block_key_device_test
+                                qsa_score_device_test qsa_select_device_test qsa_work_device_test
+                                attn_paged_device_test
+                                moe_iqr_device_test moe_iqr_test moe_w4nl_device_test kv_store_b4_device_test
+                                gather_rows_u8_device_test
+                                r3d_rope_imrope_h128_device_test router_fused_device_test
+                                gemv_n1_device_test vision_rows_device_test
+                                gdn_conv_recurrent_had_device_test logits_bf16_device_test
+                                mtp_enter_e4m3_device_test logit_rerank_iqr_device_test
+                                act_i8g_group256_device_test tp2_collectives_device_test
+                                dflash_conv_device_test)
+  set(RAD_TESTS_WITH_R3D_HOST hc_layout_test)
+else()
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/iqr_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/moe_iqr_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/moe_w4nl_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/ple_hc_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_block_key_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_score_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_select_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/qsa_work_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/r3d_rope_imrope_h128_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/vision_rows_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/gdn_conv_recurrent_had_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/moe_iqr_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/kv_store_b4_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/gather_rows_u8_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/router_fused_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/gemv_n1_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/logits_bf16_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/mtp_enter_e4m3_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/logit_rerank_iqr_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/act_i8g_group256_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/tp2_collectives_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/dflash_conv_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/hc_layout_test\\.cpp$")
+endif()
 foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
   if(n IN_LIST RAD_TESTS_NO_CORE)
@@ -220,6 +261,29 @@ foreach(t ${RAD_TESTS})
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/tools/iface.cpp)
     target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
     target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/tools)
+  elseif(n IN_LIST RAD_TESTS_WITH_R3D_DEVICE)
+    add_executable(${n} ${t})
+    target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE} ${CMAKE_DL_LIBS} ${RAD_HIP_RUNTIME})
+    target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr3d)
+    target_compile_definitions(${n} PRIVATE RAD_R3D_SO="$<TARGET_FILE:libr3d>")
+    add_dependencies(${n} libr3d)
+    # The MoE IQR tests must round their scale multiplies separately, as the kernel does, and state
+    # their f32 order (a multiply and an add, not an fma).
+    if(n STREQUAL moe_iqr_device_test OR n STREQUAL "moe_iqr_test" OR
+       n STREQUAL moe_w4nl_device_test OR n STREQUAL act_i8g_group256_device_test)
+      target_compile_options(${n} PRIVATE -ffp-contract=off)
+    endif()
+    # The PLE/HC ladder compares against libref's row-by-row oracle.
+    if(TARGET libref)
+      target_compile_definitions(${n} PRIVATE RAD_LIBREF_SO="$<TARGET_FILE:libref>")
+      add_dependencies(${n} libref)
+    endif()
+  elseif(n IN_LIST RAD_TESTS_WITH_R3D_HOST)
+    add_executable(${n} ${t})
+    target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE} ${CMAKE_DL_LIBS})
+    target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr3d)
+    target_compile_definitions(${n} PRIVATE RAD_R3D_SO="$<TARGET_FILE:libr3d>")
+    add_dependencies(${n} libr3d)
   elseif(n IN_LIST RAD_TESTS_WITH_R4D_HOST)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/libr4d/r4d_layout.cpp
                             ${CMAKE_SOURCE_DIR}/libr4d/r4d_fp8_layout.cpp
@@ -235,6 +299,11 @@ foreach(t ${RAD_TESTS})
     endif()
     if(n STREQUAL relayout_iqr_test)
       target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_iqr_layout.cpp)
+    endif()
+    if(n STREQUAL iqr_parity_test)
+      target_sources(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr4d/r4d_iqr_layout.cpp
+                                  ${CMAKE_SOURCE_DIR}/libr3d/r3d_iqr_layout.cpp)
+      target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr3d)
     endif()
   elseif(n IN_LIST RAD_TESTS_WITH_PACK)
     add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/arch/minimaxh3/rad_ref2va_pack.cpp)
@@ -328,6 +397,27 @@ if(RAD_HIP_FOUND)
       SKIP_RETURN_CODE 77
       TIMEOUT ${RAD_TEST_TIMEOUT}
       ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  endforeach()
+  # The IQR GEMM, the PLE/HC ladder, the QSA rows, the routed IQR GEMM and the vision tower's
+  # linear and position-table rows against their host references, on the card the library was
+  # built for.
+  foreach(n iqr_device_test ple_hc_device_test qsa_block_key_device_test qsa_score_device_test
+            qsa_select_device_test qsa_work_device_test moe_iqr_device_test moe_iqr_test
+            moe_w4nl_device_test
+            kv_store_b4_device_test r3d_rope_imrope_h128_device_test router_fused_device_test
+            gather_rows_u8_device_test
+            gemv_n1_device_test vision_rows_device_test gdn_conv_recurrent_had_device_test
+            logits_bf16_device_test mtp_enter_e4m3_device_test logit_rerank_iqr_device_test
+            act_i8g_group256_device_test tp2_collectives_device_test dflash_conv_device_test)
+    if(TARGET ${n})
+      add_test(NAME ${n}_card COMMAND ${n})
+      set_tests_properties(${n}_card PROPERTIES
+        LABELS gpu
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        TIMEOUT ${RAD_TEST_TIMEOUT}
+        ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+    endif()
   endforeach()
 endif()
 

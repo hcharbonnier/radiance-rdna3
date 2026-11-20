@@ -67,8 +67,25 @@ struct HeatParams {
      * times its own bytes in misses.
      *
      * Per class because a rank holding an uneven slice of every expert has two classes of about
-     * half an expert each; a shared budget would make residency converge half as fast. */
+     * half an expert each; a shared budget would make residency converge half as fast.
+     *
+     * `heat_params_for` lowers it on a plan that already keeps most expert bytes on the card, but
+     * only once a broad pass has shaped the resident set (moves_full); the full budget comes back
+     * after kHeatDenseSteps without one. There the hot set is resident and the extra swaps are
+     * churn: on Qwen3.8-Flash-Next TP1 at 66% resident (48 GiB card, 24 GiB pool), 64 moves a step
+     * gave 77.6% decode hit rate and 9.4 GiB of promotions over 64 tokens at 3 252 context, 16
+     * gave 77.4% and 3.6 GiB, and the 64-token decode ran 5 949 -> 5 845 ms (NS=0) and
+     * 3 771 -> 3 745 ms (NS=3). A 92-token context, whose prompt does not shape the set, keeps the
+     * full budget and its 1 734 ms. */
     int moves_per_step = RAD_PLACE_MOVES_PER_STEP;
+
+    /* The budget for a step whose routing history is thin: no broad pass has shaped the resident
+     * set, so the decode is still discovering it and every promotion is a first one. 64 keeps a
+     * short prompt's decode at the rate the full budget gave it. -1 follows moves_per_step, which
+     * is what a caller that sets only that expects. */
+    int moves_full = -1;
+
+    int full_budget() const { return moves_full >= 0 ? moves_full : moves_per_step; }
 
     /* The most one histogram credits, in selections; a larger histogram is scaled to this total.
      * Decode routes a few rows a sequence and stays under it. A prefill chunk routes thousands
@@ -92,6 +109,30 @@ struct HeatParams {
      * container is ground truth), so the cost of an admission mistake is one future re-read. */
     float admit_heat = 8.0f;
 };
+
+/* The move budget when the caller asks for none (`--expert-moves 0`). A plan that keeps this
+ * share of its movable expert bytes on the card has its decode hot set resident already: every
+ * extra swap is a promotion the next steps would have hit anyway, paid over the link the misses
+ * use. The share is over the plan's expert bytes, all slab classes together; a plan whose classes
+ * differ widely in residency makes one decision for both, which the symmetric shards of TP keep
+ * representative. Below the share the swaps are how residency follows a working set that does not
+ * fit, and the full RAD_PLACE_MOVES_PER_STEP budget pays. The threshold and the low budget come
+ * from Flash-Next TP1: 66% resident measured flat hit rate from 8 to 128 moves (76.6-77.7%),
+ * while the replay at 40% resident needs 64 (74.1% at 32, 77.1% at 64). */
+constexpr double kHeatChurnShare = 0.60;
+constexpr int    kHeatChurnMoves = 16;
+
+/* A routing histogram at least this wide came from a broad pass (about 410 rows at top_k 10),
+ * which shapes the resident set for the steps after it. Until one is seen, and for kHeatDenseSteps
+ * steps after, the engine keeps the full move budget: a short prompt's decode is discovering its
+ * set, and cutting the budget there cost 6% of a 64-token decode at 92 context. A prompt served
+ * in chunks below this width never arms, which falls back to the full budget (today's behaviour),
+ * never to the churn one. */
+constexpr int64_t kHeatDenseSelections = 4096;
+constexpr int     kHeatDenseSteps = 512;
+
+/* HeatParams for `plan`: `moves` > 0 is the caller's budget, 0 the policy above. */
+HeatParams heat_params_for(const Plan& plan, int moves);
 
 /* A promotion and its matching demotion. The mover issues two transfers, but they are decided
  * together: a promotion without its demotion would grow the resident set past the slab. */
@@ -290,6 +331,8 @@ private:
     bool       enabled_ = false;
     int32_t    n_layer_ = 0;
     HeatCounters stats_;
+    /* Steps left on the churn budget; set by a broad pass's histogram (kHeatDenseSelections). */
+    int32_t    dense_steps_ = 0;
 
     /* Heat by position, not by unit. Each layer owns a run of positions whose front is indexed by
      * expert: expert e of layer l is at slot_lo_[l] + e, whether or not the plan has a unit for it

@@ -69,6 +69,16 @@ struct Engine::Rank {
     /* Per Ctx level (0 is the full plan): the bytes at the top of this rank's arena that level
      * leaves to the expert slab. */
     std::vector<int64_t>    arena_lent;
+    /* Per Ctx level: the staging region at the arena's top is reserved for the prefill stager at
+     * this level (stager.ring_full()), so `arena_lent` already excludes it. Level 0 keeps it. */
+    std::vector<char>       arena_ring_top;
+    /* Per Ctx level: the same loan when the step does not stage, the ring lent back to the slab.
+     * A decode step takes this one: it needs no ring, and the residents it keeps are the ones the
+     * next large chunk would otherwise find in the host pool. */
+    std::vector<int64_t>    arena_lent_full;
+    /* The smallest step the scheduler keeps a held-back prefill chunk at (--busy-prefill-chunk):
+     * the level above every arena level when the stager was full-plan only. */
+    int64_t                 sched_stage_rows = 0;
     /* Where the prefill stager's ring is at the span's shared level, from the arena's base; -1
      * without that level. */
     int64_t                 arena_low_off = -1;

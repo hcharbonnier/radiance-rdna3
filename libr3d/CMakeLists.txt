@@ -1,4 +1,4 @@
-# libr3d serves RDNA3 only, declared here and nowhere else. Its kernels rely on wave32 and on
+﻿# libr3d serves RDNA3 only, declared here and nowhere else. Its kernels rely on wave32 and on
 # instructions RDNA3 has: v_dot2acc_f32_f16 and the 16x16x16 v_wmma wave-matrix family for the
 # matrix work, v_cvt_pkrtz_f16_f32, DPP16 and v_permlanex16. The GEMM rows carry two arms each,
 # the dot2 pairs and the wave matrix, points of the row's `impl` axis the tune cache picks per
@@ -7,7 +7,7 @@
 # the reason.
 #
 # A build targeting other cards skips libr3d. Without a device kernel library the engine refuses ops
-# only a reference library implements, unless --debug-accept-reference-kernels is passed (spec §17).
+# only a reference library implements, unless --debug-accept-reference-kernels is passed (spec Â§17).
 # libr4d is the kernel library for gfx12, libr3d for gfx11.
 #
 # Built in radiance's tree, or standalone against an installed radiance
@@ -24,7 +24,7 @@ endif()
 # `gfx11-generic`, as `^gfx12` does for libr4d. The RDNA3 chips differ in CU count and clock, not in
 # the instructions these kernels issue, so one code object per family serves them all. A build
 # listing both a chip and the family gets both, and the engine prefers the chip's object
-# (docs/PLUGIN.md §10).
+# (docs/PLUGIN.md Â§10).
 rad_plugin_gpu_targets(R3D_GPU_TARGETS "^gfx11")
 if(NOT R3D_GPU_TARGETS)
   message(STATUS
@@ -53,6 +53,11 @@ set(R3D_UNITS
   # The speculative decoder's accept step: a walk over the draft block's candidate lattice, which is
   # a gather out of two codebooks rather than arithmetic.
   "r3d_dflash_f32|"
+  # The drafter's grouped dynamic convolution: the coefficient add, every tap and the block mask
+  # in one pass. Device math in r3dh_dflash_conv_body.h, which also compiles standalone for ISA
+  # review. Without this row the drafter's whole weight group is pinned to the container's mapping
+  # (a group with a host-only op is never copied), so the 27B refuses any speculative deployment.
+  "r3d_dflash_conv|"
   # The gated MLP band: GEMM, gate and output quantiser in one launch, so the [M,N] intermediate
   # is never written to memory.
   "r3d_gemm_fp8a8_gated|"
@@ -68,6 +73,21 @@ set(R3D_UNITS
   # per 32 of K, the block's partials scaled at the block boundary.
   "r3d_gemm_mxfp4a8|"
   "r3d_gemm_inta8|"
+  # The IQR weight at decode heights (W0/W3): the computed trellis decoded where it is read, one
+  # wave a 16-row tile, v_dot4 for the group sub-sums.
+  "r3d_gemm_iqr_m16|"
+  # Split-K for that GEMV's narrow-N band: whole 128-K slices into f32 partials, reduced in split
+  # order. The unsplit kernel above is untouched; the shim picks this one only when M = 1, N is
+  # narrow, and the row's scratch holds the partials.
+  "r3d_gemm_iqr_splitk|"
+  # The i8a8h gated fold (the int8 trunk's feed-forward): one workgroup a 128-column group, the
+  # gate's and the up's IQR decode, the gate, the bf16 rounding, the Hadamard and the codes in one
+  # launch, with no [M,N] intermediate and no scratch.
+  "r3d_gemm_iqr_gated|"
+  # The embedding table at its codes' width: the gather decodes the rows it is asked for.
+  "r3d_iqr_embed|"
+  # The vocabulary-weighted head: rotated int8 activation, one IQR GEMM a class, the ids scatter.
+  "r3d_iqr_logits|"
   # The wave-matrix arm of the w8a8 grid: V_WMMA_I32_16X16X16_IU8 chains an exact i32 group
   # sub-sum, the group term the reference's. The `impl` point of the dot2 arm's row.
   "r3d_gemm_inta8_wmma|"
@@ -83,6 +103,15 @@ set(R3D_UNITS
   # Dense causal latent attention over a paged [latent | rope] cache: a wave a (row, head), the
   # score one wave sum, split history with an f32 partial merge, the optional head gate.
   "r3d_mla_attn_paged|"
+  "r3d_attn_paged_h256|"
+  # The vision tower's two remaining ops (W10-lite): dense non-causal attention at head_dim 72 and
+  # the axial 2-D rotary (sections 18 18) over [2, M] positions. Both transcribe libref's order.
+  "r3d_vision_bf16|"
+  # The tower's linear layer (gemm_nt_bias: bias, activation and residual in one rounded chain)
+  # and its learned position table (grid_embed: bilinear align_corners resample added in place).
+  # Both transcribe libref's arithmetic so a vision pass keeps its bits on the card.
+  "r3d_gemm_nt_bias|"
+  "r3d_grid_embed|"
   # The sampler's spine: the row's top-R in one scan, and the stages that turn the candidate plane
   # the top-R produces into one token -- argmax, temp, top-k, the draw, and the four narrowings.
   "r3d_sample_f32|"
@@ -93,16 +122,30 @@ set(R3D_UNITS
   "r3d_gelu_mul_quant_i8|"
   "r3d_kv_len_trim|"
   "r3d_qsa_tail_store|"
+  "r3d_qsa_block_key|"
+  "r3d_qsa_score|"
+  "r3d_qsa_select|"
+  "r3d_qsa_work|"
+  # The QSA indexer's query rotary: imrope at head_dim 128, rotary 64, four heads. A separate unit
+  # so the fused h256 imrope row and its entry point are untouched.
+  "r3d_rope_imrope_h128|"
   "r3d_gated_had_quant_i8|"
   "r3d_had_quant_act_fp8|"
   "r3d_gated_had_quant_fp8|"
   "r3d_quant_cols_fp8|"
   "r3d_had_quant_act_i8g|"
   "r3d_gated_had_quant_i8g|"
+  "r3d_gate_had_quant_i8g|"
   "r3d_rmsnorm_quant_i8|"
+  # The int8 trunk's rotated producer: the residual add, the RMS norm, the 128-wide Hadamard and
+  # the per-group int8 quantiser in one pass, byte-identical to rmsnorm + had_quant_act_i8g.
+  "r3d_rmsnorm_had_quant_i8g|"
   # The skinny bf16 GEMM for decode, M <= 16: one output element a lane, k ascending, so the
   # accumulation order is libref's.
   "r3d_gemm_bf16_nt_m16|"
+  # Its N = 1 GEMV: the shared expert's gate, one lane an output row, the dot in libref's
+  # ascending-k chain.
+  "r3d_gemm_nt_n1|"
   # The wave-matrix arm of the skinny bf16 GEMM: V_WMMA_F32_16X16X16_BF16 over a 16x16x16 tile, a
   # wave a tile, the `impl` point of the dot2 arm's row.
   "r3d_gemm_bf16_nt_m16_wmma|"
@@ -126,6 +169,19 @@ set(R3D_UNITS
   "r3dh_gdn_kkt_solve|"
   "r3dh_gdn_chunk_scan|"
   "r3dh_gdn_recurrent_update|"
+  # The tensor-parallel collectives: libhalo's all-reduce / all-gather kernels (r3dh_*, the
+  # halo_ -> r3dh_ rename), the entry that owns their host rendezvous and exchange buffers, and the
+  # fused junction. Compiled for the whole family; a card needs the engine's tp>1 path to use them.
+  "r3dh_ar_entry|"
+  "r3dh_ar_gather_2rank|"
+  "r3dh_ar_gather_Nrank|"
+  "r3dh_ar_oneshot_2rank_exact|"
+  "r3dh_ar_oneshot_2rank_wht6|"
+  "r3dh_ar_oneshot_Nrank_exact|"
+  "r3dh_ar_twoshot_Nrank_exact|"
+  "r3dh_ar_twoshot_Nrank_ti8|"
+  "r3dh_ar_ln_had_quant_i8|"
+  "r3dh_ar_stubs|"
   "r3d_gdn_gated_rmsnorm_h128|"
   "r3d_gdn_gated_norm_had_quant_i8|"
   "r3d_gdn_conv_w4_h128|"
@@ -163,6 +219,14 @@ set(R3D_UNITS
   # The grouped E4M3 x E4M3 GEMM (moe_gemm_q): both operands fp8, staged compact and upcast to f16
   # in registers (the FeatherOps bit trick), the f16 wave-matrix, a per-(row, g-of-K) scale fold.
   "r3d_moe_gemm_q|"
+  # The grouped IQR GEMM (moe_gemm_iqr): each expert's computed-trellis weight decoded where it is
+  # read, a block walking the sorted rows' expert runs in the decode band and a run map above it so
+  # a decoded 16x128 unit serves four token tiles.
+  "r3d_moe_iqr|"
+  # The grouped w4nl codebook GEMM (moe_gemm_q): u4 codes indexing a sixteen-entry f32 table, an
+  # E4M3 scale per (row, 64 of K) under one f32 level; the IQR row's run walk, with the group fold
+  # libref's order so the int8 result is bit-exact.
+  "r3d_moe_w4nl|"
   # The grouped GEMM with unquantised bf16 experts: the same run-walk / gather as moe_gemm_q, the
   # bf16 operands loaded straight into the bf16 wave-matrix fragments (f32 accumulate), no decode.
   "r3d_moe_gemm_bf16|"
@@ -173,6 +237,19 @@ set(R3D_UNITS
   # The same shape over a block-scaled fp8 weight, decoded to f16 exactly (E4M3's four exponent bits
   # and three mantissa bits are a subset of f16's), and over int8 codes.
   "r3d_gemm_fp8a16_nt_m1|"
+  # Per-Layer Embedding and HyperConnections (Qwen4-Exp): the n-gram table gather and its prefetch
+  # hint, the PLE gate and dilated convolution, and the wide residual stream's read/write/enter/
+  # project. The HC read carries a host layout hook for the E4M3 mixing weights.
+  "r3d_embed_lookup_q|"
+  "r3d_ngram_hint|"
+  "r3d_ple_gate_bf16|"
+  "r3d_hc_bf16|"
+  "r3d_ar_hc_write|"
+  # The MTP head's entry over the wide stream with E4M3 fc rows (libr4d's joined
+  # `r4d.mtp.e4m3.g128` form, read in place), and the exact rescoring of a coarse head's candidates
+  # over the IQR lm rows (r3d_iqr.h's lm form).
+  "r3d_mtp_hc_e4m3|"
+  "r3d_logit_rerank|"
   # A row in r3d_rows.cpp must name an entry point defined by one of these units: an undefined
   # symbol makes the whole plugin fail to load.
 )
@@ -196,12 +273,9 @@ foreach(u ${R3D_UNITS})
   list(APPEND R3D_SRC "${src}")
 endforeach()
 
-# The host sources are declaration only: the row table and the operand descriptions. They are pure
-# host C++ that includes neither r3d.h nor hip_runtime.h, so the tables compile and can be inspected
-# without ROCm. libr3d has no layout source: nothing it serves is repacked, because a dot2 GEMM
-# reads a weight in the order it is stored (see r3d_rows.cpp). There is no fusion source because
-# no fused row exists.
-set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp)
+# The host sources are declaration only: the row table and the operand descriptions, plus the IQR
+# storage hooks (pure host C++, no HIP). They compile and can be inspected without ROCm.
+set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp r3d_iqr_layout.cpp)
 
 rad_add_plugin(libr3d kernels
   SOURCES     ${R3D_DECLARATION}

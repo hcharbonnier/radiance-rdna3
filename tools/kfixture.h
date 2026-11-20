@@ -169,6 +169,14 @@ void kf_draw_planes(const KfOperand& d, uint64_t seed, std::vector<std::vector<u
 int kf_planes_logical(const KfOperand& d, const std::vector<std::vector<uint8_t>>& planes,
                       std::vector<uint8_t>* out, std::string* why);
 
+/* The same operand with every plane of its encoding selected, for a reference that reads the
+ * logical weight: a declaration may take a view of the planes (a trellis weight's codes view names
+ * three of five), and the reference needs all of them to decode one element. True and `out` filled
+ * when `d` selects a strict subset of a multi-plane trellis encoding whose first plane is `codes`;
+ * false when it already selects every plane or is a scale view (`enc_selection_logical` reads a
+ * scale chain from its own selection). */
+bool kf_operand_full(const KfOperand& d, KfOperand* out);
+
 /* The bytes kernel `info` reads for `operand`, laid out from the planes. Returns RAD_OK with `out`
  * and `lay` filled; RAD_E_UNSUPPORTED when the kernel reads the plane as is (the
  * kf_planes_logical bytes, widened if the operand is wider); RAD_E_DTYPE when the kernel does not
@@ -210,6 +218,15 @@ using KfEntryPlanes = std::function<int(int64_t e, std::vector<std::vector<uint8
 int kf_lay_table(const RadKernelInfo* info, const RadParam* p, int n_p, int operand,
                  const KfOperand& d, const KfEntryPlanes& planes, RadLayout* lay,
                  std::vector<uint8_t>* out);
+
+/* Each entry laid out separately, as the engine's pointer table hands them to a kernel: one buffer
+ * an expert, the same layout and dtype for every entry. Returns kf_lay_weight's answer for the
+ * entries, and `lay` is the first entry's. A kernel that reads the stacked form one declared entry
+ * apart (kf_lay_table) can read this too through its pointers; a kernel that refuses a stacked
+ * table (libr3d's IQR and w4nl experts) needs it. */
+int kf_lay_entries(const RadKernelInfo* info, const RadParam* p, int n_p, int operand,
+                   const KfOperand& d, const KfEntryPlanes& planes, RadLayout* lay,
+                   std::vector<std::vector<uint8_t>>* out);
 
 /* ================================================================== drawing an input
  *

@@ -1,4 +1,4 @@
-/* r3d_plugin.h -- what libr3d's translation units share.
+﻿/* r3d_plugin.h -- what libr3d's translation units share.
  *
  * The row table (r3d_rows.cpp) and the operand descriptions (r3d_shapes.cpp) are pure host C++ and
  * include only this file and the ABI; the launch shims include r3d.h and so <hip/hip_runtime.h>.
@@ -14,7 +14,7 @@
 
 /* ================================================================== the priority ladder
  *
- * The selector ranks candidate rows by an integer priority (spec §2.1); where two rows of one op
+ * The selector ranks candidate rows by an integer priority (spec Â§2.1); where two rows of one op
  * match a geometry, it decides which serves. Each group states the reason for its order. Values are
  * spaced by ten so a row can be inserted between two without renumbering.
  *
@@ -51,7 +51,17 @@ enum {
 
     /* One row per sampler stage, on f32 logits, so there is nothing to rank yet. A second row for
      * a stage (an i8 logits form, say) would rank against this value. */
-    R3D_PRIO_SAMPLE = 50
+    R3D_PRIO_SAMPLE = 50,
+
+    /* `rope` has an unconstrained row for neox/gptj/imrope, so a mode-specific row must outrank it
+     * to be selected; the unconstrained row then refuses the mode at launch. The axial row is the
+     * vision tower's two-component rotary. */
+    R3D_PRIO_ROPE_AXIAL = 80,
+
+    /* The collectives: at the widths that have both forms the two-shot outranks the one-shot,
+     * since its band starts where the one-shot's send cost stops paying (libr4d's order). */
+    R3D_PRIO_AR_TWOSHOT = 70,
+    R3D_PRIO_AR_ONESHOT = 60
 };
 
 /* ================================================================== the dtype codes a C
@@ -100,9 +110,10 @@ static inline int r3d_dt_size(int code) {
 /* The activation an `act` parameter names, as the kernels' template argument. */
 enum { R3D_ACT_SILU = 0, R3D_ACT_SIGMOID = 1, R3D_ACT_GELU = 2 };
 
-/* rope's `mode`, numbered as libref's kModes. Only neox and gptj are implemented, and the rows'
- * constraints say so, so a model that needs mrope is not routed here. */
-enum { R3D_ROPE_NEOX = 0, R3D_ROPE_GPTJ = 1 };
+/* rope's `mode`, numbered as libref's kModes. neox, gptj and imrope are implemented by the general
+ * row; axial (the vision tower's 2-D rotary) has its own row. The rows' constraints say so, so a
+ * model that needs mrope is not routed here. */
+enum { R3D_ROPE_NEOX = 0, R3D_ROPE_GPTJ = 1, R3D_ROPE_IMROPE = 3, R3D_ROPE_AXIAL = 4 };
 
 /* ================================================================== the row table's entry points
  *
@@ -126,7 +137,8 @@ int r3d_rad_act_mul       (const RadArgs* a, RadStream s);
 int r3d_rad_softmax       (const RadArgs* a, RadStream s);
 int r3d_rad_scale         (const RadArgs* a, RadStream s);
 int r3d_rad_fill          (const RadArgs* a, RadStream s);
-int r3d_rad_rope          (const RadArgs* a, RadStream s);
+int r3d_rad_rope            (const RadArgs* a, RadStream s);
+int r3d_rad_rope_table      (const RadArgs* a, RadStream s);
 int r3d_rad_kv_store      (const RadArgs* a, RadStream s);
 int r3d_rad_embed_lookup  (const RadArgs* a, RadStream s);
 int r3d_rad_gather_rows   (const RadArgs* a, RadStream s);
@@ -193,6 +205,8 @@ int r3d_rad_ple_conv(const RadArgs* a, RadStream s);
  * decode against the paged state cache, in either state form (per_candidate or anchor). */
 extern "C" int r3dh_rad_gdn_recurrent_update(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_gdn_conv_recurrent_update(const RadArgs* a, RadStream s);
+/* The same fold with had_quant_act_i8g's codes of `o` in its epilogue (gdn_conv_recurrent_update_had). */
+extern "C" int r3dh_rad_gdn_conv_recurrent_update_had(const RadArgs* a, RadStream s);
 
 /* --- r3d_kda_update.hip: GLM's per-channel KDA recurrence at decode and prefill, over the
  * paged f32 state cache, with the speculative candidate snapshots. */
@@ -250,6 +264,16 @@ int r3d_rad_kv_len_trim(const RadArgs* a, RadStream s);
 /* --- r3d_qsa_tail_store.hip: the QSA indexer's tail, into a per-layer linear KV state. */
 int r3d_rad_qsa_tail_store(const RadArgs* a, RadStream s);
 
+/* --- r3d_qsa_block_key.hip: the QSA indexer's compressed key, pooled, normed and rotated. */
+int r3d_rad_qsa_block_key(const RadArgs* a, RadStream s);
+
+/* --- r3d_qsa_score.hip: the QSA indexer's block scores, per query. */
+int r3d_rad_qsa_score(const RadArgs* a, RadStream s);
+/* --- r3d_qsa_select.hip: the QSA selection, the topk blocks and the partial page. */
+int r3d_rad_qsa_select(const RadArgs* a, RadStream s);
+/* --- r3d_qsa_work.hip: the blocks completing this step, gathered for qsa_block_key. */
+int r3d_rad_qsa_work(const RadArgs* a, RadStream s);
+
 /* --- r3d_gated_had_quant_i8.hip: a gated product, block Hadamard, then per-row int8. */
 int r3d_rad_gated_had_quant_i8(const RadArgs* a, RadStream s);
 
@@ -268,6 +292,9 @@ int r3d_rad_had_quant_act_i8g(const RadArgs* a, RadStream s);
 
 /* --- r3d_gated_had_quant_i8g.hip: a gated product, 128-wide Hadamard, then per-group int8. */
 int r3d_rad_gated_had_quant_i8g(const RadArgs* a, RadStream s);
+
+/* --- r3d_gate_had_quant_i8g.hip: the same with the gate in its own operand. */
+int r3d_rad_gate_had_quant_i8g(const RadArgs* a, RadStream s);
 
 /* --- r3d_rmsnorm_quant_i8.hip: the RMS norm and the per-row int8 quantiser, one pass. */
 int r3d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream s);
@@ -301,23 +328,35 @@ int r3d_shape_had_quant_act_i8(const RadParam* p, int n_p, int operand, RadOpdDe
 int r3d_shape_gelu_mul_quant_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_kv_len_trim(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_qsa_tail_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_qsa_block_key(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_qsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_qsa_select(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_qsa_work(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gated_had_quant_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_had_quant_act_fp8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gated_had_quant_fp8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_quant_cols_fp8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_had_quant_act_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gated_had_quant_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_gate_had_quant_i8g(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_rmsnorm_quant_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_quant_act_i8g   (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gated_quant_fp8 (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_dequant         (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt         (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_gemm_nt_bias    (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+int r3d_shape_grid_embed      (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt_q       (const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt_q_mxfp4a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 
 /* --- r3d_shapes.cpp: the fused-op, attention and sampler shape hooks --- */
 extern "C" int r3d_shape_silu_mul          (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_attn_paged        (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_attn_paged_i8     (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_kv_store_i8       (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_rope_table        (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_attn_dense        (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_rope_axial        (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_gemm_nt_q_gated (const RadParam*, int, int, RadOpdDesc*);
 /* r3d_gemm_nt_q_w2a8.hip: the w2a8 vocab projection's layout hook, one of the library's three
  * (with the fp8 weight's and the logits head's, below). It repacks nothing: it presents the
@@ -327,6 +366,7 @@ extern "C" int r3d_shape_gemm_nt_q_gated (const RadParam*, int, int, RadOpdDesc*
 extern "C" int r3d_layout_gemm_nt_q_w2a8(const RadParam*, int, int, const RadEncoding*,
                                          const int* sel, const RadTensor* planes, int n_planes,
                                          RadLayout*);
+extern "C" int r3d_shape_dflash_conv       (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_dflash_select     (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_row_topk          (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_sample_argmax     (const RadParam*, int, int, RadOpdDesc*);
@@ -349,6 +389,7 @@ extern "C" int r3d_shape_sample_logprobs   (const RadParam*, int, int, RadOpdDes
 int r3d_rad_gemm_nt_q_w2a8     (const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_gated  (const RadArgs* a, RadStream s);
 int r3d_rad_dflash_select      (const RadArgs* a, RadStream s);
+int r3d_rad_dflash_conv        (const RadArgs* a, RadStream s);
 int r3d_rad_row_topk           (const RadArgs* a, RadStream s);
 int r3d_rad_sample_argmax      (const RadArgs* a, RadStream s);
 int r3d_rad_sample_temp        (const RadArgs* a, RadStream s);
@@ -369,6 +410,26 @@ int r3d_rad_sample_logprobs    (const RadArgs* a, RadStream s);
  * query tile. */
 int r3d_rad_attn_decode_h128       (const RadArgs* a, RadStream s);
 int r3d_rad_attn_prefill_h128      (const RadArgs* a, RadStream s);
+
+/* --- r3d_attn_paged_h256.hip: the head_dim-256 int8 paged body. Four lanes own one output row
+ * (64 dims each), a workgroup carries whole tokens, and the geometry is (gqa 12, block 4) for
+ * Flash-Next or (gqa 6, block 16) for the 27B. Decode split-KVs; prefill is one pass. */
+int r3d_rad_attn_decode_h256       (const RadArgs* a, RadStream s);
+int r3d_rad_attn_prefill_h256      (const RadArgs* a, RadStream s);
+
+/* --- r3d_vision_bf16.hip: the vision tower's two missing ops (W10-lite). `attn_dense` is the
+ * ViT's non-causal full attention at head_dim 72, gqa 1; `rope` is its axial 2-D rotary (head_dim
+ * 72, sections 18 18, positions [2, M]). */
+int r3d_rad_attn_dense            (const RadArgs* a, RadStream s);
+int r3d_rad_rope_axial            (const RadArgs* a, RadStream s);
+
+/* --- r3d_gemm_nt_bias.hip: the vision tower's linear layer, gemm_nt with a bias and libref's
+ * act/residual epilogue (bf16). --- */
+int r3d_rad_gemm_nt_bias          (const RadArgs* a, RadStream s);
+
+/* --- r3d_grid_embed.hip: the ViT's learned position table, bilinearly resampled with the grid's
+ * corners on the table's and added to x (bf16). --- */
+int r3d_rad_grid_embed            (const RadArgs* a, RadStream s);
 
 /* --- r3d_gemm_fp8a8_tiled.hip: the quantised GEMM above the decode heights, and the reader for
  * the container's fp8 weight: codes and per-128x128 scale as two planes behind `b_scale`. The row
@@ -396,6 +457,40 @@ int r3d_rad_gemm_nt_q_w4a8_m16(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_w8a8_m16(const RadArgs* a, RadStream s);
 int r3d_shape_gemm_nt_q_w4a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt_q_w8a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
+
+/* --- r3d_gemm_iqr_m16.hip and r3d_iqr_layout.cpp: the IQR weight (r3d_iqr.h) at M <= 16. The
+ * layout hooks reorder the container's codes into the lane segments the decoder reads and invert;
+ * the shim refuses the forms the W0 kernel does not decode yet. --- */
+int r3d_rad_gemm_nt_q_iqr_m16(const RadArgs* a, RadStream s);
+/* --- r3d_gemm_iqr_gated.hip: the i8a8h gated fold, gate_up in the op's scratch then the gated
+ * Hadamard quantiser, so the FFN's fusion resolves on the device. --- */
+int r3d_rad_gemm_nt_q_iqr_gated(const RadArgs* a, RadStream s);
+int64_t r3d_rad_gemm_nt_q_iqr_gated_scratch(const RadArgs* a);
+int r3d_shape_gemm_nt_q_gated_i8a8h(const RadParam*, int, int, RadOpdDesc*);
+int r3d_rad_gemm_nt_q_iqr_tiled(const RadArgs* a, RadStream s);
+int r3d_rad_embed_lookup_iqr(const RadArgs* a, RadStream s);
+int r3d_rad_logits_gemm_vocab_iqr(const RadArgs* a, RadStream s);
+int64_t r3d_logits_gemm_vocab_iqr_scratch(const RadArgs* a);
+int r3d_rad_layout_iqr_embed(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                             const int* sel, const RadTensor* pl, int n, RadLayout* out);
+int r3d_rad_relayout_iqr_embed(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                               const int* sel, const RadTensor* pl, int n, void* dst,
+                               int64_t dst_bytes);
+int r3d_rad_layout_iqr_vocab(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                             const int* sel, const RadTensor* pl, int n, RadLayout* out);
+int r3d_rad_relayout_iqr_vocab(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                               const int* sel, const RadTensor* pl, int n, void* dst,
+                               int64_t dst_bytes);
+int r3d_rad_unrelayout_iqr_vocab(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                                 const int* sel, const void* src, int64_t src_bytes,
+                                 const RadTensor* pl, int n);
+int r3d_rad_layout_iqr(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                       const int* sel, const RadTensor* pl, int n, RadLayout* out);
+int r3d_rad_relayout_iqr(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                         const int* sel, const RadTensor* pl, int n, void* dst, int64_t dst_bytes);
+int r3d_rad_unrelayout_iqr(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
+                           const int* sel, const void* src, int64_t src_bytes,
+                           const RadTensor* pl, int n);
 
 /* The relayout writers for the three layout hooks, each delegating to rad_planes_relayout. The
  * loader converts a quantised weight into the joined operand the plan names, and only the row that
@@ -431,6 +526,73 @@ int r3d_shape_logits_gemm_bf16  (const RadParam*, int, int, RadOpdDesc*);
 int r3d_rad_silu_mul             (const RadArgs* a, RadStream s);
 int r3d_rad_rmsnorm_quant_fp8    (const RadArgs* a, RadStream s);
 int r3d_shape_rmsnorm_quant_fp8  (const RadParam*, int, int, RadOpdDesc*);
+
+/* --- r3d_rmsnorm_had_quant_i8g.hip: add, norm, 128-wide Hadamard, per-group int8. --- */
+int r3d_rad_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s);
+int r3d_shape_rmsnorm_had_quant_i8g(const RadParam*, int, int, RadOpdDesc*);
+
+/* --- the PLE and HyperConnections rows (W9 then W8) --- */
+int r3d_rad_embed_lookup_q (const RadArgs* a, RadStream s);
+int r3d_rad_ngram_hint     (const RadArgs* a, RadStream s);
+int r3d_rad_ple_gate       (const RadArgs* a, RadStream s);
+int r3d_rad_hc_enter       (const RadArgs* a, RadStream s);
+int r3d_rad_hc_read        (const RadArgs* a, RadStream s);
+int r3d_rad_hc_write       (const RadArgs* a, RadStream s);
+int r3d_rad_hc_project     (const RadArgs* a, RadStream s);
+int64_t r3d_rad_hc_read_scratch(const RadArgs* a);
+int r3d_rad_ar_hc_write        (const RadArgs* a, RadStream s);
+int r3d_rad_ar_gather_hc_write (const RadArgs* a, RadStream s);
+/* --- the tensor-parallel collectives (r3dh_ar_entry.hip, the libhalo port) --- */
+int r3dh_rad_ar_init      (const RadParam* p, int n_p, int rank, int world, void** out);
+int r3dh_rad_ar_host_init (const RadParam* p, int n_p, int rank, int world, void** out);
+void r3dh_rad_ar_fini     (void* instance);
+int r3dh_rad_ar_oneshot_2rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_oneshot_2rank_wht6 (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_twoshot_3rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_oneshot_3rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_oneshot_8rank_exact(const RadArgs* a, RadStream s);
+int r3dh_rad_ar_twoshot_3rank_ti8  (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_twoshot_4rank_ti8  (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_gather_2rank       (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_gather_3rank       (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_gather_4rank       (const RadArgs* a, RadStream s);
+int r3dh_rad_ar_gather_8rank       (const RadArgs* a, RadStream s);
+int r3d_shape_all_reduce (const RadParam*, int, int, RadOpdDesc*);
+int r3d_shape_all_gather (const RadParam*, int, int, RadOpdDesc*);
+/* The joined E4M3 mixing weight: codes and a f32 scale per group in the row's tail. */
+int r3d_rad_layout_hc_mix     (const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, RadLayout*);
+int r3d_rad_relayout_hc_mix   (const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, void*, int64_t);
+int r3d_rad_unrelayout_hc_mix (const RadParam*, int, int, const RadEncoding*, const int*,
+                               const void*, int64_t, const RadTensor*, int);
+
+/* --- r3d_mtp_hc_e4m3.hip: mtp_enter with the two square fc matrices stored as E4M3 rows. The
+ * stored form is libr4d's `r4d.mtp.e4m3.g128`, so a container laid out on RDNA4 is read in place
+ * (as hc_read's E4M3 mix already is). --- */
+int r3d_rad_mtp_enter (const RadArgs* a, RadStream s);
+int r3d_rad_layout_mtp_e4m3   (const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, RadLayout*);
+int r3d_rad_relayout_mtp_e4m3 (const RadParam*, int, int, const RadEncoding*, const int*,
+                               const RadTensor*, int, void*, int64_t);
+int r3d_rad_unrelayout_mtp_e4m3(const RadParam*, int, int, const RadEncoding*, const int*,
+                                const void*, int64_t, const RadTensor*, int);
+
+/* --- r3d_logit_rerank.hip: the exact rescoring of a coarse head's R candidates over the IQR
+ * lm_head rows logits_gemm_iqr stores (r3d_iqr_layout.cpp's lm form). --- */
+int r3d_rad_logit_rerank_iqr (const RadArgs* a, RadStream s);
+int r3d_rad_logit_rerank_i8  (const RadArgs* a, RadStream s);
+int r3d_rad_layout_i8_logits    (const RadParam*, int, int, const RadEncoding*, const int*,
+                                 const RadTensor*, int, RadLayout*);
+int r3d_rad_layout_iqr_logits   (const RadParam*, int, int, const RadEncoding*, const int*,
+                                 const RadTensor*, int, RadLayout*);
+int r3d_rad_relayout_iqr_logits (const RadParam*, int, int, const RadEncoding*, const int*,
+                                 const RadTensor*, int, void*, int64_t);
+int r3d_rad_unrelayout_iqr_logits(const RadParam*, int, int, const RadEncoding*, const int*,
+                                  const void*, int64_t, const RadTensor*, int);
 
 }  /* extern "C" */
 

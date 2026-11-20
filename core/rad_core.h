@@ -970,11 +970,19 @@ struct Config {
      *   chunks the same prompt on (ChunkGeometry::grid), and a prompt's tail snapshot is taken
      *   where its last chunk starts. The hit recomputes the cold run's own chunks, so its output
      *   is the cold run's bit for bit even where a kernel rounds a row differently at another
-     *   chunk length.
+     *   chunk length. A linear-state prompt shorter than one interval has no grid point to
+     *   resume at, so it anchors a snapshot at its own tail (Scheduler::kShortTailMin) and the
+     *   next turn resumes there, recomputing the interval's end in a shorter chunk.
      * - nearest: a hit resumes at the deepest snapshot or block, and a prompt's tail snapshot is
      *   at its last quantum boundary. Up to a chunk less is re-prefilled a turn, and a hit can
      *   differ from a cold run in the last bits (a near-tie in greedy text). */
     bool    prefix_exact = true;
+    /* --tail-anchor on|off (default on): off drops the short-turn anchor of a prompt under the
+     * first checkpoint interval, so the prompt runs its whole last chunk and no snapshot is taken
+     * off the grid. On a mixture-of-experts server every chunk sweeps the expert plane once, so
+     * the dropped tail chunk is worth its prefill time; the cost is that the next turn of a short
+     * conversation resumes from nothing. Never affects a prompt at or past the interval. */
+    bool    tail_anchor = true;
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as unmeasured;
      * core/mem/prefix.h ships the two extremes so they can be compared. */
     std::string checkpoint_policy = "geometric-backoff";
@@ -1229,6 +1237,14 @@ struct Config {
      * share, keeping them resident: heat never demotes them. 0 is off. */
     float   expert_pin_top = 0.0f;
     bool    expert_pin_top_given = false;
+    /* --expert-moves N: swaps the heat engine may propose per slab class each step, N from the
+     * first step. 0 (the default) follows the plan: 16 once a broad pass has shaped the resident
+     * set and at least 60% of the movable expert bytes stay on the card, where extra swaps are
+     * churn, and RAD_PLACE_MOVES_PER_STEP otherwise; the full budget comes back after 512 steps
+     * without a broad pass. A thin history (a short prompt's decode) keeps the full budget either
+     * way (heat_params_for, kHeatDenseSelections). */
+    int     expert_moves = 0;
+    bool    expert_moves_given = false;
     /* --draft-expert-placement auto|host. `host` pins a draft head's (MTP/DSpark) routed experts
      * in the host pool before any strategy runs, read in place like a pooled expert, so they fit
      * beside a trunk that already fills the card. `auto` (the default) leaves them to the

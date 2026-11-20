@@ -2,9 +2,8 @@
  *
  * The rotated form of quant_act_fp8: the 128-wide Hadamard shrinks the group maximum, so e4m3's
  * four exponent bits carry the outliers better after the rotation. The transform is the wave-local
- * FWHT of r3d_fwht.h (unnormalised; the scale carries the 1/sqrt(128) so the dequantised value is
- * the orthonormal rotation). Normalisation is folded into the scale: S = absmax * (1/sqrt(128)) /
- * 448, codes of (v * (128/absmax)) clamped to +-448.
+ * FWHT of r3d_fwht.h (unnormalised; the rotation's 1/128 is the rotated weight's, so the scale is
+ * absmax / 448 and folds nothing, as libref does). Codes are (v * 448/absmax) clamped to +-448.
  *
  * A separate op, not a parameter: it writes different numbers than quant_act_fp8, so a swapped
  * graph would run as a different model. The codes are row-major (the fp8 GEMM reads stored order).
@@ -77,7 +76,7 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void had_quant_act_fp8_
     for (uint32_t w = 1; w < kWaves; ++w) m = fmaxf(m, red[w]);
     const float scale = m > 0.0f ? m * (1.0f / kTopE4M3) : 1.0f;
     const float inv = 1.0f / scale;
-    if (threadIdx.x == 0) s[row] = scale * (1.0f / sqrtf((float)HAD));
+    if (threadIdx.x == 0) s[row] = scale;
 
     for (uint32_t c = lane * 4; c < n; c += kWave * 4) {
         if (wave == 0) {

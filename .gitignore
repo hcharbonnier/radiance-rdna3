@@ -6,3 +6,7 @@ compile_commands.json
 /sync-jarvis.sh
 __pycache__/
 .cache/
+external
+external-docs/
+AGENTS.local.md
+API_DISTANTE.md

@@ -896,7 +896,11 @@ synchronisation, so placement changes without serialising the step.
 **Dynamic re-placement.** The heat engine (`core/place/heat.h`) accumulates heat on conditional
 weights from the routing histograms, decays each layer's heat once per step, and promotes and
 demotes against a hysteresis ratio and a minimum gain, up to 64 swaps per slab class per step
-(`RAD_PLACE_MOVES_PER_STEP`). A promotion copies into a shadow slot before publishing the new
+(`RAD_PLACE_MOVES_PER_STEP`, the default; 16 once a broad pass has shaped the resident set and the
+plan keeps 60% or more of its movable expert bytes resident, where extra swaps only re-copy experts
+the steps would hit, and 64 again after 512 steps without one. A short prompt's decode keeps the
+full 64; `--expert-moves` sets the budget from the first step, up to 1 024). A promotion
+copies into a shadow slot before publishing the new
 pointer, and a freed slot is quarantined until every launch that could name it has retired, so no
 slot is overwritten while a kernel may read it. Link traffic is U-shaped in the minimum gain: a
 declined promotion returns as a miss over the same link, so a higher threshold loses hit rate
